@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+
 #--
 # Copyright 2006 by Chad Fowler, Rich Kilmer, Jim Weirich and others.
 # All rights reserved.
@@ -6,21 +7,27 @@
 #++
 
 class Gem::Ext::RakeBuilder < Gem::Ext::Builder
-  def self.build(extension, dest_path, results, args=[], lib_dir=nil, extension_dir=Dir.pwd)
-    if File.basename(extension) =~ /mkrf_conf/i
-      run([Gem.ruby, File.basename(extension), *args], results, class_name, extension_dir)
+  def self.build(extension, dest_path, results, args = [], lib_dir = nil, extension_dir = Dir.pwd,
+    target_rbconfig = Gem.target_rbconfig, n_jobs: nil)
+    if target_rbconfig.path
+      warn "--target-rbconfig is not yet supported for Rake extensions. Ignoring"
     end
 
-    rake = ENV['rake']
+    if /mkrf_conf/i.match?(File.basename(extension))
+      # Gem.ruby is quoted if it contains whitespace, so split it into argv
+      # elements to keep the quotes out of the spawned command.
+      run([*shellsplit(Gem.ruby), File.basename(extension), *args], results, class_name, extension_dir)
+    end
+
+    rake = ENV["rake"]
 
     if rake
-      require "shellwords"
-      rake = rake.shellsplit
+      rake = shellsplit_command(rake)
     else
       begin
-        rake = [Gem.ruby, "-I#{File.expand_path("../..", __dir__)}", "-rrubygems", Gem.bin_path('rake', 'rake')]
+        rake = ruby << "-rrubygems" << Gem.bin_path("rake", "rake")
       rescue Gem::Exception
-        rake = [Gem.default_exec_format % 'rake']
+        rake = [Gem.default_exec_format % "rake"]
       end
     end
 

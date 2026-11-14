@@ -52,7 +52,7 @@ RSpec.describe "real source plugins" do
       build_lib "a-path-gem"
 
       gemfile <<-G
-        source "#{file_uri_for(gem_repo2)}" # plugin source
+        source "https://gem.repo2" # plugin source
         source "#{lib_path("a-path-gem-1.0")}", :type => :mpath do
           gem "a-path-gem"
         end
@@ -67,8 +67,13 @@ RSpec.describe "real source plugins" do
       expect(the_bundle).to include_gems("a-path-gem 1.0")
     end
 
-    it "writes to lock file" do
+    it "writes to lockfile" do
       bundle "install"
+
+      checksums = checksums_section_when_enabled do |c|
+        c.no_checksum "a-path-gem", "1.0"
+        c.checksum gem_repo2, "bundler-source-mpath", "1.0"
+      end
 
       expect(lockfile).to eq <<~G
         PLUGIN SOURCE
@@ -78,17 +83,19 @@ RSpec.describe "real source plugins" do
             a-path-gem (1.0)
 
         GEM
-          remote: #{file_uri_for(gem_repo2)}/
+          remote: https://gem.repo2/
           specs:
+            bundler-source-mpath (1.0)
 
         PLATFORMS
           #{lockfile_platforms}
 
         DEPENDENCIES
           a-path-gem!
-
+          bundler-source-mpath
+        #{checksums}
         BUNDLED WITH
-           #{Bundler::VERSION}
+          #{Bundler::VERSION}
       G
     end
 
@@ -106,7 +113,7 @@ RSpec.describe "real source plugins" do
       end
 
       install_gemfile <<-G
-        source "#{file_uri_for(gem_repo2)}" # plugin source
+        source "https://gem.repo2" # plugin source
         source "#{lib_path("gem_with_bin-1.0")}", :type => :mpath do
           gem "gem_with_bin"
         end
@@ -120,38 +127,35 @@ RSpec.describe "real source plugins" do
       let(:uri_hash) { Digest(:SHA1).hexdigest(lib_path("a-path-gem-1.0").to_s) }
       it "copies repository to vendor cache and uses it" do
         bundle "install"
-        bundle "config set cache_all true"
         bundle :cache
 
         expect(bundled_app("vendor/cache/a-path-gem-1.0-#{uri_hash}")).to exist
         expect(bundled_app("vendor/cache/a-path-gem-1.0-#{uri_hash}/.git")).not_to exist
         expect(bundled_app("vendor/cache/a-path-gem-1.0-#{uri_hash}/.bundlecache")).to be_file
 
-        FileUtils.rm_rf lib_path("a-path-gem-1.0")
+        FileUtils.rm_r lib_path("a-path-gem-1.0")
         expect(the_bundle).to include_gems("a-path-gem 1.0")
       end
 
       it "copies repository to vendor cache and uses it even when installed with `path` configured" do
-        bundle "config set --local path vendor/bundle"
+        bundle_config "path vendor/bundle"
         bundle :install
-        bundle "config set cache_all true"
         bundle :cache
 
         expect(bundled_app("vendor/cache/a-path-gem-1.0-#{uri_hash}")).to exist
 
-        FileUtils.rm_rf lib_path("a-path-gem-1.0")
+        FileUtils.rm_r lib_path("a-path-gem-1.0")
         expect(the_bundle).to include_gems("a-path-gem 1.0")
       end
 
       it "bundler package copies repository to vendor cache" do
-        bundle "config set --local path vendor/bundle"
+        bundle_config "path vendor/bundle"
         bundle :install
-        bundle "config set cache_all true"
         bundle :cache
 
         expect(bundled_app("vendor/cache/a-path-gem-1.0-#{uri_hash}")).to exist
 
-        FileUtils.rm_rf lib_path("a-path-gem-1.0")
+        FileUtils.rm_r lib_path("a-path-gem-1.0")
         expect(the_bundle).to include_gems("a-path-gem 1.0")
       end
     end
@@ -166,7 +170,7 @@ RSpec.describe "real source plugins" do
               a-path-gem (1.0)
 
           GEM
-            remote: #{file_uri_for(gem_repo2)}/
+            remote: https://gem.repo2/
             specs:
 
           PLATFORMS
@@ -176,7 +180,7 @@ RSpec.describe "real source plugins" do
             a-path-gem!
 
           BUNDLED WITH
-             #{Bundler::VERSION}
+            #{Bundler::VERSION}
         G
       end
 
@@ -203,7 +207,7 @@ RSpec.describe "real source plugins" do
               def initialize(opts)
                 super
 
-                @ref = options["ref"] || options["branch"] || options["tag"] || "master"
+                @ref = options["ref"] || options["branch"] || options["tag"] || "main"
                 @unlocked = false
               end
 
@@ -247,7 +251,7 @@ RSpec.describe "real source plugins" do
 
               def options_to_lock
                 opts = {"revision" => revision}
-                opts["ref"] = ref if ref != "master"
+                opts["ref"] = ref if ref != "main"
                 opts
               end
 
@@ -304,13 +308,7 @@ RSpec.describe "real source plugins" do
                 @install_path ||= begin
                   git_scope = "\#{base_name}-\#{shortref_for_path(revision)}"
 
-                  path = gem_install_dir.join(git_scope)
-
-                  if !path.exist? && requires_sudo?
-                    user_bundle_path.join(ruby_scope).join(git_scope)
-                  else
-                    path
-                  end
+                  gem_install_dir.join(git_scope)
                 end
               end
 
@@ -325,8 +323,8 @@ RSpec.describe "real source plugins" do
       build_git "ma-gitp-gem"
 
       gemfile <<-G
-        source "#{file_uri_for(gem_repo2)}" # plugin source
-        source "#{file_uri_for(lib_path("ma-gitp-gem-1.0"))}", :type => :gitp do
+        source "https://gem.repo2" # plugin source
+        source "#{lib_path("ma-gitp-gem-1.0")}", :type => :gitp do
           gem "ma-gitp-gem"
         end
       G
@@ -338,30 +336,37 @@ RSpec.describe "real source plugins" do
       expect(the_bundle).to include_gems("ma-gitp-gem 1.0")
     end
 
-    it "writes to lock file" do
+    it "writes to lockfile" do
       revision = revision_for(lib_path("ma-gitp-gem-1.0"))
       bundle "install"
 
+      checksums = checksums_section_when_enabled do |c|
+        c.checksum gem_repo2, "bundler-source-gitp", "1.0"
+        c.no_checksum "ma-gitp-gem", "1.0"
+      end
+
       expect(lockfile).to eq <<~G
         PLUGIN SOURCE
-          remote: #{file_uri_for(lib_path("ma-gitp-gem-1.0"))}
+          remote: #{lib_path("ma-gitp-gem-1.0")}
           type: gitp
           revision: #{revision}
           specs:
             ma-gitp-gem (1.0)
 
         GEM
-          remote: #{file_uri_for(gem_repo2)}/
+          remote: https://gem.repo2/
           specs:
+            bundler-source-gitp (1.0)
 
         PLATFORMS
           #{lockfile_platforms}
 
         DEPENDENCIES
+          bundler-source-gitp
           ma-gitp-gem!
-
+        #{checksums}
         BUNDLED WITH
-           #{Bundler::VERSION}
+          #{Bundler::VERSION}
       G
     end
 
@@ -370,14 +375,14 @@ RSpec.describe "real source plugins" do
         revision = revision_for(lib_path("ma-gitp-gem-1.0"))
         lockfile <<-G
           PLUGIN SOURCE
-            remote: #{file_uri_for(lib_path("ma-gitp-gem-1.0"))}
+            remote: #{lib_path("ma-gitp-gem-1.0")}
             type: gitp
             revision: #{revision}
             specs:
               ma-gitp-gem (1.0)
 
           GEM
-            remote: #{file_uri_for(gem_repo2)}/
+            remote: https://gem.repo2/
             specs:
 
           PLATFORMS
@@ -387,7 +392,7 @@ RSpec.describe "real source plugins" do
             ma-gitp-gem!
 
           BUNDLED WITH
-             #{Bundler::VERSION}
+            #{Bundler::VERSION}
         G
       end
 
@@ -419,10 +424,10 @@ RSpec.describe "real source plugins" do
       end
 
       it "updates the deps on change in gemfile" do
-        update_git "ma-gitp-gem", "1.1", :path => lib_path("ma-gitp-gem-1.0"), :gemspec => true
+        update_git "ma-gitp-gem", "1.1", path: lib_path("ma-gitp-gem-1.0"), gemspec: true
         gemfile <<-G
-          source "#{file_uri_for(gem_repo2)}" # plugin source
-          source "#{file_uri_for(lib_path("ma-gitp-gem-1.0"))}", :type => :gitp do
+          source "https://gem.repo2" # plugin source
+          source "#{lib_path("ma-gitp-gem-1.0")}", :type => :gitp do
             gem "ma-gitp-gem", "1.1"
           end
         G
@@ -435,22 +440,21 @@ RSpec.describe "real source plugins" do
     describe "bundle cache with gitp" do
       it "copies repository to vendor cache and uses it" do
         git = build_git "foo"
-        ref = git.ref_for("master", 11)
+        ref = git.ref_for("main", 11)
 
         install_gemfile <<-G
-          source "#{file_uri_for(gem_repo2)}" # plugin source
+          source "https://gem.repo2" # plugin source
           source  '#{lib_path("foo-1.0")}', :type => :gitp do
             gem "foo"
           end
         G
 
-        bundle "config set cache_all true"
         bundle :cache
         expect(bundled_app("vendor/cache/foo-1.0-#{ref}")).to exist
         expect(bundled_app("vendor/cache/foo-1.0-#{ref}/.git")).not_to exist
         expect(bundled_app("vendor/cache/foo-1.0-#{ref}/.bundlecache")).to be_file
 
-        FileUtils.rm_rf lib_path("foo-1.0")
+        FileUtils.rm_r lib_path("foo-1.0")
         expect(the_bundle).to include_gems "foo 1.0"
       end
     end

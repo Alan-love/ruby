@@ -43,13 +43,15 @@ describe "The --enable and --disable flags" do
     ruby_exe("p 'foo'.frozen?", options: "--disable-frozen-string-literal").chomp.should == "false"
   end
 
-  platform_is_not :darwin do # frequently hangs for >60s on GitHub Actions macos-latest
+  # frequently hangs for >60s on GitHub Actions macos-latest
+  # MinGW's YJIT support seems broken
+  platform_is_not :darwin, :mingw do
     it "can be used with all for enable" do
       e = "p [defined?(Gem), defined?(DidYouMean), $VERBOSE, 'foo'.frozen?]"
       env = {'RUBYOPT' => '-w'}
       # Use a single variant here because it can be quite slow as it might enable jit, etc
       ruby_exe(e, options: "--enable-all", env: env).chomp.should == "[\"constant\", \"constant\", true, true]"
-    end
+    end unless defined?(RubyVM::YJIT) && defined?(RubyVM::ZJIT) && RubyVM::ZJIT.enabled? # You're not supposed to enable YJIT with --enable-all when ZJIT options are passed.
   end
 
   it "can be used with all for disable" do
@@ -60,10 +62,10 @@ describe "The --enable and --disable flags" do
   end
 
   it "prints a warning for unknown features" do
-    ruby_exe("p 14", options: "--enable=ruby-spec-feature-does-not-exist 2>&1").chomp.should include('warning: unknown argument for --enable')
-    ruby_exe("p 14", options: "--disable=ruby-spec-feature-does-not-exist 2>&1").chomp.should include('warning: unknown argument for --disable')
-    ruby_exe("p 14", options: "--enable-ruby-spec-feature-does-not-exist 2>&1").chomp.should include('warning: unknown argument for --enable')
-    ruby_exe("p 14", options: "--disable-ruby-spec-feature-does-not-exist 2>&1").chomp.should include('warning: unknown argument for --disable')
+    ruby_exe("p 14", options: "--enable=ruby-spec-feature-does-not-exist 2>&1").chomp.should.include?('warning: unknown argument for --enable')
+    ruby_exe("p 14", options: "--disable=ruby-spec-feature-does-not-exist 2>&1").chomp.should.include?('warning: unknown argument for --disable')
+    ruby_exe("p 14", options: "--enable-ruby-spec-feature-does-not-exist 2>&1").chomp.should.include?('warning: unknown argument for --enable')
+    ruby_exe("p 14", options: "--disable-ruby-spec-feature-does-not-exist 2>&1").chomp.should.include?('warning: unknown argument for --disable')
   end
 
 end

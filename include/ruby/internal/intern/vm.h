@@ -89,7 +89,8 @@ VALUE rb_check_funcall(VALUE recv, ID mid, int argc, const VALUE *argv);
  * @param[in]      kw_splat     Handling of keyword parameters:
  *   - RB_NO_KEYWORDS           `argv`'s last is not a keyword argument.
  *   - RB_PASS_KEYWORDS         `argv`'s last is a keyword argument.
- *   - RB_PASS_CALLED_KEYWORDS  it depends if there is a passed block.
+ *   - RB_PASS_CALLED_KEYWORDS  Pass keyword arguments if the current method
+ *                              was called with keyword arguments.
  * @retval         RUBY_Qundef  `recv` doesn't respond to `mid`.
  * @retval         otherwise    What the method evaluates to.
  */
@@ -106,9 +107,11 @@ VALUE rb_check_funcall_kw(VALUE recv, ID mid, int argc, const VALUE *argv, int k
  * @param[in]  kw_splat  Handling of keyword parameters:
  *   - RB_NO_KEYWORDS           `arg`'s last is not a keyword argument.
  *   - RB_PASS_KEYWORDS         `arg`'s last is a keyword argument.
- *   - RB_PASS_CALLED_KEYWORDS  it depends if there is a passed block.
+ *   - RB_PASS_CALLED_KEYWORDS  Pass keyword arguments if the current method
+ *                              was called with keyword arguments.
  * @return     What the command evaluates to.
  */
+RBIMPL_ATTR_DEPRECATED_INTERNAL(4.0)
 VALUE rb_eval_cmd_kw(VALUE cmd, VALUE arg, int kw_splat);
 
 /**
@@ -229,8 +232,7 @@ void rb_define_alloc_func(VALUE klass, rb_alloc_func_t func);
  * restrict creation  of an instance of  a class.  For example  it rarely makes
  * sense for  a DB adaptor class  to allow programmers creating  DB row objects
  * without querying  the DB  itself.  You  can kill  sporadic creation  of such
- * objects then,  by nullifying  the allocator function  using this  API.  Your
- * object shall be allocated using #RB_NEWOBJ_OF() directly.
+ * objects then,  by nullifying  the allocator function  using this  API.
  *
  * @param[out]  klass  The class to modify.
  * @pre         `klass` must be an instance of Class.
@@ -247,21 +249,17 @@ void rb_undef_alloc_func(VALUE klass);
  *
  * @internal
  *
- * Who cares?  @shyouhei fins no practical usage of the return value.  Maybe we
+ * Who cares?  @shyouhei finds no practical usage of the return value.  Maybe we
  * need KonMari.
  */
 rb_alloc_func_t rb_get_alloc_func(VALUE klass);
 
 /**
- * Clears  the constant  cache.   Extension libraries  should  not bother  such
- * things.   Just forget  about this  API (or  even, the  presence of  constant
- * cache).
- *
- * @internal
- *
- * Completely no idea why this function is defined in vm_method.c.
+ * Clears the inline constant caches associated with a particular ID. Extension
+ * libraries should not bother with such things. Just forget about this API (or
+ * even, the presence of constant caches).
  */
-void rb_clear_constant_cache(void);
+void rb_clear_constant_cache_for_id(ID id);
 
 /**
  * Resembles `alias`.

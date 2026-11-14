@@ -3,7 +3,7 @@ require_relative 'fixtures/classes'
 
 describe "Module#prepend" do
   it "is a public method" do
-    Module.should have_public_instance_method(:prepend, false)
+    Module.public_instance_methods(false).should.include?(:prepend)
   end
 
   it "does not affect the superclass" do
@@ -73,6 +73,26 @@ describe "Module#prepend" do
       end
     end
     foo.call.should == 'm'
+  end
+
+  it "updates the optimized method when a prepended module is updated" do
+    out = ruby_exe(<<~RUBY)
+    module M; end
+    class Integer
+      prepend M
+    end
+    l = -> { 1 + 2 }
+    p l.call
+    M.module_eval do
+      def +(o)
+        $called = true
+        super(o)
+      end
+    end
+    p l.call
+    p $called
+    RUBY
+    out.should == "3\n3\ntrue\n"
   end
 
   it "updates the method when there is a base included method and the prepended module overrides it" do
@@ -241,6 +261,8 @@ describe "Module#prepend" do
       B.prepend M
       B.foo.should == 'm'
     end
+  ensure
+    ModuleSpecs.send(:remove_const, :ConstUpdatePrepended)
   end
 
   it "updates the constant when a prepended module is updated" do
@@ -261,6 +283,8 @@ describe "Module#prepend" do
       M.const_set(:FOO, 'm')
       B.foo.should == 'm'
     end
+  ensure
+    ModuleSpecs.send(:remove_const, :ConstPrependedUpdated)
   end
 
   it "updates the constant when there is a base included constant and the prepended module overrides it" do
@@ -282,6 +306,8 @@ describe "Module#prepend" do
       A.prepend M
       A.foo.should == 'm'
     end
+  ensure
+    ModuleSpecs.send(:remove_const, :ConstIncludedPrependedOverride)
   end
 
   it "updates the constant when there is a base included constant and the prepended module is later updated" do
@@ -305,6 +331,8 @@ describe "Module#prepend" do
       M.const_set(:FOO, 'm')
       A.foo.should == 'm'
     end
+  ensure
+    ModuleSpecs.send(:remove_const, :ConstIncludedPrependedLaterUpdated)
   end
 
   it "updates the constant when a module prepended after a constant is later updated" do
@@ -328,6 +356,8 @@ describe "Module#prepend" do
       M.const_set(:FOO, 'm')
       B.foo.should == 'm'
     end
+  ensure
+    ModuleSpecs.send(:remove_const, :ConstUpdatedPrependedAfterLaterUpdated)
   end
 
   it "updates the constant when a module is prepended after another and the constant is defined later on that module" do
@@ -352,6 +382,8 @@ describe "Module#prepend" do
       N.const_set(:FOO, 'n')
       A.foo.should == 'n'
     end
+  ensure
+    ModuleSpecs.send(:remove_const, :ConstUpdatedPrependedAfterConstDefined)
   end
 
   it "updates the constant when a module is included in a prepended module and the constant is defined later" do
@@ -379,6 +411,8 @@ describe "Module#prepend" do
       N.const_set(:FOO, 'n')
       A.foo.should == 'n'
     end
+  ensure
+    ModuleSpecs.send(:remove_const, :ConstUpdatedIncludedInPrependedConstDefinedLater)
   end
 
   it "updates the constant when a new module with an included module is prepended" do
@@ -405,29 +439,47 @@ describe "Module#prepend" do
       B.prepend M
       B.foo.should == 'n'
     end
+  ensure
+    ModuleSpecs.send(:remove_const, :ConstUpdatedNewModuleIncludedPrepended)
   end
 
   it "raises a TypeError when the argument is not a Module" do
-    -> { ModuleSpecs::Basic.prepend(Class.new) }.should raise_error(TypeError)
+    -> { ModuleSpecs::Basic.prepend(Class.new) }.should.raise(TypeError)
   end
 
   it "does not raise a TypeError when the argument is an instance of a subclass of Module" do
-    -> { ModuleSpecs::SubclassSpec.prepend(ModuleSpecs::Subclass.new) }.should_not raise_error(TypeError)
+    class ModuleSpecs::SubclassSpec::AClass
+    end
+    -> { ModuleSpecs::SubclassSpec::AClass.prepend(ModuleSpecs::Subclass.new) }.should_not.raise(TypeError)
+  ensure
+    ModuleSpecs::SubclassSpec.send(:remove_const, :AClass)
+  end
+
+  it "raises a TypeError when the argument is a refinement" do
+    refinement = nil
+
+    Module.new do
+      refine String do
+        refinement = self
+      end
+    end
+
+    -> { ModuleSpecs::Basic.prepend(refinement) }.should.raise(TypeError, "Cannot prepend refinement")
   end
 
   it "imports constants" do
     m1 = Module.new
     m1::MY_CONSTANT = 1
     m2 = Module.new { prepend(m1) }
-    m2.constants.should include(:MY_CONSTANT)
+    m2.constants.should.include?(:MY_CONSTANT)
   end
 
   it "imports instance methods" do
-    Module.new { prepend ModuleSpecs::A }.instance_methods.should include(:ma)
+    Module.new { prepend ModuleSpecs::A }.instance_methods.should.include?(:ma)
   end
 
   it "does not import methods to modules and classes" do
-    Module.new { prepend ModuleSpecs::A }.methods.should_not include(:ma)
+    Module.new { prepend ModuleSpecs::A }.methods.should_not.include?(:ma)
   end
 
   it "allows wrapping methods" do
@@ -453,7 +505,7 @@ describe "Module#prepend" do
 
   it "includes prepended modules in ancestors" do
     m = Module.new
-    Class.new { prepend(m) }.ancestors.should include(m)
+    Class.new { prepend(m) }.ancestors.should.include?(m)
   end
 
   it "reports the prepended module as the method owner" do
@@ -469,10 +521,23 @@ describe "Module#prepend" do
     c.public_instance_method(:meth).owner.should == m
   end
 
-  it "causes the prepended module's method to be aliased by alias_method" do
-    m = Module.new { def meth; :m end }
-    c = Class.new { def meth; :c end; prepend(m); alias_method :alias, :meth }
-    c.new.alias.should == :m
+  ruby_version_is '4.1' do
+    it "causes the prepended module's method to be aliased by alias_method" do
+      m = Module.new { def meth; :m end }
+      c = Class.new { def meth; :c end; prepend(m) }
+      -> {
+        c.send(:alias_method, :alias, :meth)
+      }.should complain(/aliasing .*#meth defined in a prepended module .* is deprecated/)
+      c.new.alias.should == :m
+    end
+  end
+
+  ruby_version_is ''...'4.1' do
+    it "causes the prepended module's method to be aliased by alias_method" do
+      m = Module.new { def meth; :m end }
+      c = Class.new { def meth; :c end; prepend(m); alias_method :alias, :meth }
+      c.new.alias.should == :m
+    end
   end
 
   it "reports the class for the owner of an aliased method on the class" do
@@ -481,57 +546,53 @@ describe "Module#prepend" do
     c.instance_method(:alias).owner.should == c
   end
 
-  it "reports the class for the owner of a method aliased from the prepended module" do
-    m = Module.new { def meth; :m end }
-    c = Class.new { prepend(m); alias_method :alias, :meth }
-    c.instance_method(:alias).owner.should == c
+  ruby_version_is '4.1' do
+    it "reports the class for the owner of a method aliased from the prepended module" do
+      m = Module.new { def meth; :m end }
+      c = Class.new { prepend(m) }
+      -> {
+        c.send(:alias_method, :alias, :meth)
+      }.should complain(/aliasing .*#meth defined in a prepended module .* is deprecated/)
+      c.instance_method(:alias).owner.should == c
+    end
+  end
+
+  ruby_version_is ''...'4.1' do
+    it "reports the class for the owner of a method aliased from the prepended module" do
+      m = Module.new { def meth; :m end }
+      c = Class.new { prepend(m); alias_method :alias, :meth }
+      c.instance_method(:alias).owner.should == c
+    end
   end
 
   it "sees an instance of a prepended class as kind of the prepended module" do
     m = Module.new
     c = Class.new { prepend(m) }
-    c.new.should be_kind_of(m)
+    c.new.should.is_a?(m)
   end
 
   it "keeps the module in the chain when dupping the class" do
     m = Module.new
     c = Class.new { prepend(m) }
-    c.dup.new.should be_kind_of(m)
+    c.dup.new.should.is_a?(m)
   end
 
-  ruby_version_is '0'...'3.0' do
-    it "keeps the module in the chain when dupping an intermediate module" do
-      m1 = Module.new { def calc(x) x end }
-      m2 = Module.new { prepend(m1) }
-      c1 = Class.new { prepend(m2) }
-      m2dup = m2.dup
-      m2dup.ancestors.should == [m2dup,m1,m2]
-      c2 = Class.new { prepend(m2dup) }
-      c1.ancestors[0,3].should == [m1,m2,c1]
-      c1.new.should be_kind_of(m1)
-      c2.ancestors[0,4].should == [m2dup,m1,m2,c2]
-      c2.new.should be_kind_of(m1)
-    end
-  end
-
-  ruby_version_is '3.0' do
-    it "uses only new module when dupping the module" do
-      m1 = Module.new { def calc(x) x end }
-      m2 = Module.new { prepend(m1) }
-      c1 = Class.new { prepend(m2) }
-      m2dup = m2.dup
-      m2dup.ancestors.should == [m1,m2dup]
-      c2 = Class.new { prepend(m2dup) }
-      c1.ancestors[0,3].should == [m1,m2,c1]
-      c1.new.should be_kind_of(m1)
-      c2.ancestors[0,3].should == [m1,m2dup,c2]
-      c2.new.should be_kind_of(m1)
-    end
+  it "uses only new module when dupping the module" do
+    m1 = Module.new { def calc(x) x end }
+    m2 = Module.new { prepend(m1) }
+    c1 = Class.new { prepend(m2) }
+    m2dup = m2.dup
+    m2dup.ancestors.should == [m1,m2dup]
+    c2 = Class.new { prepend(m2dup) }
+    c1.ancestors[0,3].should == [m1,m2,c1]
+    c1.new.should.is_a?(m1)
+    c2.ancestors[0,3].should == [m1,m2dup,c2]
+    c2.new.should.is_a?(m1)
   end
 
   it "depends on prepend_features to add the module" do
     m = Module.new { def self.prepend_features(mod) end }
-    Class.new { prepend(m) }.ancestors.should_not include(m)
+    Class.new { prepend(m) }.ancestors.should_not.include?(m)
   end
 
   it "adds the module in the subclass chains" do
@@ -592,7 +653,7 @@ describe "Module#prepend" do
         super << :class
       end
     end
-    -> { c.new.chain }.should raise_error(NoMethodError)
+    -> { c.new.chain }.should.raise(NoMethodError)
   end
 
   it "calls prepended after prepend_features" do
@@ -611,12 +672,24 @@ describe "Module#prepend" do
     ScratchPad.recorded.should == [[:prepend_features, c], [:prepended, c]]
   end
 
+  it "prepends a module if it is included in a super class" do
+    module ModuleSpecs::M3
+      module M; end
+      class A; include M; end
+      class B < A; prepend M; end
+
+      all = [A, B, M]
+
+      (B.ancestors.filter { |a| all.include?(a) }).should == [M, B, A, M]
+    end
+  end
+
   it "detects cyclic prepends" do
     -> {
       module ModuleSpecs::P
         prepend ModuleSpecs::P
       end
-    }.should raise_error(ArgumentError)
+    }.should.raise(ArgumentError)
   end
 
   it "doesn't accept no-arguments" do
@@ -624,7 +697,7 @@ describe "Module#prepend" do
       Module.new do
         prepend
       end
-    }.should raise_error(ArgumentError)
+    }.should.raise(ArgumentError)
   end
 
   it "returns the class it's included into" do
@@ -731,6 +804,33 @@ describe "Module#prepend" do
     ary.should == [3, 2, 1]
   end
 
+  it "does not prepend a second copy if the module already indirectly exists in the hierarchy" do
+    mod = Module.new do; end
+    submod = Module.new do; end
+    klass = Class.new do; end
+    klass.include(mod)
+    mod.prepend(submod)
+    klass.include(mod)
+
+    klass.ancestors.take(4).should == [klass, submod, mod, Object]
+  end
+
+  # https://bugs.ruby-lang.org/issues/17423
+  describe "when module already exists in ancestor chain" do
+    it "modifies the ancestor chain" do
+      m = Module.new do; end
+      a = Module.new do; end
+      b = Class.new do; end
+
+      b.include(a)
+      a.prepend(m)
+      b.ancestors.take(4).should == [b, m, a, Object]
+
+      b.prepend(m)
+      b.ancestors.take(5).should == [m, b, m, a, Object]
+    end
+  end
+
   describe "called on a module" do
     describe "included into a class"
     it "does not obscure the module's methods from reflective access" do
@@ -743,7 +843,7 @@ describe "Module#prepend" do
       pre = Module.new
       mod.prepend pre
 
-      cls.instance_methods.should include(:foo)
+      cls.instance_methods.should.include?(:foo)
     end
   end
 end

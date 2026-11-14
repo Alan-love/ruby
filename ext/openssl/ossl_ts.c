@@ -5,20 +5,12 @@
  */
 /*
  * This program is licenced under the same licence as Ruby.
- * (See the file 'LICENCE'.)
+ * (See the file 'COPYING'.)
  */
 #include "ossl.h"
 
 #ifndef OPENSSL_NO_TS
 
-#define NewTSRequest(klass) \
-    TypedData_Wrap_Struct((klass), &ossl_ts_req_type, 0)
-#define SetTSRequest(obj, req) do { \
-    if (!(req)) { \
-        ossl_raise(rb_eRuntimeError, "TS_REQ wasn't initialized."); \
-    } \
-    RTYPEDDATA_DATA(obj) = (req); \
-} while (0)
 #define GetTSRequest(obj, req) do { \
     TypedData_Get_Struct((obj), TS_REQ, &ossl_ts_req_type, (req)); \
     if (!(req)) { \
@@ -26,14 +18,6 @@
     } \
 } while (0)
 
-#define NewTSResponse(klass) \
-    TypedData_Wrap_Struct((klass), &ossl_ts_resp_type, 0)
-#define SetTSResponse(obj, resp) do { \
-    if (!(resp)) { \
-        ossl_raise(rb_eRuntimeError, "TS_RESP wasn't initialized."); \
-    } \
-    RTYPEDDATA_DATA(obj) = (resp); \
-} while (0)
 #define GetTSResponse(obj, resp) do { \
     TypedData_Get_Struct((obj), TS_RESP, &ossl_ts_resp_type, (resp)); \
     if (!(resp)) { \
@@ -41,14 +25,6 @@
     } \
 } while (0)
 
-#define NewTSTokenInfo(klass) \
-    TypedData_Wrap_Struct((klass), &ossl_ts_token_info_type, 0)
-#define SetTSTokenInfo(obj, info) do { \
-    if (!(info)) { \
-        ossl_raise(rb_eRuntimeError, "TS_TST_INFO wasn't initialized."); \
-    } \
-    RTYPEDDATA_DATA(obj) = (info); \
-} while (0)
 #define GetTSTokenInfo(obj, info) do { \
     TypedData_Get_Struct((obj), TS_TST_INFO, &ossl_ts_token_info_type, (info)); \
     if (!(info)) { \
@@ -83,7 +59,7 @@ static const rb_data_type_t ossl_ts_req_type = {
     {
         0, ossl_ts_req_free,
     },
-    0, 0, RUBY_TYPED_FREE_IMMEDIATELY,
+    0, 0, RUBY_TYPED_THREAD_SAFE_FREE | RUBY_TYPED_WB_PROTECTED,
 };
 
 static void
@@ -97,13 +73,13 @@ static  const rb_data_type_t ossl_ts_resp_type = {
     {
         0, ossl_ts_resp_free,
     },
-    0, 0, RUBY_TYPED_FREE_IMMEDIATELY,
+    0, 0, RUBY_TYPED_THREAD_SAFE_FREE | RUBY_TYPED_WB_PROTECTED,
 };
 
 static void
 ossl_ts_token_info_free(void *ptr)
 {
-        TS_TST_INFO_free(ptr);
+    TS_TST_INFO_free(ptr);
 }
 
 static const rb_data_type_t ossl_ts_token_info_type = {
@@ -111,7 +87,7 @@ static const rb_data_type_t ossl_ts_token_info_type = {
     {
         0, ossl_ts_token_info_free,
     },
-    0, 0, RUBY_TYPED_FREE_IMMEDIATELY,
+    0, 0, RUBY_TYPED_THREAD_SAFE_FREE | RUBY_TYPED_WB_PROTECTED,
 };
 
 static VALUE
@@ -132,59 +108,10 @@ asn1_to_der(void *template, int (*i2d)(void *template, unsigned char **pp))
     return str;
 }
 
-static ASN1_OBJECT*
-obj_to_asn1obj(VALUE obj)
-{
-    ASN1_OBJECT *a1obj;
-
-    StringValue(obj);
-    a1obj = OBJ_txt2obj(RSTRING_PTR(obj), 0);
-    if(!a1obj) a1obj = OBJ_txt2obj(RSTRING_PTR(obj), 1);
-    if(!a1obj) ossl_raise(eASN1Error, "invalid OBJECT ID");
-
-    return a1obj;
-}
-
-static VALUE
-obj_to_asn1obj_i(VALUE obj)
-{
-    return (VALUE)obj_to_asn1obj(obj);
-}
-
-static VALUE
-get_asn1obj(ASN1_OBJECT *obj)
-{
-    BIO *out;
-    VALUE ret;
-    int nid;
-    if ((nid = OBJ_obj2nid(obj)) != NID_undef)
-        ret = rb_str_new2(OBJ_nid2sn(nid));
-    else{
-        if (!(out = BIO_new(BIO_s_mem())))
-            ossl_raise(eX509AttrError, NULL);
-        i2a_ASN1_OBJECT(out, obj);
-        ret = ossl_membio2str(out);
-    }
-
-    return ret;
-}
-
 static VALUE
 ossl_ts_req_alloc(VALUE klass)
 {
-    TS_REQ *req;
-    VALUE obj;
-
-    obj = NewTSRequest(klass);
-    if (!(req = TS_REQ_new()))
-        ossl_raise(eTimestampError, NULL);
-    SetTSRequest(obj, req);
-
-    /* Defaults */
-    TS_REQ_set_version(req, 1);
-    TS_REQ_set_cert_req(req, 1);
-
-    return obj;
+    return TypedData_Wrap_Struct(klass, &ossl_ts_req_type, NULL);
 }
 
 /*
@@ -199,23 +126,36 @@ ossl_ts_req_alloc(VALUE klass)
 static VALUE
 ossl_ts_req_initialize(int argc, VALUE *argv, VALUE self)
 {
-    TS_REQ *ts_req = DATA_PTR(self);
+    TS_REQ *req;
     BIO *in;
     VALUE arg;
 
-    if(rb_scan_args(argc, argv, "01", &arg) == 0) {
+    rb_scan_args(argc, argv, "01", &arg);
+    ossl_want_uninitialized(self, &ossl_ts_req_type);
+    if (argc == 0) {
+        req = TS_REQ_new();
+        if (!req)
+            ossl_raise(eTimestampError, "TS_REQ_new");
+        RTYPEDDATA_DATA(self) = req;
+
+        /* Defaults */
+        if (!TS_REQ_set_version(req, 1))
+            ossl_raise(eTimestampError, "TS_REQ_set_version");
+        if (!TS_REQ_set_cert_req(req, 1))
+            ossl_raise(eTimestampError, "TS_REQ_set_cert_req");
+
         return self;
     }
 
     arg = ossl_to_der_if_possible(arg);
     in = ossl_obj2bio(&arg);
-    ts_req = d2i_TS_REQ_bio(in, &ts_req);
+    req = d2i_TS_REQ_bio(in, NULL);
     BIO_free(in);
-    if (!ts_req) {
-        DATA_PTR(self) = NULL;
-        ossl_raise(eTimestampError, "Error when decoding the timestamp request");
+    if (!req) {
+        ossl_raise(eTimestampError,
+                   "Error when decoding the timestamp request");
     }
-    DATA_PTR(self) = ts_req;
+    RTYPEDDATA_DATA(self) = req;
 
     return self;
 }
@@ -233,11 +173,13 @@ ossl_ts_req_get_algorithm(VALUE self)
     TS_REQ *req;
     TS_MSG_IMPRINT *mi;
     X509_ALGOR *algor;
+    const ASN1_OBJECT *obj;
 
     GetTSRequest(self, req);
     mi = TS_REQ_get_msg_imprint(req);
     algor = TS_MSG_IMPRINT_get_algo(mi);
-    return get_asn1obj(algor->algorithm);
+    X509_ALGOR_get0(&obj, NULL, NULL, algor);
+    return ossl_asn1obj_to_string(obj);
 }
 
 /*
@@ -259,7 +201,7 @@ ossl_ts_req_set_algorithm(VALUE self, VALUE algo)
     X509_ALGOR *algor;
 
     GetTSRequest(self, req);
-    obj = obj_to_asn1obj(algo);
+    obj = ossl_to_asn1obj(algo);
     mi = TS_REQ_get_msg_imprint(req);
     algor = TS_MSG_IMPRINT_get_algo(mi);
     if (!X509_ALGOR_set0(algor, obj, V_ASN1_NULL, NULL)) {
@@ -288,7 +230,7 @@ ossl_ts_req_get_msg_imprint(VALUE self)
     mi = TS_REQ_get_msg_imprint(req);
     hashed_msg = TS_MSG_IMPRINT_get_msg(mi);
 
-    ret = rb_str_new((const char *)hashed_msg->data, hashed_msg->length);
+    ret = asn1str_to_str(hashed_msg);
 
     return ret;
 }
@@ -366,7 +308,7 @@ ossl_ts_req_get_policy_id(VALUE self)
     GetTSRequest(self, req);
     if (!TS_REQ_get_policy_id(req))
         return Qnil;
-    return get_asn1obj(TS_REQ_get_policy_id(req));
+    return ossl_asn1obj_to_string(TS_REQ_get_policy_id(req));
 }
 
 /*
@@ -389,7 +331,7 @@ ossl_ts_req_set_policy_id(VALUE self, VALUE oid)
     int ok;
 
     GetTSRequest(self, req);
-    obj = obj_to_asn1obj(oid);
+    obj = ossl_to_asn1obj(oid);
     ok = TS_REQ_set_policy_id(req, obj);
     ASN1_OBJECT_free(obj);
     if (!ok)
@@ -470,7 +412,9 @@ ossl_ts_req_set_cert_requested(VALUE self, VALUE requested)
     TS_REQ *req;
 
     GetTSRequest(self, req);
-    TS_REQ_set_cert_req(req, RTEST(requested));
+    if (!TS_REQ_set_cert_req(req, RTEST(requested))) {
+        ossl_raise(eTimestampError, "TS_REQ_set_cert_req");
+    }
 
     return requested;
 }
@@ -487,34 +431,47 @@ ossl_ts_req_to_der(VALUE self)
     TS_REQ *req;
     TS_MSG_IMPRINT *mi;
     X509_ALGOR *algo;
+    const ASN1_OBJECT *obj;
     ASN1_OCTET_STRING *hashed_msg;
 
     GetTSRequest(self, req);
     mi = TS_REQ_get_msg_imprint(req);
 
     algo = TS_MSG_IMPRINT_get_algo(mi);
-    if (OBJ_obj2nid(algo->algorithm) == NID_undef)
+    X509_ALGOR_get0(&obj, NULL, NULL, algo);
+    if (OBJ_obj2nid(obj) == NID_undef)
         ossl_raise(eTimestampError, "Message imprint missing algorithm");
 
     hashed_msg = TS_MSG_IMPRINT_get_msg(mi);
-    if (!hashed_msg->length)
+    if (!ASN1_STRING_length(hashed_msg))
         ossl_raise(eTimestampError, "Message imprint missing hashed message");
 
     return asn1_to_der((void *)req, (int (*)(void *, unsigned char **))i2d_TS_REQ);
 }
 
 static VALUE
+ossl_ts_req_to_text(VALUE self)
+{
+    TS_REQ *req;
+    BIO *out;
+
+    GetTSRequest(self, req);
+
+    out = BIO_new(BIO_s_mem());
+    if (!out) ossl_raise(eTimestampError, NULL);
+
+    if (!TS_REQ_print_bio(out, req)) {
+        BIO_free(out);
+        ossl_raise(eTimestampError, NULL);
+    }
+
+    return ossl_membio2str(out);
+}
+
+static VALUE
 ossl_ts_resp_alloc(VALUE klass)
 {
-    TS_RESP *resp;
-    VALUE obj;
-
-    obj = NewTSResponse(klass);
-    if (!(resp = TS_RESP_new()))
-        ossl_raise(eTimestampError, NULL);
-    SetTSResponse(obj, resp);
-
-    return obj;
+    return TypedData_Wrap_Struct(klass, &ossl_ts_resp_type, NULL);
 }
 
 /*
@@ -530,18 +487,19 @@ ossl_ts_resp_alloc(VALUE klass)
 static VALUE
 ossl_ts_resp_initialize(VALUE self, VALUE der)
 {
-    TS_RESP *ts_resp = DATA_PTR(self);
+    TS_RESP *resp;
     BIO *in;
 
+    ossl_want_uninitialized(self, &ossl_ts_resp_type);
     der = ossl_to_der_if_possible(der);
-    in  = ossl_obj2bio(&der);
-    ts_resp = d2i_TS_RESP_bio(in, &ts_resp);
+    in = ossl_obj2bio(&der);
+    resp = d2i_TS_RESP_bio(in, NULL);
     BIO_free(in);
-    if (!ts_resp) {
-        DATA_PTR(self) = NULL;
-        ossl_raise(eTimestampError, "Error when decoding the timestamp response");
+    if (!resp) {
+        ossl_raise(eTimestampError,
+                   "Error when decoding the timestamp response");
     }
-    DATA_PTR(self) = ts_resp;
+    RTYPEDDATA_DATA(self) = resp;
 
     return self;
 }
@@ -598,14 +556,7 @@ ossl_ts_resp_get_failure_info(VALUE self)
 {
     TS_RESP *resp;
     TS_STATUS_INFO *si;
-
-    /* The ASN1_BIT_STRING_get_bit changed from 1.0.0. to 1.1.0, making this
-     * const. */
-    #if defined(HAVE_TS_STATUS_INFO_GET0_FAILURE_INFO)
     const ASN1_BIT_STRING *fi;
-    #else
-    ASN1_BIT_STRING *fi;
-    #endif
 
     GetTSResponse(self, resp);
     si = TS_RESP_get_status_info(resp);
@@ -672,22 +623,15 @@ static VALUE
 ossl_ts_resp_get_token(VALUE self)
 {
     TS_RESP *resp;
-    PKCS7 *p7, *copy;
-    VALUE obj;
+    PKCS7 *p7;
 
     GetTSResponse(self, resp);
     if (!(p7 = TS_RESP_get_token(resp)))
         return Qnil;
-
-    obj = NewPKCS7(cPKCS7);
-
-    if (!(copy = PKCS7_dup(p7)))
-        ossl_raise(eTimestampError, NULL);
-
-    SetPKCS7(obj, copy);
-
-    return obj;
+    return ossl_pkcs7_new(p7);
 }
+
+static VALUE ossl_ts_token_info_alloc(VALUE klass);
 
 /*
  * Get the response's token info if present.
@@ -706,12 +650,10 @@ ossl_ts_resp_get_token_info(VALUE self)
     if (!(info = TS_RESP_get_tst_info(resp)))
         return Qnil;
 
-    obj = NewTSTokenInfo(cTimestampTokenInfo);
-
+    obj = ossl_ts_token_info_alloc(cTimestampTokenInfo);
     if (!(copy = TS_TST_INFO_dup(info)))
-        ossl_raise(eTimestampError, NULL);
-
-    SetTSTokenInfo(obj, copy);
+        ossl_raise(eTimestampError, "TS_TST_INFO_dup");
+    RTYPEDDATA_DATA(obj) = copy;
 
     return obj;
 }
@@ -730,12 +672,14 @@ ossl_ts_resp_get_tsa_certificate(VALUE self)
     TS_RESP *resp;
     PKCS7 *p7;
     PKCS7_SIGNER_INFO *ts_info;
-    X509 *cert;
+    const X509 *cert;
 
     GetTSResponse(self, resp);
     if (!(p7 = TS_RESP_get_token(resp)))
         return Qnil;
     ts_info = sk_PKCS7_SIGNER_INFO_value(p7->d.sign->signer_info, 0);
+    if (!ts_info)
+        return Qnil;
     cert = PKCS7_cert_from_signer_info(p7, ts_info);
     if (!cert)
         return Qnil;
@@ -755,6 +699,25 @@ ossl_ts_resp_to_der(VALUE self)
 
     GetTSResponse(self, resp);
     return asn1_to_der((void *)resp, (int (*)(void *, unsigned char **))i2d_TS_RESP);
+}
+
+static VALUE
+ossl_ts_resp_to_text(VALUE self)
+{
+    TS_RESP *resp;
+    BIO *out;
+
+    GetTSResponse(self, resp);
+
+    out = BIO_new(BIO_s_mem());
+    if (!out) ossl_raise(eTimestampError, NULL);
+
+    if (!TS_RESP_print_bio(out, resp)) {
+        BIO_free(out);
+        ossl_raise(eTimestampError, NULL);
+    }
+
+    return ossl_membio2str(out);
 }
 
 /*
@@ -826,16 +789,26 @@ ossl_ts_resp_verify(int argc, VALUE *argv, VALUE self)
         X509_up_ref(cert);
     }
 
+    if (!X509_STORE_up_ref(x509st)) {
+        sk_X509_pop_free(x509inter, X509_free);
+        TS_VERIFY_CTX_free(ctx);
+        ossl_raise(eTimestampError, "X509_STORE_up_ref");
+    }
+
+#ifdef HAVE_TS_VERIFY_CTX_SET0_CERTS
+    TS_VERIFY_CTX_set0_certs(ctx, x509inter);
+    TS_VERIFY_CTX_set0_store(ctx, x509st);
+#else
+# if OSSL_OPENSSL_PREREQ(3, 0, 0) || OSSL_IS_LIBRESSL
     TS_VERIFY_CTX_set_certs(ctx, x509inter);
-    TS_VERIFY_CTX_add_flags(ctx, TS_VFY_SIGNATURE);
+# else
+    TS_VERIFY_CTS_set_certs(ctx, x509inter);
+# endif
     TS_VERIFY_CTX_set_store(ctx, x509st);
+#endif
+    TS_VERIFY_CTX_add_flags(ctx, TS_VFY_SIGNATURE);
 
     ok = TS_RESP_verify_response(ctx, resp);
-    /*
-     * TS_VERIFY_CTX_set_store() call above does not increment the reference
-     * counter, so it must be unset before TS_VERIFY_CTX_free() is called.
-     */
-    TS_VERIFY_CTX_set_store(ctx, NULL);
     TS_VERIFY_CTX_free(ctx);
 
     if (!ok)
@@ -847,15 +820,7 @@ ossl_ts_resp_verify(int argc, VALUE *argv, VALUE self)
 static VALUE
 ossl_ts_token_info_alloc(VALUE klass)
 {
-    TS_TST_INFO *info;
-    VALUE obj;
-
-    obj = NewTSTokenInfo(klass);
-    if (!(info = TS_TST_INFO_new()))
-        ossl_raise(eTimestampError, NULL);
-    SetTSTokenInfo(obj, info);
-
-    return obj;
+    return TypedData_Wrap_Struct(klass, &ossl_ts_token_info_type, NULL);
 }
 
 /*
@@ -871,18 +836,19 @@ ossl_ts_token_info_alloc(VALUE klass)
 static VALUE
 ossl_ts_token_info_initialize(VALUE self, VALUE der)
 {
-    TS_TST_INFO *info = DATA_PTR(self);
+    TS_TST_INFO *info;
     BIO *in;
 
+    ossl_want_uninitialized(self, &ossl_ts_token_info_type);
     der = ossl_to_der_if_possible(der);
-    in  = ossl_obj2bio(&der);
-    info = d2i_TS_TST_INFO_bio(in, &info);
+    in = ossl_obj2bio(&der);
+    info = d2i_TS_TST_INFO_bio(in, NULL);
     BIO_free(in);
     if (!info) {
-        DATA_PTR(self) = NULL;
-        ossl_raise(eTimestampError, "Error when decoding the timestamp token info");
+        ossl_raise(eTimestampError,
+                   "Error when decoding the timestamp token info");
     }
-    DATA_PTR(self) = info;
+    RTYPEDDATA_DATA(self) = info;
 
     return self;
 }
@@ -922,7 +888,7 @@ ossl_ts_token_info_get_policy_id(VALUE self)
     TS_TST_INFO *info;
 
     GetTSTokenInfo(self, info);
-    return get_asn1obj(TS_TST_INFO_get_policy_id(info));
+    return ossl_asn1obj_to_string(TS_TST_INFO_get_policy_id(info));
 }
 
 /*
@@ -944,11 +910,13 @@ ossl_ts_token_info_get_algorithm(VALUE self)
     TS_TST_INFO *info;
     TS_MSG_IMPRINT *mi;
     X509_ALGOR *algo;
+    const ASN1_OBJECT *obj;
 
     GetTSTokenInfo(self, info);
     mi = TS_TST_INFO_get_msg_imprint(info);
     algo = TS_MSG_IMPRINT_get_algo(mi);
-    return get_asn1obj(algo->algorithm);
+    X509_ALGOR_get0(&obj, NULL, NULL, algo);
+    return ossl_asn1obj_to_string(obj);
 }
 
 /*
@@ -974,7 +942,7 @@ ossl_ts_token_info_get_msg_imprint(VALUE self)
     GetTSTokenInfo(self, info);
     mi = TS_TST_INFO_get_msg_imprint(info);
     hashed_msg = TS_MSG_IMPRINT_get_msg(mi);
-    ret = rb_str_new((const char *)hashed_msg->data, hashed_msg->length);
+    ret = asn1str_to_str(hashed_msg);
 
     return ret;
 }
@@ -1073,37 +1041,138 @@ ossl_ts_token_info_to_der(VALUE self)
     return asn1_to_der((void *)info, (int (*)(void *, unsigned char **))i2d_TS_TST_INFO);
 }
 
-static ASN1_INTEGER *
-ossl_tsfac_serial_cb(struct TS_resp_ctx *ctx, void *data)
+static VALUE
+ossl_ts_token_info_to_text(VALUE self)
 {
-    ASN1_INTEGER **snptr = (ASN1_INTEGER **)data;
-    ASN1_INTEGER *sn = *snptr;
-    *snptr = NULL;
+    TS_TST_INFO *info;
+    BIO *out;
+
+    GetTSTokenInfo(self, info);
+
+    out = BIO_new(BIO_s_mem());
+    if (!out) ossl_raise(eTimestampError, NULL);
+
+    if (!TS_TST_INFO_print_bio(out, info)) {
+        BIO_free(out);
+        ossl_raise(eTimestampError, NULL);
+    }
+
+    return ossl_membio2str(out);
+}
+
+struct tsfac_create_ts_args {
+    VALUE self, key, certificate, request;
+    TS_RESP_CTX *ctx;
+    ASN1_INTEGER *asn1_serial;
+    long lgen_time;
+    ASN1_OBJECT *def_policy_id_obj;
+    STACK_OF(X509) *inter_certs;
+    VALUE md_holders;
+};
+
+static ASN1_INTEGER *
+ossl_tsfac_serial_cb(TS_RESP_CTX *ctx, void *args_)
+{
+    struct tsfac_create_ts_args *args = args_;
+    ASN1_INTEGER *sn = args->asn1_serial;
+    // Will be freed by TS_RESP_create_response()
+    args->asn1_serial = NULL;
     return sn;
 }
 
 static int
 #if !defined(LIBRESSL_VERSION_NUMBER)
-ossl_tsfac_time_cb(struct TS_resp_ctx *ctx, void *data, long *sec, long *usec)
+ossl_tsfac_time_cb(TS_RESP_CTX *ctx, void *args_, long *sec, long *usec)
 #else
-ossl_tsfac_time_cb(struct TS_resp_ctx *ctx, void *data, time_t *sec, long *usec)
+ossl_tsfac_time_cb(TS_RESP_CTX *ctx, void *args_, time_t *sec, long *usec)
 #endif
 {
-    *sec = *((long *)data);
+    struct tsfac_create_ts_args *args = args_;
+    *sec = args->lgen_time;
     *usec = 0;
     return 1;
 }
 
 static VALUE
-ossl_evp_get_digestbyname_i(VALUE arg)
+tsfac_create_ts_i(VALUE args_)
 {
-    return (VALUE)ossl_evp_get_digestbyname(arg);
-}
+    struct tsfac_create_ts_args *args = (void *)args_;
+    TS_RESP_CTX *ctx;
 
-static VALUE
-ossl_obj2bio_i(VALUE arg)
-{
-    return (VALUE)ossl_obj2bio((VALUE *)arg);
+    ctx = args->ctx = TS_RESP_CTX_new();
+    if (!ctx)
+        ossl_raise(eTimestampError, "TS_RESP_CTX_new");
+
+    X509 *tsa_cert = GetX509CertPtr(args->certificate);
+    if (!TS_RESP_CTX_set_signer_cert(ctx, tsa_cert))
+        ossl_raise(eTimestampError,
+                   "Certificate does not contain the timestamping extension");
+
+    VALUE additional_certs = ossl_tsfac_get_additional_certs(args->self);
+    if (rb_obj_is_kind_of(additional_certs, rb_cArray)) {
+        args->inter_certs = ossl_x509_ary2sk(additional_certs);
+
+        /* this dups the sk_X509 and ups each cert's ref count */
+        if (!TS_RESP_CTX_set_certs(ctx, args->inter_certs))
+            ossl_raise(eTimestampError, "TS_RESP_CTX_set_certs");
+    }
+
+    EVP_PKEY *sign_key = GetPrivPKeyPtr(args->key);
+    if (!TS_RESP_CTX_set_signer_key(ctx, sign_key))
+        ossl_raise(eTimestampError, "TS_RESP_CTX_set_signer_key");
+
+    VALUE gen_time = ossl_tsfac_get_gen_time(args->self);
+    if (!rb_obj_is_instance_of(gen_time, rb_cTime))
+        ossl_raise(eTimestampError, "@gen_time must be a Time");
+    args->lgen_time = NUM2LONG(rb_funcall(gen_time, rb_intern("to_i"), 0));
+    TS_RESP_CTX_set_time_cb(ctx, ossl_tsfac_time_cb, args);
+
+    VALUE serial_number = ossl_tsfac_get_serial_number(args->self);
+    if (NIL_P(serial_number))
+        ossl_raise(eTimestampError, "@serial_number must be set");
+    args->asn1_serial = num_to_asn1integer(serial_number, NULL);
+    TS_RESP_CTX_set_serial_cb(ctx, ossl_tsfac_serial_cb, args);
+
+    TS_REQ *req;
+    GetTSRequest(args->request, req);
+    const ASN1_OBJECT *def_policy = TS_REQ_get_policy_id(req);
+    VALUE def_policy_id = ossl_tsfac_get_default_policy_id(args->self);
+    if (!def_policy) {
+        if (NIL_P(def_policy_id)) {
+            ossl_raise(eTimestampError,
+                       "No policy id in the request and no default policy set");
+        }
+        def_policy = args->def_policy_id_obj = ossl_to_asn1obj(def_policy_id);
+    }
+    if (!TS_RESP_CTX_set_def_policy(ctx, def_policy))
+        ossl_raise(eTimestampError, "TS_RESP_CTX_set_def_policy");
+
+    VALUE allowed_digests = ossl_tsfac_get_allowed_digests(args->self);
+    if (rb_obj_is_kind_of(allowed_digests, rb_cArray)) {
+        args->md_holders = rb_ary_new_capa(RARRAY_LEN(allowed_digests));
+        for (rb_len_t i = 0; i < RARRAY_LEN(allowed_digests); i++) {
+            VALUE digest = rb_ary_entry(allowed_digests, i), md_holder;
+            const EVP_MD *md = ossl_evp_md_fetch(digest, &md_holder);
+            rb_ary_push(args->md_holders, md_holder);
+            if (!TS_RESP_CTX_add_md(ctx, md))
+                ossl_raise(eTimestampError, "TS_RESP_CTX_add_md");
+        }
+    }
+
+    VALUE ret = ossl_ts_resp_alloc(cTimestampResponse);
+    VALUE str = ossl_to_der(args->request);
+    BIO *req_bio = ossl_obj2bio(&str);
+    TS_RESP *response = TS_RESP_create_response(ctx, req_bio);
+    BIO_free(req_bio);
+    if (!response)
+        ossl_raise(eTimestampError, "Error during response generation");
+    RTYPEDDATA_DATA(ret) = response;
+
+    /* bad responses aren't exceptional, but openssl still sets error
+     * information. */
+    ossl_clear_error();
+
+    return ret;
 }
 
 /*
@@ -1133,127 +1202,20 @@ ossl_obj2bio_i(VALUE arg)
 static VALUE
 ossl_tsfac_create_ts(VALUE self, VALUE key, VALUE certificate, VALUE request)
 {
-    VALUE serial_number, def_policy_id, gen_time, additional_certs, allowed_digests;
-    VALUE str;
-    STACK_OF(X509) *inter_certs;
-    VALUE tsresp, ret = Qnil;
-    EVP_PKEY *sign_key;
-    X509 *tsa_cert;
-    TS_REQ *req;
-    TS_RESP *response = NULL;
-    TS_RESP_CTX *ctx = NULL;
-    BIO *req_bio;
-    ASN1_INTEGER *asn1_serial = NULL;
-    ASN1_OBJECT *def_policy_id_obj = NULL;
-    long lgen_time;
-    const char * err_msg = NULL;
-    int status = 0;
-
-    tsresp = NewTSResponse(cTimestampResponse);
-    tsa_cert = GetX509CertPtr(certificate);
-    sign_key = GetPrivPKeyPtr(key);
-    GetTSRequest(request, req);
-
-    gen_time = ossl_tsfac_get_gen_time(self);
-    if (!rb_obj_is_instance_of(gen_time, rb_cTime)) {
-        err_msg = "@gen_time must be a Time.";
-        goto end;
-    }
-    lgen_time = NUM2LONG(rb_funcall(gen_time, rb_intern("to_i"), 0));
-
-    serial_number = ossl_tsfac_get_serial_number(self);
-    if (NIL_P(serial_number)) {
-        err_msg = "@serial_number must be set.";
-        goto end;
-    }
-    asn1_serial = num_to_asn1integer(serial_number, NULL);
-
-    def_policy_id = ossl_tsfac_get_default_policy_id(self);
-    if (NIL_P(def_policy_id) && !TS_REQ_get_policy_id(req)) {
-        err_msg = "No policy id in the request and no default policy set";
-        goto end;
-    }
-    if (!NIL_P(def_policy_id) && !TS_REQ_get_policy_id(req)) {
-        def_policy_id_obj = (ASN1_OBJECT*)rb_protect(obj_to_asn1obj_i, (VALUE)def_policy_id, &status);
-        if (status)
-            goto end;
-    }
-
-    if (!(ctx = TS_RESP_CTX_new())) {
-        err_msg = "Memory allocation failed.";
-        goto end;
-    }
-
-    TS_RESP_CTX_set_serial_cb(ctx, ossl_tsfac_serial_cb, &asn1_serial);
-    if (!TS_RESP_CTX_set_signer_cert(ctx, tsa_cert)) {
-        err_msg = "Certificate does not contain the timestamping extension";
-        goto end;
-    }
-
-    additional_certs = ossl_tsfac_get_additional_certs(self);
-    if (rb_obj_is_kind_of(additional_certs, rb_cArray)) {
-        inter_certs = ossl_protect_x509_ary2sk(additional_certs, &status);
-        if (status)
-                goto end;
-
-        /* this dups the sk_X509 and ups each cert's ref count */
-        TS_RESP_CTX_set_certs(ctx, inter_certs);
-        sk_X509_pop_free(inter_certs, X509_free);
-    }
-
-    TS_RESP_CTX_set_signer_key(ctx, sign_key);
-    if (!NIL_P(def_policy_id) && !TS_REQ_get_policy_id(req))
-        TS_RESP_CTX_set_def_policy(ctx, def_policy_id_obj);
-    if (TS_REQ_get_policy_id(req))
-        TS_RESP_CTX_set_def_policy(ctx, TS_REQ_get_policy_id(req));
-    TS_RESP_CTX_set_time_cb(ctx, ossl_tsfac_time_cb, &lgen_time);
-
-    allowed_digests = ossl_tsfac_get_allowed_digests(self);
-    if (rb_obj_is_kind_of(allowed_digests, rb_cArray)) {
-        int i;
-        VALUE rbmd;
-        const EVP_MD *md;
-
-        for (i = 0; i < RARRAY_LEN(allowed_digests); i++) {
-            rbmd = rb_ary_entry(allowed_digests, i);
-            md = (const EVP_MD *)rb_protect(ossl_evp_get_digestbyname_i, rbmd, &status);
-            if (status)
-                goto end;
-            TS_RESP_CTX_add_md(ctx, md);
-        }
-    }
-
-    str = rb_protect(ossl_to_der, request, &status);
-    if (status)
-        goto end;
-
-    req_bio = (BIO*)rb_protect(ossl_obj2bio_i, (VALUE)&str, &status);
-    if (status)
-        goto end;
-
-    response = TS_RESP_create_response(ctx, req_bio);
-    BIO_free(req_bio);
-
-    if (!response) {
-        err_msg = "Error during response generation";
-        goto end;
-    }
-
-    /* bad responses aren't exceptional, but openssl still sets error
-     * information. */
-    ossl_clear_error();
-
-    SetTSResponse(tsresp, response);
-    ret = tsresp;
-
-end:
-    ASN1_INTEGER_free(asn1_serial);
-    ASN1_OBJECT_free(def_policy_id_obj);
-    TS_RESP_CTX_free(ctx);
-    if (err_msg)
-        rb_exc_raise(ossl_make_error(eTimestampError, rb_str_new_cstr(err_msg)));
-    if (status)
-        rb_jump_tag(status);
+    struct tsfac_create_ts_args args = {
+        .self = self,
+        .key = key,
+        .certificate = certificate,
+        .request = request,
+    };
+    int state;
+    VALUE ret = rb_protect(tsfac_create_ts_i, (VALUE)&args, &state);
+    ASN1_INTEGER_free(args.asn1_serial);
+    ASN1_OBJECT_free(args.def_policy_id_obj);
+    TS_RESP_CTX_free(args.ctx);
+    sk_X509_pop_free(args.inter_certs, X509_free);
+    if (state)
+        rb_jump_tag(state);
     return ret;
 }
 
@@ -1263,10 +1225,6 @@ end:
 void
 Init_ossl_ts(void)
 {
-    #if 0
-    mOSSL = rb_define_module("OpenSSL"); /* let rdoc know about mOSSL */
-    #endif
-
     /*
      * Possible return value for +Response#failure_info+. Indicates that the
      * timestamp server rejects the message imprint algorithm used in the
@@ -1356,6 +1314,7 @@ Init_ossl_ts(void)
     rb_define_method(cTimestampResponse, "token_info", ossl_ts_resp_get_token_info, 0);
     rb_define_method(cTimestampResponse, "tsa_certificate", ossl_ts_resp_get_tsa_certificate, 0);
     rb_define_method(cTimestampResponse, "to_der", ossl_ts_resp_to_der, 0);
+    rb_define_method(cTimestampResponse, "to_text", ossl_ts_resp_to_text, 0);
     rb_define_method(cTimestampResponse, "verify", ossl_ts_resp_verify, -1);
 
     /* Document-class: OpenSSL::Timestamp::TokenInfo
@@ -1374,6 +1333,7 @@ Init_ossl_ts(void)
     rb_define_method(cTimestampTokenInfo, "ordering", ossl_ts_token_info_get_ordering, 0);
     rb_define_method(cTimestampTokenInfo, "nonce", ossl_ts_token_info_get_nonce, 0);
     rb_define_method(cTimestampTokenInfo, "to_der", ossl_ts_token_info_to_der, 0);
+    rb_define_method(cTimestampTokenInfo, "to_text", ossl_ts_token_info_to_text, 0);
 
     /* Document-class: OpenSSL::Timestamp::Request
      * Allows to create timestamp requests or parse existing ones. A Request is
@@ -1399,6 +1359,7 @@ Init_ossl_ts(void)
     rb_define_method(cTimestampRequest, "cert_requested=", ossl_ts_req_set_cert_requested, 1);
     rb_define_method(cTimestampRequest, "cert_requested?", ossl_ts_req_get_cert_requested, 0);
     rb_define_method(cTimestampRequest, "to_der", ossl_ts_req_to_der, 0);
+    rb_define_method(cTimestampRequest, "to_text", ossl_ts_req_to_text, 0);
 
     /*
      * Indicates a successful response. Equal to +0+.
@@ -1473,67 +1434,45 @@ Init_ossl_ts(void)
      *      fac.default_policy_id = '1.2.3.4.5'
      *      fac.additional_certificates = [ inter1, inter2 ]
      *      timestamp = fac.create_timestamp(p12.key, p12.certificate, req)
-     *
-     * ==Attributes
-     *
-     * ===default_policy_id
-     *
-     * Request#policy_id will always be preferred over this if present in the
-     * Request, only if Request#policy_id is nil default_policy will be used.
-     * If none of both is present, a TimestampError will be raised when trying
-     * to create a Response.
-     *
-     * call-seq:
-     *       factory.default_policy_id = "string" -> string
-     *       factory.default_policy_id            -> string or nil
-     *
-     * ===serial_number
-     *
-     * Sets or retrieves the serial number to be used for timestamp creation.
-     * Must be present for timestamp creation.
-     *
-     * call-seq:
-     *       factory.serial_number = number -> number
-     *       factory.serial_number          -> number or nil
-     *
-     * ===gen_time
-     *
-     * Sets or retrieves the Time value to be used in the Response. Must be
-     * present for timestamp creation.
-     *
-     * call-seq:
-     *       factory.gen_time = Time -> Time
-     *       factory.gen_time        -> Time or nil
-     *
-     * ===additional_certs
-     *
-     * Sets or retrieves additional certificates apart from the timestamp
-     * certificate (e.g. intermediate certificates) to be added to the Response.
-     * Must be an Array of OpenSSL::X509::Certificate.
-     *
-     * call-seq:
-     *       factory.additional_certs = [cert1, cert2] -> [ cert1, cert2 ]
-     *       factory.additional_certs                  -> array or nil
-     *
-     * ===allowed_digests
-     *
-     * Sets or retrieves the digest algorithms that the factory is allowed
-     * create timestamps for. Known vulnerable or weak algorithms should not be
-     * allowed where possible.
-     * Must be an Array of String or OpenSSL::Digest subclass instances.
-     *
-     * call-seq:
-     *       factory.allowed_digests = ["sha1", OpenSSL::Digest.new('SHA256').new] -> [ "sha1", OpenSSL::Digest) ]
-     *       factory.allowed_digests                                               -> array or nil
-     *
      */
     cTimestampFactory = rb_define_class_under(mTimestamp, "Factory", rb_cObject);
+    /*
+     * The list of digest algorithms that the factory is allowed
+     * create timestamps for. Known vulnerable or weak algorithms should not be
+     * allowed where possible. Must be an Array of String or OpenSSL::Digest
+     * subclass instances.
+     */
     rb_attr(cTimestampFactory, rb_intern_const("allowed_digests"), 1, 1, 0);
+    /*
+     * A String representing the default policy object identifier, or +nil+.
+     *
+     * Request#policy_id will always be preferred over this if present in the
+     * Request, only if Request#policy_id is +nil+ default_policy will be used.
+     * If none of both is present, a TimestampError will be raised when trying
+     * to create a Response.
+     */
     rb_attr(cTimestampFactory, rb_intern_const("default_policy_id"), 1, 1, 0);
+    /*
+     * The serial number to be used for timestamp creation. Must be present for
+     * timestamp creation. Must be an instance of OpenSSL::BN or Integer.
+     */
     rb_attr(cTimestampFactory, rb_intern_const("serial_number"), 1, 1, 0);
+    /*
+     * The Time value to be used in the Response. Must be present for timestamp
+     * creation.
+     */
     rb_attr(cTimestampFactory, rb_intern_const("gen_time"), 1, 1, 0);
+    /*
+     * Additional certificates apart from the timestamp certificate (e.g.
+     * intermediate certificates) to be added to the Response.
+     * Must be an Array of OpenSSL::X509::Certificate, or +nil+.
+     */
     rb_attr(cTimestampFactory, rb_intern_const("additional_certs"), 1, 1, 0);
     rb_define_method(cTimestampFactory, "create_timestamp", ossl_tsfac_create_ts, 3);
 }
-
+#else /* OPENSSL_NO_TS */
+void
+Init_ossl_ts(void)
+{
+}
 #endif

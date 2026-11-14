@@ -38,12 +38,14 @@ module EnumerableSpecs
   class Empty
     include Enumerable
     def each
+      self
     end
   end
 
   class EmptyWithSize
     include Enumerable
     def each
+      self
     end
     def size
       0
@@ -341,5 +343,8 @@ module EnumerableSpecs
       @yielded << args
       @block.call(*args)
     end
+  end
+
+  class SetSubclass < Set
   end
 end # EnumerableSpecs utility classes

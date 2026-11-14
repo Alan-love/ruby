@@ -8,12 +8,12 @@ module Bundler
     end
 
     def run
-      platforms, ruby_version = Bundler.ui.silence do
-        locked_ruby_version = Bundler.locked_gems && Bundler.locked_gems.ruby_version
-        gemfile_ruby_version = Bundler.definition.ruby_version && Bundler.definition.ruby_version.single_version_string
-        [Bundler.definition.platforms.map {|p| "* #{p}" },
-         locked_ruby_version || gemfile_ruby_version]
+      ruby_version = if Bundler.locked_gems
+        Bundler.locked_gems.ruby_version&.gsub(/p\d+\Z/, "")
+      else
+        Bundler.definition.ruby_version&.single_version_string
       end
+
       output = []
 
       if options[:ruby]
@@ -23,7 +23,9 @@ module Bundler
           output << "No ruby version specified"
         end
       else
-        output << "Your platform is: #{RUBY_PLATFORM}"
+        platforms = Bundler.definition.platforms.map {|p| "* #{p}" }
+
+        output << platform_info
         output << "Your app has gems that work on these platforms:\n#{platforms.join("\n")}"
 
         if ruby_version
@@ -41,6 +43,20 @@ module Bundler
       end
 
       Bundler.ui.info output.join("\n\n")
+    end
+
+    private
+
+    def platform_info
+      info = "Your platform is: #{Gem::Platform.local}"
+      return info if Bundler.local_platform == Gem::Platform.local
+
+      info + "\nHowever, your effective platform is: #{Bundler.local_platform} " \
+        "(because force_ruby_platform is #{force_ruby_platform_origin})"
+    end
+
+    def force_ruby_platform_origin
+      Bundler.settings.pretty_values_for(:force_ruby_platform).first.sub(/\ASet /, "set ")
     end
   end
 end

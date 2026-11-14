@@ -180,6 +180,10 @@ class TestDateStrptime < Test::Unit::TestCase
 
      [['fri1feb034pm+5', '%a%d%b%y%H%p%Z'], [2003,2,1,16,nil,nil,'+5',5*3600,5]],
      [['E.  Australia Standard Time', '%Z'], [nil,nil,nil,nil,nil,nil,'E.  Australia Standard Time',10*3600,nil], __LINE__],
+
+     # out of range
+     [['+0.9999999999999999999999', '%Z'], [nil,nil,nil,nil,nil,nil,'+0.9999999999999999999999',+1*3600,nil], __LINE__],
+     [['+9999999999999999999999.0', '%Z'], [nil,nil,nil,nil,nil,nil,'+9999999999999999999999.0',nil,nil], __LINE__],
     ].each do |x, y|
       h = Date._strptime(*x)
       a = h.values_at(:year,:mon,:mday,:hour,:min,:sec,:zone,:offset,:wday)
@@ -292,6 +296,11 @@ class TestDateStrptime < Test::Unit::TestCase
     assert_not_nil(Date._strptime('Januari', '%B'))
     assert_nil(Date._strptime('Sundai,', '%A,'))
     assert_nil(Date._strptime('Januari,', '%B,'))
+
+    assert_nil(Date._strptime('+24:00', '%Z')[:offset])
+    assert_nil(Date._strptime('+23:60', '%Z')[:offset])
+    assert_nil(Date._strptime('+23:00:60', '%Z')[:offset])
+    assert_nil(Date._strptime('+23:00:60', '%Z')[:offset])
   end
 
   def test_strptime
@@ -299,6 +308,8 @@ class TestDateStrptime < Test::Unit::TestCase
     d = Date.new(2002,3,14)
     assert_equal(d, Date.strptime(d.to_s))
     assert_equal(Date.new(2002,3,14), Date.strptime('2002-03-14'))
+    assert_equal(Date.new(2002,3,14), Date.strptime('2002-03-14 11:22:33', '%Y-%m-%d'))
+    assert_equal(Date.new(2002,3,14), Date.strptime('2002-03-14T11:22:33Z', '%F'))
 
     d = DateTime.new(2002,3,14,11,22,33, 0)
     assert_equal(d, DateTime.strptime(d.to_s))
@@ -449,6 +460,10 @@ class TestDateStrptime < Test::Unit::TestCase
     d = DateTime.strptime('2004-11', '%Y-%W')
     assert_equal([2004, 11, 1, 0, 0, 0],
 		 [d.year, d.strftime('%W').to_i, d.wday, d.hour, d.min, d.sec])
+
+    d = DateTime.strptime('2001 Sat', '%Y %a')
+    assert_equal([2001, 1, 6, 0, 0, 0],
+		 [d.year, d.mon, d.mday, d.hour, d.min, d.sec])
   end
 
   def test_strptime__d_to_s
@@ -508,7 +523,27 @@ class TestDateStrptime < Test::Unit::TestCase
     d = DateTime.strptime('9000 +0200', '%Q %z')
     assert_equal([1970, 1, 1, 2, 0, 9], [d.year, d.mon, d.mday, d.hour, d.min, d.sec])
     assert_equal(Rational(2, 24), d.offset)
-
   end
 
+  def test_format_modified
+    str = " " * 100
+    fmt = Struct.new(:str) {
+      def to_str
+        str << "2026-06-01" << " "*100
+        " %F "
+      end
+    }.new(str)
+    d = Date._strptime(str, fmt)
+    assert_not_nil(d)
+    assert_equal(2026, d[:year])
+    assert_equal(6, d[:mon])
+    assert_equal(1, d[:mday])
+  end
+
+  def test_nonascii_string
+    nonalpha = "\u{2600 fe0f}"
+    s = "2011-10-05T22:26:12#{nonalpha}"
+
+    assert_nil(DateTime._strptime(s))
+  end
 end

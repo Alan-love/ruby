@@ -8,25 +8,43 @@
 
 = Licence
   This program is licensed under the same licence as Ruby.
-  (See the file 'LICENCE'.)
+  (See the file 'COPYING'.)
 =end
 
 require "mkmf"
 
-dir_config("openssl")
-dir_config("kerberos")
+ssl_dirs = dir_config("openssl")
+dir_config_given = ssl_dirs.any?
+
+_, ssl_ldir = ssl_dirs
+if ssl_ldir&.split(File::PATH_SEPARATOR)&.none? { |dir| File.directory?(dir) }
+  # According to the `mkmf.rb#dir_config`, the `--with-openssl-dir=<dir>` uses
+  # the value of the `File.basename(RbConfig::MAKEFILE_CONFIG["libdir"])` as a
+  # loaded library directory name.
+  ruby_ldir_name = File.basename(RbConfig::MAKEFILE_CONFIG["libdir"])
+
+  raise "OpenSSL library directory could not be found in '#{ssl_ldir}'. " \
+    "You might want to fix this error in one of the following ways.\n" \
+    "  * Recompile OpenSSL by configuring it with --libdir=#{ruby_ldir_name} " \
+    " to specify the OpenSSL library directory.\n" \
+    "  * Recompile Ruby by configuring it with --libdir=<dir> to specify the " \
+    "Ruby library directory.\n" \
+    "  * Compile this openssl gem with --with-openssl-include=<dir> and " \
+    "--with-openssl-lib=<dir> options to specify the OpenSSL include and " \
+    "library directories."
+end
 
 Logging::message "=== OpenSSL for Ruby configurator ===\n"
 
-##
-# Adds -DOSSL_DEBUG for compilation and some more targets when GCC is used
-# To turn it on, use: --with-debug or --enable-debug
-#
-if with_config("debug") or enable_config("debug")
-  $defs.push("-DOSSL_DEBUG")
-end
+$defs.push("-D""OPENSSL_SUPPRESS_DEPRECATED")
 
-have_func("rb_io_maybe_wait") # Ruby 3.1
+# Missing in TruffleRuby
+have_func("rb_call_super_kw(0, NULL, 0)", "ruby.h")
+# Ruby 3.1
+have_func("rb_io_descriptor", "ruby/io.h")
+have_func("rb_io_maybe_wait(0, Qnil, Qnil, Qnil)", "ruby/io.h")
+# Ruby 3.2
+have_func("rb_io_timeout", "ruby/io.h")
 
 Logging::message "=== Checking for system dependent stuff... ===\n"
 have_library("nsl", "t_open")
@@ -44,7 +62,6 @@ end
 def find_openssl_library
   if $mswin || $mingw
     # required for static OpenSSL libraries
-    have_library("gdi32") # OpenSSL <= 1.0.2 (for RAND_screen())
     have_library("crypt32")
   end
 
@@ -58,12 +75,6 @@ def find_openssl_library
     # OpenSSL >= 1.1.0: libcrypto.lib and libssl.lib.
     if have_library("libcrypto", "CRYPTO_malloc") &&
         have_library("libssl", "SSL_new")
-      return true
-    end
-
-    # OpenSSL <= 1.0.2: libeay32.lib and ssleay32.lib.
-    if have_library("libeay32", "CRYPTO_malloc") &&
-        have_library("ssleay32", "SSL_new")
       return true
     end
 
@@ -92,7 +103,7 @@ def find_openssl_library
 end
 
 Logging::message "=== Checking for required stuff... ===\n"
-pkg_config_found = pkg_config("openssl") && have_header("openssl/ssl.h")
+pkg_config_found = !dir_config_given && pkg_config("openssl") && have_header("openssl/ssl.h")
 
 if !pkg_config_found && !find_openssl_library
   Logging::message "=== Checking for required stuff failed. ===\n"
@@ -104,14 +115,15 @@ end
 
 version_ok = if have_macro("LIBRESSL_VERSION_NUMBER", "openssl/opensslv.h")
   is_libressl = true
-  checking_for("LibreSSL version >= 3.1.0") {
-    try_static_assert("LIBRESSL_VERSION_NUMBER >= 0x30100000L", "openssl/opensslv.h") }
+  checking_for("LibreSSL version >= 3.9.0") {
+    try_static_assert("LIBRESSL_VERSION_NUMBER >= 0x30900000L", "openssl/opensslv.h") }
 else
-  checking_for("OpenSSL version >= 1.0.2") {
-    try_static_assert("OPENSSL_VERSION_NUMBER >= 0x10002000L", "openssl/opensslv.h") }
+  is_openssl = true
+  checking_for("OpenSSL version >= 1.1.1") {
+    try_static_assert("OPENSSL_VERSION_NUMBER >= 0x10101000L", "openssl/opensslv.h") }
 end
 unless version_ok
-  raise "OpenSSL >= 1.0.2 or LibreSSL >= 3.1.0 is required"
+  raise "OpenSSL >= 1.1.1 or LibreSSL >= 3.9.0 is required"
 end
 
 # Prevent wincrypt.h from being included, which defines conflicting macro with openssl/x509.h
@@ -120,67 +132,71 @@ if is_libressl && ($mswin || $mingw)
 end
 
 Logging::message "=== Checking for OpenSSL features... ===\n"
+evp_h = "openssl/evp.h".freeze
+ts_h = "openssl/ts.h".freeze
+ssl_h = "openssl/ssl.h".freeze
+stack_h = "openssl/stack.h".freeze
+
 # compile options
-have_func("RAND_egd")
-engines = %w{dynamic 4758cca aep atalla chil
-             cswift nuron sureware ubsec padlock capi gmp gost cryptodev}
-engines.each { |name|
-  have_func("ENGINE_load_#{name}()", "openssl/engine.h")
-}
+have_func("RAND_egd()", "openssl/rand.h")
 
-# added in 1.1.0
-if !have_struct_member("SSL", "ctx", "openssl/ssl.h") || is_libressl
-  $defs.push("-DHAVE_OPAQUE_OPENSSL")
+# added in OpenSSL 1.0.2, not in LibreSSL yet
+have_func("SSL_CTX_set1_sigalgs_list(NULL, NULL)", ssl_h)
+# added in OpenSSL 1.0.2, not in LibreSSL or AWS-LC yet
+have_func("SSL_CTX_set1_client_sigalgs_list(NULL, NULL)", ssl_h)
+
+# SSL options can be uint64_t (OpenSSL >= 3), unsigned long (OpenSSL >= 1.1),
+# long (LibreSSL), or uint32_t (AWS-LC)
+if checking_for("whether SSL_CTX_get_options() returns a 64-bit value") {
+    try_static_assert("sizeof(SSL_CTX_get_options(NULL)) == 8", ssl_h) }
+  $defs.push("-DOSSL_SIZEOF_SSL_OPTIONS_IS_8")
 end
-have_func("EVP_MD_CTX_new")
-have_func("EVP_MD_CTX_free")
-have_func("EVP_MD_CTX_pkey_ctx")
-have_func("X509_STORE_get_ex_data")
-have_func("X509_STORE_set_ex_data")
-have_func("X509_STORE_get_ex_new_index")
-have_func("X509_CRL_get0_signature")
-have_func("X509_REQ_get0_signature")
-have_func("X509_REVOKED_get0_serialNumber")
-have_func("X509_REVOKED_get0_revocationDate")
-have_func("X509_get0_tbs_sigalg")
-have_func("X509_STORE_CTX_get0_untrusted")
-have_func("X509_STORE_CTX_get0_cert")
-have_func("X509_STORE_CTX_get0_chain")
-have_func("OCSP_SINGLERESP_get0_id")
-have_func("SSL_CTX_get_ciphers")
-have_func("X509_up_ref")
-have_func("X509_CRL_up_ref")
-have_func("X509_STORE_up_ref")
-have_func("SSL_SESSION_up_ref")
-have_func("EVP_PKEY_up_ref")
-have_func("SSL_CTX_set_min_proto_version(NULL, 0)", "openssl/ssl.h")
-have_func("SSL_CTX_get_security_level")
-have_func("X509_get0_notBefore")
-have_func("SSL_SESSION_get_protocol_version")
-have_func("TS_STATUS_INFO_get0_status")
-have_func("TS_STATUS_INFO_get0_text")
-have_func("TS_STATUS_INFO_get0_failure_info")
-have_func("TS_VERIFY_CTS_set_certs(NULL, NULL)", "openssl/ts.h")
-have_func("TS_VERIFY_CTX_set_store")
-have_func("TS_VERIFY_CTX_add_flags")
-have_func("TS_RESP_CTX_set_time_cb")
-have_func("EVP_PBE_scrypt")
-have_func("SSL_CTX_set_post_handshake_auth")
 
-# added in 1.1.1
-have_func("EVP_PKEY_check")
+# added in 1.1.0, currently not in LibreSSL
+have_func("EVP_PBE_scrypt(\"\", 0, (unsigned char *)\"\", 0, 0, 0, 0, 0, NULL, 0)", evp_h)
+
+# added in OpenSSL 1.1.1 and LibreSSL 3.5.0, then removed in LibreSSL 4.0.0
+have_func("EVP_PKEY_check(NULL)", evp_h)
+
+# added in OpenSSL 1.1.1, currently not in LibreSSL
+have_func("OPENSSL_sk_new_reserve(NULL, 0)", stack_h)
 
 # added in 3.0.0
-have_func("SSL_set0_tmp_dh_pkey")
-have_func("ERR_get_error_all")
-have_func("TS_VERIFY_CTX_set_certs(NULL, NULL)", "openssl/ts.h")
-have_func("SSL_CTX_load_verify_file")
-have_func("BN_check_prime")
-have_func("EVP_MD_CTX_get0_md")
-have_func("EVP_MD_CTX_get_pkey_ctx")
-have_func("EVP_PKEY_eq")
+have_func("SSL_CTX_set0_tmp_dh_pkey(NULL, NULL)", ssl_h)
+have_func("ERR_get_error_all(NULL, NULL, NULL, NULL, NULL)", "openssl/err.h")
+have_func("SSL_CTX_load_verify_file(NULL, \"\")", ssl_h)
+have_func("BN_check_prime(NULL, NULL, NULL)", "openssl/bn.h")
+have_func("EVP_MD_CTX_get0_md(NULL)", evp_h)
+have_func("EVP_MD_CTX_get_pkey_ctx(NULL)", evp_h)
+have_func("EVP_PKEY_get_params(NULL, NULL)", evp_h)
+have_func("EVP_PKEY_eq(NULL, NULL)", evp_h)
+have_func("EVP_PKEY_dup(NULL)", evp_h)
+have_func("EVP_PKEY_encapsulate_init(NULL, NULL)", evp_h)
+
+# added in 3.2.0
+have_func("SSL_get0_group_name(NULL)", ssl_h)
+have_func("OSSL_HPKE_CTX_new(0, (OSSL_HPKE_SUITE){0}, 0, NULL, NULL)", "openssl/hpke.h")
+
+# added in 3.3.0
+have_func("SSL_SESSION_get_time_ex(NULL)", ssl_h)
+
+# added in 3.4.0
+have_func("TS_VERIFY_CTX_set0_certs(NULL, NULL)", ts_h)
+have_func("SSL_CTX_flush_sessions_ex(NULL, 0)", ssl_h)
+
+# added in 3.5.0
+have_func("SSL_get0_peer_signature_name(NULL, NULL)", ssl_h)
+
+# added in 4.0.0
+have_func("ASN1_BIT_STRING_set1(NULL, NULL, 0, 0)", "openssl/asn1.h")
 
 Logging::message "=== Checking done. ===\n"
+
+# Append flags from environment variables.
+extcflags = ENV["RUBY_OPENSSL_EXTCFLAGS"]
+append_cflags(extcflags.split) if extcflags
+extldflags = ENV["RUBY_OPENSSL_EXTLDFLAGS"]
+append_ldflags(extldflags.split) if extldflags
 
 create_header
 create_makefile("openssl")

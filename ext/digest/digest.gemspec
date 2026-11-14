@@ -1,12 +1,12 @@
 # coding: utf-8
 # frozen_string_literal: true
 
-version_module = Module.new do
-  version_rb = File.join(__dir__, "lib/digest/version.rb")
-  module_eval(File.read(version_rb), version_rb)
-end
-
 Gem::Specification.new do |spec|
+  version_module = Module.new do
+    version_rb = File.join(__dir__, "lib/digest/version.rb")
+    module_eval(File.read(version_rb), version_rb)
+  end
+
   spec.name          = "digest"
   spec.version       = version_module::Digest::VERSION
   spec.authors       = ["Akinori MUSHA"]
@@ -37,6 +37,9 @@ Gem::Specification.new do |spec|
     spec.extensions = Dir["ext/digest/**/extconf.rb"]
 
     spec.files += Dir["ext/digest/**/{*.{rb,c,h,sh},depend}"]
+    # Vendored third-party license files (e.g. BLAKE3's LICENSE_*), which
+    # carry no filename extension and are missed by the glob above.
+    spec.files += Dir["ext/digest/**/LICENSE*"]
     spec.require_paths = %w[lib]
   end
 

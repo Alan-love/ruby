@@ -61,7 +61,7 @@
  * doesn't mean a total rewrite.  Practically  when it comes to API versioning,
  * major and minor version changes are equally catastrophic.
  */
-#define RUBY_API_VERSION_MAJOR 3
+#define RUBY_API_VERSION_MAJOR 4
 
 /**
  * Minor  version.   As of  writing  this  version changes  annually.   Greater
@@ -137,7 +137,8 @@ RUBY_EXTERN const int  ruby_patchlevel;
 
 /**
  * This is what `ruby -v` prints to the standard error.  Something like:
- * `"ruby 2.5.9p229 (2021-04-05 revision 67829) [x86_64-linux]"`
+ * `"ruby 2.5.9p229 (2021-04-05 revision 67829) [x86_64-linux]"`. This doesn't
+ * include runtime options like a JIT being enabled.
  */
 RUBY_EXTERN const char ruby_description[];
 

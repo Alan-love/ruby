@@ -7,24 +7,24 @@ describe "Process::Status#signaled?" do
     end
 
     it "returns false" do
-      $?.signaled?.should be_false
+      $?.signaled?.should == false
     end
   end
 
   describe "for a terminated child" do
     before :each do
-      ruby_exe("Process.kill(:KILL, $$); exit(42)", exit_status: platform_is(:windows) ? 0 : nil)
+      ruby_exe("Process.kill(:KILL, $$); exit(42)", exit_status: platform_is(:windows) ? 0 : :SIGKILL)
     end
 
     platform_is_not :windows do
       it "returns true" do
-        $?.signaled?.should be_true
+        $?.signaled?.should == true
       end
     end
 
     platform_is :windows do
       it "always returns false" do
-        $?.signaled?.should be_false
+        $?.signaled?.should == false
       end
     end
   end

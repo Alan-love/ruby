@@ -26,7 +26,7 @@ class TestRubyLiteral < Test::Unit::TestCase
     assert_equal '5', 0b101.inspect
     assert_instance_of Integer, 0b101
     assert_raise(SyntaxError) { eval("0b") }
-    assert_equal '123456789012345678901234567890', 123456789012345678901234567890.inspect
+    assert_equal '123456789012345678901234567890', 123456789012345678901234567890.to_s
     assert_instance_of Integer, 123456789012345678901234567890
     assert_instance_of Float, 1.3
     assert_equal '2', eval("0x00+2").inspect
@@ -39,6 +39,8 @@ class TestRubyLiteral < Test::Unit::TestCase
   end
 
   def test_string
+    verbose_bak, $VERBOSE = $VERBOSE, nil # prevent syntax warnings
+
     assert_instance_of String, ?a
     assert_equal "a", ?a
     assert_instance_of String, ?A
@@ -94,6 +96,15 @@ class TestRubyLiteral < Test::Unit::TestCase
 
     assert_equal "ab", eval("?a 'b'")
     assert_equal "a\nb", eval("<<A 'b'\na\nA")
+
+    assert_raise(SyntaxError) {eval('"\C-' "\u3042" '"')}
+    assert_raise(SyntaxError) {eval('"\C-\\' "\u3042" '"')}
+    assert_raise(SyntaxError) {eval('"\M-' "\u3042" '"')}
+    assert_raise(SyntaxError) {eval('"\M-\\' "\u3042" '"')}
+
+    assert_equal "\x09 \xC9 \x89", eval('"\C-\111 \M-\111 \M-\C-\111"')
+  ensure
+    $VERBOSE = verbose_bak
   end
 
   def test_dstring
@@ -142,6 +153,8 @@ class TestRubyLiteral < Test::Unit::TestCase
   end
 
   def test_frozen_string
+    default = eval("'test'").frozen?
+
     all_assertions do |a|
       a.for("false with indicator") do
         str = eval("# -*- frozen-string-literal: false -*-\n""'foo'")
@@ -161,19 +174,19 @@ class TestRubyLiteral < Test::Unit::TestCase
       end
       a.for("false with preceding garbage") do
         str = eval("# x frozen-string-literal: false\n""'foo'")
-        assert_not_predicate(str, :frozen?)
+        assert_equal(default, str.frozen?)
       end
       a.for("true with preceding garbage") do
         str = eval("# x frozen-string-literal: true\n""'foo'")
-        assert_not_predicate(str, :frozen?)
+        assert_equal(default, str.frozen?)
       end
       a.for("false with succeeding garbage") do
         str = eval("# frozen-string-literal: false x\n""'foo'")
-        assert_not_predicate(str, :frozen?)
+        assert_equal(default, str.frozen?)
       end
       a.for("true with succeeding garbage") do
         str = eval("# frozen-string-literal: true x\n""'foo'")
-        assert_not_predicate(str, :frozen?)
+        assert_equal(default, str.frozen?)
       end
     end
   end
@@ -182,6 +195,11 @@ class TestRubyLiteral < Test::Unit::TestCase
     list = eval("# frozen-string-literal: true\n""['foo', 'bar']")
     assert_equal 2, list.length
     list.each { |str| assert_predicate str, :frozen? }
+  end
+
+  def test_string_in_hash_literal
+    hash = eval("# frozen-string-literal: false\n""{foo: 'foo'}")
+    assert_not_predicate(hash[:foo], :frozen?)
   end
 
   if defined?(RubyVM::InstructionSequence.compile_option) and
@@ -234,8 +252,9 @@ class TestRubyLiteral < Test::Unit::TestCase
   def test_dregexp
     assert_instance_of Regexp, /re#{'ge'}xp/
     assert_equal(/regexp/, /re#{'ge'}xp/)
-    bug3903 = '[ruby-core:32682]'
-    assert_raise(SyntaxError, bug3903) {eval('/[#{"\x80"}]/')}
+
+    # [ruby-core:32682]
+    eval('/[#{"\x80"}]/')
   end
 
   def test_array
@@ -496,10 +515,15 @@ class TestRubyLiteral < Test::Unit::TestCase
       '1.0i',
       '1.72723e-77',
       '//',
+      '__LINE__',
+      '__FILE__',
+      '__ENCODING__',
     ) do |key|
-      assert_warning(/key #{Regexp.quote(eval(key).inspect)} is duplicated/) do
-        eval("{#{key} => :bar, #{key} => :foo}")
-      end
+      assert_warning(/key #{Regexp.quote(eval(key).inspect)} is duplicated/) { eval("{#{key} => :bar, #{key} => :foo}") }
+    end
+
+    assert_warning(/key :foo is duplicated/, "[Bug #22264]") do
+      eval("{**{}, foo: :bar, **{foo: :foo}}")
     end
   end
 
@@ -539,6 +563,97 @@ class TestRubyLiteral < Test::Unit::TestCase
 
   private def two
     2
+  end
+
+  def test_hash_double_splat_result
+    kw = ->(**k) { k }
+    builders = [
+      ->(h) { {**h} },
+      ->(h) { {**h, a: 1} },
+      ->(h) { {**h, **h} },
+      ->(h) { {**h, **nil} },
+      ->(h) { {**nil, **h} },
+      ->(h) { {**h, **nil, **h} },
+      ->(h) { {b: 2, **h} },
+      ->(h) { kw.(**h, a: 1) },
+      ->(h) { kw.(**h, **nil) },
+      ->(h) { kw.(**nil, **h) },
+    ]
+
+    builders.each do |build|
+      result = build[Hash.new(5)]
+      assert_nil(result.default)
+      assert_nil(result[:missing])
+
+      result = build[Hash.new { 7 }]
+      assert_nil(result.default_proc)
+      assert_nil(result.default)
+      assert_nil(result[:missing])
+
+      assert_not_predicate(build[{a: 1}.compare_by_identity], :compare_by_identity?)
+      assert_instance_of(Hash, build[Class.new(Hash).new])
+      assert_not_predicate(build[{a: 1}.freeze], :frozen?)
+    end
+  end
+
+  def test_hash_double_splat_copies_to_hash_result
+    hash = {a: 1}.freeze
+    object = Object.new
+    object.define_singleton_method(:to_hash) { hash }
+
+    result = {**object}
+    assert_equal({a: 1}, result)
+    assert_not_same(hash, result)
+    assert_not_predicate(result, :frozen?)
+  end
+
+  def test_hash_double_splat_conversion_order
+    log = []
+    splat = ->(tag) do
+      Object.new.tap { |object| object.define_singleton_method(:to_hash) { log << tag; {tag => 1} } }
+    end
+    value = ->(tag) { log << tag; 1 }
+    kw = ->(**k) { k }
+    x, y, z = splat[:x], splat[:y], splat[:z]
+
+    assert_equal({x: 1, y: 1}, {**x, **y})
+    assert_equal([:x, :y], log.slice!(0..))
+
+    assert_equal({x: 1, a: 1}, {**x, a: value[:v]})
+    assert_equal([:x, :v], log.slice!(0..))
+
+    assert_equal({x: 1, a: 1, y: 1, z: 1}, {**x, a: value[:v], **y, **z})
+    assert_equal([:x, :v, :y, :z], log.slice!(0..))
+
+    assert_equal({x: 1, y: 1}, kw.(**x, **y))
+    assert_equal([:x, :y], log.slice!(0..))
+
+    assert_equal({x: 1, a: 1}, kw.(**x, a: value[:v]))
+    assert_equal([:x, :v], log.slice!(0..))
+  end
+
+  def test_hash_double_splat_converts_operand_before_nil
+    object = Object.new
+    def object.to_hash = {a: 1}
+
+    assert_equal({a: 1}, {**object, **nil})
+    assert_equal({a: 1}, {**nil, **object})
+    assert_raise(TypeError) { {**1, **nil} }
+    assert_raise(TypeError) { {**"string", **nil} }
+    assert_raise(TypeError) { {**[1], **nil} }
+    assert_raise(TypeError) { {**Object.new, **nil} }
+  end
+
+  def test_hash_double_splat_after_literal_is_a_new_hash
+    build = -> { {a: 1, **nil} }
+    assert_not_same(build.call, build.call)
+    assert_not_predicate(build.call, :frozen?)
+    assert_equal({a: 1}, build.call)
+
+    build = ->(h) { {a: 1, **h} }
+    empty = {}
+    assert_not_same(build[empty], build[empty])
+    assert_not_predicate(build[empty], :frozen?)
   end
 
   def test_range
@@ -582,6 +697,8 @@ class TestRubyLiteral < Test::Unit::TestCase
   end
 
   def test_integer
+    verbose_bak, $VERBOSE = $VERBOSE, nil # prevent syntax warnings
+
     head = ['', '0x', '0o', '0b', '0d', '-', '+']
     chars = ['0', '1', '_', '9', 'f']
     head.each {|h|
@@ -611,9 +728,14 @@ class TestRubyLiteral < Test::Unit::TestCase
         assert_syntax_error(h, /numeric literal without digits\Z/, "#{bug2407}: #{h.inspect}")
       end
     end
+
+  ensure
+    $VERBOSE = verbose_bak
   end
 
   def test_float
+    verbose_bak, $VERBOSE = $VERBOSE, nil # prevent syntax warnings
+
     head = ['', '-', '+']
     chars = ['0', '1', '_', '9', 'f', '.']
     head.each {|h|
@@ -632,15 +754,32 @@ class TestRubyLiteral < Test::Unit::TestCase
           end
           begin
             r2 = eval(s)
-          rescue NameError, SyntaxError
+          rescue ArgumentError
+            # Debug log for a random failure: ArgumentError: SyntaxError#path changed
+            $stderr.puts "TestRubyLiteral#test_float failed: %p" % s
+            raise
+          rescue SyntaxError => e
+            r2 = :err
+          rescue NameError
             r2 = :err
           end
           r2 = :err if Range === r2
-          assert_equal(r1, r2, "Float(#{s.inspect}) != eval(#{s.inspect})")
+          s = s.inspect
+          mesg = "Float(#{s}) != eval(#{s})"
+          mesg << ":" << e.message if e
+          assert_equal(r1, r2, mesg)
         }
       }
     }
     assert_equal(100.0, 0.0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000100e100)
+
+  ensure
+    $VERBOSE = verbose_bak
+  end
+
+  def test_rational_float
+    assert_equal(12, 0.12r * 100)
+    assert_equal(12, 0.1_2r * 100)
   end
 
   def test_symbol_list

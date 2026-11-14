@@ -128,8 +128,16 @@ module Test
 
       def assert_in_delta exp, act, delta = 0.001, msg = nil
         n = (exp - act).abs
+        loadavg = begin
+          if File.readable?("/proc/loadavg")
+            " (/proc/loadavg=#{File.read("/proc/loadavg").strip})"
+          end
+        rescue StandardError
+          nil
+        end
+        loadavg ||= ""
         msg = message(msg) {
-          "Expected |#{exp} - #{act}| (#{n}) to be <= #{delta}"
+          "Expected |#{exp} - #{act}| (#{n}) to be <= #{delta}#{loadavg}"
         }
         assert delta >= n, msg
       end
@@ -190,6 +198,22 @@ module Test
       def assert_nil obj, msg = nil
         msg = message(msg) { "Expected #{mu_pp(obj)} to be nil" }
         assert obj.nil?, msg
+      end
+
+      ##
+      # Fails unless +obj+ is true
+
+      def assert_true obj, msg = nil
+        msg = message(msg) { "Expected #{mu_pp(obj)} to be true" }
+        assert obj == true, msg
+      end
+
+      ##
+      # Fails unless +obj+ is false
+
+      def assert_false obj, msg = nil
+        msg = message(msg) { "Expected #{mu_pp(obj)} to be false" }
+        assert obj == false, msg
       end
 
       ##
@@ -506,18 +530,16 @@ module Test
       # Skips the current test. Gets listed at the end of the run but
       # doesn't cause a failure exit code.
 
-      def pend msg = nil, bt = caller
+      def pend msg = nil, bt = caller, &_
         msg ||= "Skipped, no message given"
         @skip = true
         raise Test::Unit::PendedError, msg, bt
       end
       alias omit pend
 
-      # TODO: Removed this and enabled to raise NoMethodError with skip
-      alias skip pend
-      # def skip(msg = nil, bt = caller)
-      #   raise NoMethodError, "use omit or pend", caller
-      # end
+      def skip(msg = nil, bt = caller)
+        raise NoMethodError, "use omit or pend", caller
+      end
 
       ##
       # Was this testcase skipped? Meant for #teardown.
@@ -547,10 +569,6 @@ module Test
       #    end
       def assert_block(*msgs)
         assert yield, *msgs
-      end
-
-      def assert_raises(*exp, &b)
-        raise NoMethodError, "use assert_raise", caller
       end
 
       # :call-seq:
@@ -758,7 +776,14 @@ EOT
           e = assert_raise(SyntaxError, mesg) do
             syntax_check(src, fname, line)
           end
-          assert_match(error, e.message, mesg)
+
+          # Prism adds ANSI escape sequences to syntax error messages to
+          # colorize and format them. We strip them out here to make them easier
+          # to match against in tests.
+          message = e.message
+          message.gsub!(/\e\[.*?m/, "")
+
+          assert_match(error, message, mesg)
           e
         end
       end
@@ -781,33 +806,37 @@ EOT
       MIN_MEASURABLE = 1.0 / MIN_HZ
 
       def assert_cpu_usage_low(msg = nil, pct: 0.05, wait: 1.0, stop: nil)
-        require 'benchmark'
-
         wait = EnvUtil.apply_timeout_scale(wait)
         if wait < 0.1 # TIME_QUANTUM_USEC in thread_pthread.c
           warn "test #{msg || 'assert_cpu_usage_low'} too short to be accurate"
         end
-        tms = Benchmark.measure(msg || '') do
-          if stop
-            th = Thread.start {sleep wait; stop.call}
-            yield
-            th.join
-          else
-            begin
-              Timeout.timeout(wait) {yield}
-            rescue Timeout::Error
-            end
+
+        t0, r0 = Process.times, Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+        if stop
+          th = Thread.start {sleep wait; stop.call}
+          yield
+          th.join
+        else
+          begin
+            Timeout.timeout(wait) {yield}
+          rescue Timeout::Error
           end
         end
 
-        max = pct * tms.real
+        t1, r1 = Process.times, Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+        total = t1.utime - t0.utime + t1.stime - t0.stime + t1.cutime - t0.cutime + t1.cstime - t0.cstime
+        real = r1 - r0
+
+        max = pct * real
         min_measurable = MIN_MEASURABLE
         min_measurable *= 1.30 # add a little (30%) to account for misc. overheads
         if max < min_measurable
           max = min_measurable
         end
 
-        assert_operator tms.total, :<=, max, msg
+        assert_operator total, :<=, max, msg
       end
 
       def assert_is_minus_zero(f)

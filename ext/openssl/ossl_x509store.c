@@ -5,37 +5,21 @@
  */
 /*
  * This program is licensed under the same licence as Ruby.
- * (See the file 'LICENCE'.)
+ * (See the file 'COPYING'.)
  */
 #include "ossl.h"
 
-#define NewX509Store(klass) \
-    TypedData_Wrap_Struct((klass), &ossl_x509store_type, 0)
-#define SetX509Store(obj, st) do { \
-    if (!(st)) { \
-	ossl_raise(rb_eRuntimeError, "STORE wasn't initialized!"); \
-    } \
-    RTYPEDDATA_DATA(obj) = (st); \
-} while (0)
 #define GetX509Store(obj, st) do { \
     TypedData_Get_Struct((obj), X509_STORE, &ossl_x509store_type, (st)); \
     if (!(st)) { \
-	ossl_raise(rb_eRuntimeError, "STORE wasn't initialized!"); \
+        ossl_raise(rb_eRuntimeError, "STORE wasn't initialized!"); \
     } \
 } while (0)
 
-#define NewX509StCtx(klass) \
-    TypedData_Wrap_Struct((klass), &ossl_x509stctx_type, 0)
-#define SetX509StCtx(obj, ctx) do { \
-    if (!(ctx)) { \
-	ossl_raise(rb_eRuntimeError, "STORE_CTX wasn't initialized!"); \
-    } \
-    RTYPEDDATA_DATA(obj) = (ctx); \
-} while (0)
 #define GetX509StCtx(obj, ctx) do { \
     TypedData_Get_Struct((obj), X509_STORE_CTX, &ossl_x509stctx_type, (ctx)); \
     if (!(ctx)) { \
-	ossl_raise(rb_eRuntimeError, "STORE_CTX is out of scope!"); \
+        ossl_raise(rb_eRuntimeError, "STORE_CTX is out of scope!"); \
     } \
 } while (0)
 
@@ -62,7 +46,7 @@ call_verify_cb_proc(VALUE arg)
 {
     struct ossl_verify_cb_args *args = (struct ossl_verify_cb_args *)arg;
     return rb_funcall(args->proc, rb_intern("call"), 2,
-		      args->preverify_ok, args->store_ctx);
+                      args->preverify_ok, args->store_ctx);
 }
 
 int
@@ -73,33 +57,33 @@ ossl_verify_cb_call(VALUE proc, int ok, X509_STORE_CTX *ctx)
     int state;
 
     if (NIL_P(proc))
-	return ok;
+        return ok;
 
     ret = Qfalse;
     rctx = rb_protect(ossl_x509stctx_new_i, (VALUE)ctx, &state);
     if (state) {
-	rb_set_errinfo(Qnil);
-	rb_warn("StoreContext initialization failure");
+        rb_set_errinfo(Qnil);
+        rb_warn("StoreContext initialization failure");
     }
     else {
-	args.proc = proc;
-	args.preverify_ok = ok ? Qtrue : Qfalse;
-	args.store_ctx = rctx;
-	ret = rb_protect(call_verify_cb_proc, (VALUE)&args, &state);
-	if (state) {
-	    rb_set_errinfo(Qnil);
-	    rb_warn("exception in verify_callback is ignored");
-	}
-	RTYPEDDATA_DATA(rctx) = NULL;
+        args.proc = proc;
+        args.preverify_ok = ok ? Qtrue : Qfalse;
+        args.store_ctx = rctx;
+        ret = rb_protect(call_verify_cb_proc, (VALUE)&args, &state);
+        RTYPEDDATA_DATA(rctx) = NULL;
+        if (state) {
+            rb_set_errinfo(Qnil);
+            rb_warn("exception in verify_callback is ignored");
+        }
     }
     if (ret == Qtrue) {
-	X509_STORE_CTX_set_error(ctx, X509_V_OK);
-	ok = 1;
+        X509_STORE_CTX_set_error(ctx, X509_V_OK);
+        ok = 1;
     }
     else {
-	if (X509_STORE_CTX_get_error(ctx) == X509_V_OK)
-	    X509_STORE_CTX_set_error(ctx, X509_V_ERR_CERT_REJECTED);
-	ok = 0;
+        if (X509_STORE_CTX_get_error(ctx) == X509_V_OK)
+            X509_STORE_CTX_set_error(ctx, X509_V_ERR_CERT_REJECTED);
+        ok = 0;
     }
 
     return ok;
@@ -108,15 +92,17 @@ ossl_verify_cb_call(VALUE proc, int ok, X509_STORE_CTX *ctx)
 /*
  * Classes
  */
-VALUE cX509Store;
-VALUE cX509StoreContext;
-VALUE eX509StoreError;
+static VALUE cX509Store;
+static VALUE cX509StoreContext;
+static VALUE eX509StoreError;
 
 static void
 ossl_x509store_mark(void *ptr)
 {
     X509_STORE *store = ptr;
-    rb_gc_mark((VALUE)X509_STORE_get_ex_data(store, store_ex_verify_cb_idx));
+    VALUE verify_cb =
+        (VALUE)X509_STORE_get_ex_data(store, store_ex_verify_cb_idx);
+    rb_gc_mark_movable(verify_cb);
 }
 
 static void
@@ -125,12 +111,26 @@ ossl_x509store_free(void *ptr)
     X509_STORE_free(ptr);
 }
 
+static void
+ossl_x509store_compact(void *ptr)
+{
+    X509_STORE *store = ptr;
+    VALUE verify_cb =
+        (VALUE)X509_STORE_get_ex_data(store, store_ex_verify_cb_idx);
+    if (verify_cb) {
+        (void)X509_STORE_set_ex_data(store, store_ex_verify_cb_idx,
+                                     (void *)rb_gc_location(verify_cb));
+    }
+}
+
 static const rb_data_type_t ossl_x509store_type = {
-    "OpenSSL/X509/STORE",
-    {
-        ossl_x509store_mark, ossl_x509store_free,
+    .wrap_struct_name = "OpenSSL/X509/STORE",
+    .function = {
+        .dmark = ossl_x509store_mark,
+        .dfree = ossl_x509store_free,
+        .dcompact = ossl_x509store_compact,
     },
-    0, 0, RUBY_TYPED_FREE_IMMEDIATELY,
+    .flags = RUBY_TYPED_THREAD_SAFE_FREE | RUBY_TYPED_WB_PROTECTED,
 };
 
 /*
@@ -156,10 +156,10 @@ x509store_verify_cb(int ok, X509_STORE_CTX *ctx)
 
     proc = (VALUE)X509_STORE_CTX_get_ex_data(ctx, stctx_ex_verify_cb_idx);
     if (!proc)
-	proc = (VALUE)X509_STORE_get_ex_data(X509_STORE_CTX_get0_store(ctx),
-					     store_ex_verify_cb_idx);
+        proc = (VALUE)X509_STORE_get_ex_data(X509_STORE_CTX_get0_store(ctx),
+                                             store_ex_verify_cb_idx);
     if (!proc)
-	return ok;
+        return ok;
 
     return ossl_verify_cb_call(proc, ok, ctx);
 }
@@ -167,15 +167,7 @@ x509store_verify_cb(int ok, X509_STORE_CTX *ctx)
 static VALUE
 ossl_x509store_alloc(VALUE klass)
 {
-    X509_STORE *store;
-    VALUE obj;
-
-    obj = NewX509Store(klass);
-    if ((store = X509_STORE_new()) == NULL)
-        ossl_raise(eX509StoreError, "X509_STORE_new");
-    SetX509Store(obj, store);
-
-    return obj;
+    return TypedData_Wrap_Struct(klass, &ossl_x509store_type, NULL);
 }
 
 /*
@@ -187,8 +179,10 @@ ossl_x509store_set_vfy_cb(VALUE self, VALUE cb)
     X509_STORE *store;
 
     GetX509Store(self, store);
-    X509_STORE_set_ex_data(store, store_ex_verify_cb_idx, (void *)cb);
+    if (!X509_STORE_set_ex_data(store, store_ex_verify_cb_idx, (void *)cb))
+        ossl_raise(eX509StoreError, "X509_STORE_set_ex_data");
     rb_iv_set(self, "@verify_callback", cb);
+    RB_OBJ_WRITTEN(self, Qundef, cb);
 
     return cb;
 }
@@ -205,13 +199,14 @@ ossl_x509store_initialize(int argc, VALUE *argv, VALUE self)
 {
     X509_STORE *store;
 
-    GetX509Store(self, store);
     if (argc != 0)
         rb_warn("OpenSSL::X509::Store.new does not take any arguments");
-#if !defined(HAVE_OPAQUE_OPENSSL)
-    /* [Bug #405] [Bug #1678] [Bug #3000]; already fixed? */
-    store->ex_data.sk = NULL;
-#endif
+    ossl_want_uninitialized(self, &ossl_x509store_type);
+
+    store = X509_STORE_new();
+    if (!store)
+        ossl_raise(eX509StoreError, "X509_STORE_new");
+    RTYPEDDATA_DATA(self) = store;
     X509_STORE_set_verify_cb(store, x509store_verify_cb);
     ossl_x509store_set_vfy_cb(self, Qnil);
 
@@ -219,9 +214,43 @@ ossl_x509store_initialize(int argc, VALUE *argv, VALUE self)
     rb_iv_set(self, "@error", Qnil);
     rb_iv_set(self, "@error_string", Qnil);
     rb_iv_set(self, "@chain", Qnil);
-    rb_iv_set(self, "@time", Qnil);
 
     return self;
+}
+
+/*
+ * call-seq:
+ *    store.flags -> Integer
+ *
+ * Gets the verification flags for the Store.
+ *
+ * See also the man page X509_VERIFY_PARAM_get_flags(3).
+ */
+static VALUE
+ossl_x509store_get_flags(VALUE self)
+{
+    X509_STORE *store;
+    X509_VERIFY_PARAM *vpm;
+
+    GetX509Store(self, store);
+    vpm = X509_STORE_get0_param(store);
+    return ULONG2NUM(X509_VERIFY_PARAM_get_flags(vpm));
+}
+
+static void
+x509vpm_set_flags_i(X509_VERIFY_PARAM *vpm, VALUE flags)
+{
+    unsigned long curr = X509_VERIFY_PARAM_get_flags(vpm);
+    unsigned long f = NUM2ULONG(flags);
+
+    if ((curr | f) != f) {
+        rb_warn("`obj.flags = new_flags` does not clear existing flags; " \
+                "use `obj.clear_flags` first if you want to replace them, " \
+                "or `obj.flags |= new_flags` to indicate that " \
+                "appending flags is intentional");
+    }
+    if (!X509_VERIFY_PARAM_set_flags(vpm, f))
+        ossl_raise(eX509StoreError, "X509_VERIFY_PARAM_set_flags");
 }
 
 /*
@@ -230,6 +259,10 @@ ossl_x509store_initialize(int argc, VALUE *argv, VALUE self)
  *
  * Sets the default flags used by certificate chain verification performed with
  * the Store.
+ *
+ * *NOTE*: Despite the name, this method appends the specified flags to the
+ * existing flag set rather than replacing it. To clear existing flags, use
+ * #clear_flags before calling this method.
  *
  * _flags_ consists of zero or more of the constants defined in OpenSSL::X509
  * with name V_FLAG_* or'ed together.
@@ -243,12 +276,40 @@ static VALUE
 ossl_x509store_set_flags(VALUE self, VALUE flags)
 {
     X509_STORE *store;
-    long f = NUM2LONG(flags);
 
     GetX509Store(self, store);
-    X509_STORE_set_flags(store, f);
-
+    x509vpm_set_flags_i(X509_STORE_get0_param(store), flags);
     return flags;
+}
+
+static void
+x509vpm_clear_flags_i(X509_VERIFY_PARAM *vpm, VALUE flags)
+{
+    unsigned long f = NIL_P(flags) ? ~0UL : NUM2ULONG(flags);
+
+    if (!X509_VERIFY_PARAM_clear_flags(vpm, f))
+        ossl_raise(eX509StoreError, "X509_VERIFY_PARAM_clear_flags");
+}
+
+/*
+ * call-seq:
+ *    store.clear_flags(flags = nil)
+ *
+ * Clears verification flags _flags_ for the Store. If _flags_ is omitted,
+ * clears all existing flags.
+ *
+ * See also the man page X509_VERIFY_PARAM_clear_flags(3).
+ */
+static VALUE
+ossl_x509store_clear_flags(int argc, VALUE *argv, VALUE self)
+{
+    X509_STORE *store;
+    VALUE flags;
+
+    rb_scan_args(argc, argv, "01", &flags);
+    GetX509Store(self, store);
+    x509vpm_clear_flags_i(X509_STORE_get0_param(store), flags);
+    return Qnil;
 }
 
 /*
@@ -281,7 +342,9 @@ ossl_x509store_set_purpose(VALUE self, VALUE purpose)
     int p = NUM2INT(purpose);
 
     GetX509Store(self, store);
-    X509_STORE_set_purpose(store, p);
+    if (!X509_STORE_set_purpose(store, p)) {
+        ossl_raise(eX509StoreError, "X509_STORE_set_purpose");
+    }
 
     return purpose;
 }
@@ -305,7 +368,9 @@ ossl_x509store_set_trust(VALUE self, VALUE trust)
     int t = NUM2INT(trust);
 
     GetX509Store(self, store);
-    X509_STORE_set_trust(store, t);
+    if (!X509_STORE_set_trust(store, t)) {
+        ossl_raise(eX509StoreError, "X509_STORE_set_trust");
+    }
 
     return trust;
 }
@@ -325,7 +390,12 @@ ossl_x509store_set_trust(VALUE self, VALUE trust)
 static VALUE
 ossl_x509store_set_time(VALUE self, VALUE time)
 {
-    rb_iv_set(self, "@time", time);
+    X509_STORE *store;
+    X509_VERIFY_PARAM *param;
+
+    GetX509Store(self, store);
+    param = X509_STORE_get0_param(store);
+    X509_VERIFY_PARAM_set_time(param, NUM2TIMET(rb_Integer(time)));
     return time;
 }
 
@@ -353,15 +423,6 @@ ossl_x509store_add_file(VALUE self, VALUE file)
         ossl_raise(eX509StoreError, "X509_STORE_add_lookup");
     if (X509_LOOKUP_load_file(lookup, path, X509_FILETYPE_PEM) != 1)
         ossl_raise(eX509StoreError, "X509_LOOKUP_load_file");
-#if OPENSSL_VERSION_NUMBER < 0x10101000 || defined(LIBRESSL_VERSION_NUMBER)
-    /*
-     * X509_load_cert_crl_file() which is called from X509_LOOKUP_load_file()
-     * did not check the return value of X509_STORE_add_{cert,crl}(), leaking
-     * "cert already in hash table" errors on the error queue, if duplicate
-     * certificates are found. This will be fixed by OpenSSL 1.1.1.
-     */
-    ossl_clear_error();
-#endif
 
     return self;
 }
@@ -489,7 +550,7 @@ ossl_x509store_verify(int argc, VALUE *argv, VALUE self)
     rb_scan_args(argc, argv, "11", &cert, &chain);
     ctx = rb_funcall(cX509StoreContext, rb_intern("new"), 3, self, cert, chain);
     proc = rb_block_given_p() ?  rb_block_proc() :
-	   rb_iv_get(self, "@verify_callback");
+           rb_iv_get(self, "@verify_callback");
     rb_iv_set(ctx, "@verify_callback", proc);
     result = rb_funcall(ctx, rb_intern("verify"), 0);
 
@@ -507,57 +568,57 @@ static void
 ossl_x509stctx_mark(void *ptr)
 {
     X509_STORE_CTX *ctx = ptr;
-    rb_gc_mark((VALUE)X509_STORE_CTX_get_ex_data(ctx, stctx_ex_verify_cb_idx));
+    VALUE verify_cb =
+        (VALUE)X509_STORE_CTX_get_ex_data(ctx, stctx_ex_verify_cb_idx);
+    rb_gc_mark_movable(verify_cb);
 }
 
 static void
 ossl_x509stctx_free(void *ptr)
 {
     X509_STORE_CTX *ctx = ptr;
-    if (X509_STORE_CTX_get0_untrusted(ctx))
-	sk_X509_pop_free(X509_STORE_CTX_get0_untrusted(ctx), X509_free);
-    if (X509_STORE_CTX_get0_cert(ctx))
-	X509_free(X509_STORE_CTX_get0_cert(ctx));
+    sk_X509_pop_free(X509_STORE_CTX_get0_untrusted(ctx), X509_free);
+    X509_free((X509 *)X509_STORE_CTX_get0_cert(ctx));
     X509_STORE_CTX_free(ctx);
 }
 
+static void
+ossl_x509stctx_compact(void *ptr)
+{
+    X509_STORE_CTX *ctx = ptr;
+    VALUE verify_cb =
+        (VALUE)X509_STORE_CTX_get_ex_data(ctx, stctx_ex_verify_cb_idx);
+    if (verify_cb) {
+        (void)X509_STORE_CTX_set_ex_data(ctx, stctx_ex_verify_cb_idx,
+                                         (void *)rb_gc_location(verify_cb));
+    }
+}
+
 static const rb_data_type_t ossl_x509stctx_type = {
-    "OpenSSL/X509/STORE_CTX",
-    {
-        ossl_x509stctx_mark, ossl_x509stctx_free,
+    .wrap_struct_name = "OpenSSL/X509/STORE_CTX",
+    .function = {
+        .dmark = ossl_x509stctx_mark,
+        .dfree = ossl_x509stctx_free,
+        .dcompact = ossl_x509stctx_compact,
     },
-    0, 0, RUBY_TYPED_FREE_IMMEDIATELY,
+    .flags = RUBY_TYPED_THREAD_SAFE_FREE | RUBY_TYPED_WB_PROTECTED,
 };
 
 static VALUE
 ossl_x509stctx_alloc(VALUE klass)
 {
-    X509_STORE_CTX *ctx;
-    VALUE obj;
-
-    obj = NewX509StCtx(klass);
-    if ((ctx = X509_STORE_CTX_new()) == NULL)
-        ossl_raise(eX509StoreError, "X509_STORE_CTX_new");
-    SetX509StCtx(obj, ctx);
-
-    return obj;
+    return TypedData_Wrap_Struct(klass, &ossl_x509stctx_type, NULL);
 }
 
 static VALUE
 ossl_x509stctx_new(X509_STORE_CTX *ctx)
 {
-    VALUE obj;
-
-    obj = NewX509StCtx(cX509StoreContext);
-    SetX509StCtx(obj, ctx);
-
-    return obj;
+    return TypedData_Wrap_Struct(cX509StoreContext, &ossl_x509stctx_type, ctx);
 }
 
 static VALUE ossl_x509stctx_set_flags(VALUE, VALUE);
 static VALUE ossl_x509stctx_set_purpose(VALUE, VALUE);
 static VALUE ossl_x509stctx_set_trust(VALUE, VALUE);
-static VALUE ossl_x509stctx_set_time(VALUE, VALUE);
 
 /*
  * call-seq:
@@ -568,7 +629,7 @@ static VALUE ossl_x509stctx_set_time(VALUE, VALUE);
 static VALUE
 ossl_x509stctx_initialize(int argc, VALUE *argv, VALUE self)
 {
-    VALUE store, cert, chain, t;
+    VALUE store, cert, chain;
     X509_STORE_CTX *ctx;
     X509_STORE *x509st;
     X509 *x509 = NULL;
@@ -576,7 +637,13 @@ ossl_x509stctx_initialize(int argc, VALUE *argv, VALUE self)
     int state;
 
     rb_scan_args(argc, argv, "12", &store, &cert, &chain);
-    GetX509StCtx(self, ctx);
+    ossl_want_uninitialized(self, &ossl_x509stctx_type);
+
+    ctx = X509_STORE_CTX_new();
+    if (!ctx)
+        ossl_raise(eX509StoreError, "X509_STORE_CTX_new");
+    RTYPEDDATA_DATA(self) = ctx;
+
     GetX509Store(store, x509st);
     if (!NIL_P(cert))
         x509 = DupX509CertPtr(cert); /* NEED TO DUP */
@@ -592,8 +659,6 @@ ossl_x509stctx_initialize(int argc, VALUE *argv, VALUE self)
         sk_X509_pop_free(x509s, X509_free);
         ossl_raise(eX509StoreError, "X509_STORE_CTX_init");
     }
-    if (!NIL_P(t = rb_iv_get(store, "@time")))
-	ossl_x509stctx_set_time(self, t);
     rb_iv_set(self, "@verify_callback", rb_iv_get(store, "@verify_callback"));
     rb_iv_set(self, "@cert", cert);
 
@@ -614,8 +679,10 @@ ossl_x509stctx_verify(VALUE self)
     X509_STORE_CTX *ctx;
 
     GetX509StCtx(self, ctx);
-    X509_STORE_CTX_set_ex_data(ctx, stctx_ex_verify_cb_idx,
-			       (void *)rb_iv_get(self, "@verify_callback"));
+    VALUE cb = rb_iv_get(self, "@verify_callback");
+    if (!X509_STORE_CTX_set_ex_data(ctx, stctx_ex_verify_cb_idx, (void *)cb))
+        ossl_raise(eX509StoreError, "X509_STORE_CTX_set_ex_data");
+    RB_OBJ_WRITTEN(self, Qundef, cb);
 
     switch (X509_verify_cert(ctx)) {
       case 1:
@@ -624,7 +691,7 @@ ossl_x509stctx_verify(VALUE self)
         ossl_clear_error();
         return Qfalse;
       default:
-        ossl_raise(eX509CertError, "X509_verify_cert");
+        ossl_raise(eX509StoreError, "X509_verify_cert");
     }
 }
 
@@ -740,10 +807,14 @@ static VALUE
 ossl_x509stctx_get_curr_cert(VALUE self)
 {
     X509_STORE_CTX *ctx;
+    const X509 *x509;
 
     GetX509StCtx(self, ctx);
+    x509 = X509_STORE_CTX_get_current_cert(ctx);
+    if (!x509)
+        return Qnil;
 
-    return ossl_x509_new(X509_STORE_CTX_get_current_cert(ctx));
+    return ossl_x509_new(x509);
 }
 
 /*
@@ -758,14 +829,33 @@ static VALUE
 ossl_x509stctx_get_curr_crl(VALUE self)
 {
     X509_STORE_CTX *ctx;
-    X509_CRL *crl;
+    const X509_CRL *crl;
 
     GetX509StCtx(self, ctx);
     crl = X509_STORE_CTX_get0_current_crl(ctx);
     if (!crl)
-	return Qnil;
+        return Qnil;
 
     return ossl_x509crl_new(crl);
+}
+
+/*
+ * call-seq:
+ *    stctx.flags -> Integer
+ *
+ * Gets the verification flags for the context.
+ *
+ * See also the man page X509_VERIFY_PARAM_get_flags(3).
+ */
+static VALUE
+ossl_x509stctx_get_flags(VALUE self)
+{
+    X509_STORE_CTX *ctx;
+    X509_VERIFY_PARAM *vpm;
+
+    GetX509StCtx(self, ctx);
+    vpm = X509_STORE_CTX_get0_param(ctx);
+    return ULONG2NUM(X509_VERIFY_PARAM_get_flags(vpm));
 }
 
 /*
@@ -775,18 +865,41 @@ ossl_x509stctx_get_curr_crl(VALUE self)
  * Sets the verification flags to the context. This overrides the default value
  * set by Store#flags=.
  *
+ * *NOTE*: Despite the name, this method appends the specified flags to the
+ * existing flag set rather than replacing it. To clear existing flags, use
+ * #clear_flags before calling this method.
+ *
  * See also the man page X509_VERIFY_PARAM_set_flags(3).
  */
 static VALUE
 ossl_x509stctx_set_flags(VALUE self, VALUE flags)
 {
-    X509_STORE_CTX *store;
-    long f = NUM2LONG(flags);
+    X509_STORE_CTX *ctx;
 
-    GetX509StCtx(self, store);
-    X509_STORE_CTX_set_flags(store, f);
-
+    GetX509StCtx(self, ctx);
+    x509vpm_set_flags_i(X509_STORE_CTX_get0_param(ctx), flags);
     return flags;
+}
+
+/*
+ * call-seq:
+ *    stctx.clear_flags(flags = nil)
+ *
+ * Clears verification flags _flags_ for the Store. If _flags_ is omitted,
+ * clears all existing flags.
+ *
+ * See also the man page X509_VERIFY_PARAM_clear_flags(3).
+ */
+static VALUE
+ossl_x509stctx_clear_flags(int argc, VALUE *argv, VALUE self)
+{
+    X509_STORE_CTX *ctx;
+    VALUE flags;
+
+    rb_scan_args(argc, argv, "01", &flags);
+    GetX509StCtx(self, ctx);
+    x509vpm_clear_flags_i(X509_STORE_CTX_get0_param(ctx), flags);
+    return Qnil;
 }
 
 /*
@@ -805,7 +918,9 @@ ossl_x509stctx_set_purpose(VALUE self, VALUE purpose)
     int p = NUM2INT(purpose);
 
     GetX509StCtx(self, store);
-    X509_STORE_CTX_set_purpose(store, p);
+    if (!X509_STORE_CTX_set_purpose(store, p)) {
+        ossl_raise(eX509StoreError, "X509_STORE_CTX_set_purpose");
+    }
 
     return purpose;
 }
@@ -826,7 +941,9 @@ ossl_x509stctx_set_trust(VALUE self, VALUE trust)
     int t = NUM2INT(trust);
 
     GetX509StCtx(self, store);
-    X509_STORE_CTX_set_trust(store, t);
+    if (!X509_STORE_CTX_set_trust(store, t)) {
+        ossl_raise(eX509StoreError, "X509_STORE_CTX_set_trust");
+    }
 
     return trust;
 }
@@ -843,9 +960,9 @@ static VALUE
 ossl_x509stctx_set_time(VALUE self, VALUE time)
 {
     X509_STORE_CTX *store;
-    long t;
+    time_t t;
 
-    t = NUM2LONG(rb_Integer(time));
+    t = NUM2TIMET(rb_Integer(time));
     GetX509StCtx(self, store);
     X509_STORE_CTX_set_time(store, 0, t);
 
@@ -859,19 +976,13 @@ void
 Init_ossl_x509store(void)
 {
 #undef rb_intern
-#if 0
-    mOSSL = rb_define_module("OpenSSL");
-    eOSSLError = rb_define_class_under(mOSSL, "OpenSSLError", rb_eStandardError);
-    mX509 = rb_define_module_under(mOSSL, "X509");
-#endif
-
     /* Register ext_data slot for verify callback Proc */
     stctx_ex_verify_cb_idx = X509_STORE_CTX_get_ex_new_index(0, (void *)"stctx_ex_verify_cb_idx", 0, 0, 0);
     if (stctx_ex_verify_cb_idx < 0)
-	ossl_raise(eOSSLError, "X509_STORE_CTX_get_ex_new_index");
+        ossl_raise(eOSSLError, "X509_STORE_CTX_get_ex_new_index");
     store_ex_verify_cb_idx = X509_STORE_get_ex_new_index(0, (void *)"store_ex_verify_cb_idx", 0, 0, 0);
     if (store_ex_verify_cb_idx < 0)
-	ossl_raise(eOSSLError, "X509_STORE_get_ex_new_index");
+        ossl_raise(eOSSLError, "X509_STORE_get_ex_new_index");
 
     eX509StoreError = rb_define_class_under(mX509, "StoreError", eOSSLError);
 
@@ -950,7 +1061,9 @@ Init_ossl_x509store(void)
     rb_define_method(cX509Store, "initialize",   ossl_x509store_initialize, -1);
     rb_undef_method(cX509Store, "initialize_copy");
     rb_define_method(cX509Store, "verify_callback=", ossl_x509store_set_vfy_cb, 1);
+    rb_define_method(cX509Store, "flags",        ossl_x509store_get_flags, 0);
     rb_define_method(cX509Store, "flags=",       ossl_x509store_set_flags, 1);
+    rb_define_method(cX509Store, "clear_flags",  ossl_x509store_clear_flags, -1);
     rb_define_method(cX509Store, "purpose=",     ossl_x509store_set_purpose, 1);
     rb_define_method(cX509Store, "trust=",       ossl_x509store_set_trust, 1);
     rb_define_method(cX509Store, "time=",        ossl_x509store_set_time, 1);
@@ -979,7 +1092,9 @@ Init_ossl_x509store(void)
     rb_define_method(cX509StoreContext, "error_depth", ossl_x509stctx_get_err_depth, 0);
     rb_define_method(cX509StoreContext, "current_cert", ossl_x509stctx_get_curr_cert, 0);
     rb_define_method(cX509StoreContext, "current_crl", ossl_x509stctx_get_curr_crl, 0);
+    rb_define_method(cX509StoreContext, "flags", ossl_x509stctx_get_flags, 0);
     rb_define_method(cX509StoreContext, "flags=", ossl_x509stctx_set_flags, 1);
+    rb_define_method(cX509StoreContext, "clear_flags", ossl_x509stctx_clear_flags, -1);
     rb_define_method(cX509StoreContext, "purpose=", ossl_x509stctx_set_purpose, 1);
     rb_define_method(cX509StoreContext, "trust=", ossl_x509stctx_set_trust, 1);
     rb_define_method(cX509StoreContext, "time=", ossl_x509stctx_set_time, 1);

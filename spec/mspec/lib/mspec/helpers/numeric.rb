@@ -1,3 +1,4 @@
+# frozen_string_literal: true
 require 'mspec/guards/platform'
 
 def nan_value
@@ -9,15 +10,38 @@ def infinity_value
 end
 
 def bignum_value(plus = 0)
-  0x8000_0000_0000_0000 + plus
+  # Must be >= fixnum_max + 2, so -bignum_value is < fixnum_min
+  # A fixed value has the advantage to be the same numeric value for all Rubies and is much easier to spec
+  (2**64) + plus
 end
 
 def max_long
-  2**(0.size * 8 - 1) - 1
+  2**(PlatformGuard::C_LONG_SIZE - 1) - 1
 end
 
 def min_long
-  -(2**(0.size * 8 - 1))
+  -(2**(PlatformGuard::C_LONG_SIZE - 1))
+end
+
+def max_ulong
+  2**PlatformGuard::C_LONG_SIZE - 1
+end
+
+def max_rb_len_t
+  2**(PlatformGuard::RB_LEN_T_SIZE - 1) - 1
+end
+
+def min_rb_len_t
+  -(2**(PlatformGuard::RB_LEN_T_SIZE - 1))
+end
+
+def max_rb_ulen_t
+  2**PlatformGuard::RB_LEN_T_SIZE - 1
+end
+
+# Larger than the longest String or Array, whose lengths are pointer-sized
+def max_length
+  2**(PlatformGuard::POINTER_SIZE - 1) - 1
 end
 
 # This is a bit hairy, but we need to be able to write specs that cover the
@@ -26,21 +50,30 @@ end
 # specs based on the relationship between values rather than specific
 # values.
 if PlatformGuard.standard? or PlatformGuard.implementation? :topaz
-  if PlatformGuard.wordsize? 32
+  limits_available = begin
+    require 'rbconfig/sizeof'
+    defined?(RbConfig::LIMITS.[]) && ['FIXNUM_MAX', 'FIXNUM_MIN'].all? do |key|
+      Integer === RbConfig::LIMITS[key]
+    end
+  rescue LoadError
+    false
+  end
+
+  if limits_available
     def fixnum_max
-      (2**30) - 1
+      RbConfig::LIMITS['FIXNUM_MAX']
     end
 
     def fixnum_min
-      -(2**30)
+      RbConfig::LIMITS['FIXNUM_MIN']
     end
-  elsif PlatformGuard.wordsize? 64
+  else
     def fixnum_max
-      (2**62) - 1
+      2**(PlatformGuard::RB_LEN_T_SIZE-2) - 1
     end
 
     def fixnum_min
-      -(2**62)
+      -(2**(PlatformGuard::RB_LEN_T_SIZE-2))
     end
   end
 elsif PlatformGuard.implementation? :opal

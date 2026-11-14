@@ -1,9 +1,17 @@
 # frozen_string_literal: true
-#--
+
+# rubocop:disable Style/AsciiComments
+
 # Copyright (C) 2004 Mauricio Julio Fernández Pradier
 # See LICENSE.txt for additional licensing information.
-#++
-#
+
+# rubocop:enable Style/AsciiComments
+
+require_relative "win_platform"
+require_relative "security"
+require_relative "user_interaction"
+
+##
 # Example using a Gem::Package
 #
 # Builds a .gem file given a Gem::Specification. A .gem file is a tarball
@@ -41,10 +49,6 @@
 # #files are the files in the .gem tar file, not the Ruby files in the gem
 # #extract_files and #contents automatically call #verify
 
-require_relative "../rubygems"
-require_relative 'security'
-require_relative 'user_interaction'
-
 class Gem::Package
   include Gem::UserInteraction
 
@@ -55,9 +59,9 @@ class Gem::Package
 
     def initialize(message, source = nil)
       if source
-        @path = source.path
+        @path = source.is_a?(String) ? source : source.path
 
-        message = message + " in #{path}" if path
+        message += " in #{path}" if path
       end
 
       super message
@@ -66,15 +70,13 @@ class Gem::Package
 
   class PathError < Error
     def initialize(destination, destination_dir)
-      super "installing into parent path %s of %s is not allowed" %
-              [destination, destination_dir]
+      super format("installing into parent path %s of %s is not allowed", destination, destination_dir)
     end
   end
 
   class SymlinkError < Error
     def initialize(name, destination, destination_dir)
-      super "installing symlink '%s' pointing to parent path %s of %s is not allowed" %
-              [name, destination, destination_dir]
+      super format("installing symlink '%s' pointing to parent path %s of %s is not allowed", name, destination, destination_dir)
     end
   end
 
@@ -86,6 +88,18 @@ class Gem::Package
   # Raised when a tar file is corrupt
 
   class TarInvalidError < Error; end
+
+  ##
+  # Raised when a filename contains characters that are invalid on Windows
+
+  class InvalidWindowsFileNameError < Gem::InstallError
+    def initialize(filename, gem_name = nil)
+      message = "The gem contains a file '#{filename}' with characters in its name that are not allowed on Windows (e.g., colons)."
+      message += " This is a problem with the '#{gem_name}' gem, not Rubygems." if gem_name
+      message += " Please report this issue to the gem author."
+      super message
+    end
+  end
 
   attr_accessor :build_time # :nodoc:
 
@@ -127,13 +141,46 @@ class Gem::Package
   # Permission for other files
   attr_accessor :data_mode
 
-  def self.build(spec, skip_validation = false, strict_validation = false, file_name = nil)
-    gem_file = file_name || spec.file_name
+  ##
+  # The minimum RubyGems version that can install content-addressable gems.
+  # Built into +required_rubygems_version+ so older clients reject skinny
+  # gems through both the local and remote install paths.
 
-    package = new gem_file
-    package.spec = spec
-    package.build skip_validation, strict_validation
+  MINIMUM_RUBYGEMS_VERSION = ">= 4.1.0.a"
 
+  ##
+  # Builds the gem described by +spec+ and returns the built file name.
+  #
+  # When +content_addressable+ is true, builds a gem named by the SHA-256
+  # digest of its contents. The spec must declare a non-Ruby platform and a
+  # +required_ruby_version+ identifying a single Ruby ABI. Its
+  # +required_rubygems_version+ is constrained to at least
+  # MINIMUM_RUBYGEMS_VERSION. Content-addressable builds are incompatible
+  # with +file_name+.
+
+  def self.build(spec, skip_validation = false, strict_validation = false, file_name = nil, content_addressable: false)
+    if content_addressable && file_name
+      raise ArgumentError, "Cannot specify an output file name for a content-addressable gem as these gems must use the generated file name."
+    end
+    if content_addressable
+      require "digest"
+      require "stringio"
+
+      io = StringIO.new
+      io.set_encoding(Encoding::BINARY)
+
+      package = new io
+      package.spec = spec.dup
+      gem_file = package.build_content_addressable_file skip_validation, strict_validation
+
+      spec.required_rubygems_version = package.spec.required_rubygems_version
+    else
+      gem_file = file_name || spec.file_name
+
+      package = new gem_file
+      package.spec = spec
+      package.build skip_validation, strict_validation
+    end
     gem_file
   end
 
@@ -146,20 +193,20 @@ class Gem::Package
 
   def self.new(gem, security_policy = nil)
     gem = if gem.is_a?(Gem::Package::Source)
-            gem
-          elsif gem.respond_to? :read
-            Gem::Package::IOSource.new gem
-          else
-            Gem::Package::FileSource.new gem
-          end
+      gem
+    elsif gem.respond_to? :read
+      Gem::Package::IOSource.new gem
+    else
+      Gem::Package::FileSource.new gem
+    end
 
-    return super unless Gem::Package == self
+    return super unless self == Gem::Package
     return super unless gem.present?
 
     return super unless gem.start
-    return super unless gem.start.include? 'MD5SUM ='
+    return super unless gem.start.include? "MD5SUM ="
 
-    Gem::Package::Old.new gem
+    Gem::Package::Old.new gem, security_policy
   end
 
   ##
@@ -177,22 +224,22 @@ class Gem::Package
       tar = Gem::Package::TarReader.new io
       tar.each_entry do |entry|
         case entry.full_name
-        when 'metadata' then
+        when "metadata" then
           metadata = entry.read
-        when 'metadata.gz' then
+        when "metadata.gz" then
           metadata = Gem::Util.gunzip entry.read
         end
       end
     end
 
-    return spec, metadata
+    [spec, metadata]
   end
 
   ##
   # Creates a new package that will read or write to the file +gem+.
 
   def initialize(gem, security_policy) # :notnew:
-    require 'zlib'
+    require "zlib"
 
     @gem = gem
 
@@ -215,6 +262,21 @@ class Gem::Package
   end
 
   ##
+  # Derives the content address from the gem's file name and verifies it
+  # against the SHA256 digest of the file contents.
+
+  def content_address
+    path = @gem&.path
+    return unless path
+
+    address = Gem::ContentAddress.verified_file_name_claim(path, spec)
+    return nil unless address
+    return nil unless Gem::ContentAddress.eligible?(spec)
+
+    address
+  end
+
+  ##
   # Adds a checksum for each entry in the gem to checksums.yaml.gz.
 
   def add_checksums(tar)
@@ -228,9 +290,13 @@ class Gem::Package
       end
     end
 
-    tar.add_file_signed 'checksums.yaml.gz', 0444, @signer do |io|
+    tar.add_file_signed "checksums.yaml.gz", 0o444, @signer do |io|
       gzip_to io do |gz_io|
-        YAML.dump checksums_by_algorithm, gz_io
+        if Gem.use_psych?
+          Psych.dump checksums_by_algorithm, gz_io
+        else
+          gz_io.write Gem::YAMLSerializer.dump(checksums_by_algorithm)
+        end
       end
     end
   end
@@ -240,7 +306,7 @@ class Gem::Package
   # and adds this file to the +tar+.
 
   def add_contents(tar) # :nodoc:
-    digests = tar.add_file_signed 'data.tar.gz', 0444, @signer do |io|
+    digests = tar.add_file_signed "data.tar.gz", 0o444, @signer do |io|
       gzip_to io do |gz_io|
         Gem::Package::TarWriter.new gz_io do |data_tar|
           add_files data_tar
@@ -248,7 +314,7 @@ class Gem::Package
       end
     end
 
-    @checksums['data.tar.gz'] = digests
+    @checksums["data.tar.gz"] = digests
   end
 
   ##
@@ -256,6 +322,10 @@ class Gem::Package
 
   def add_files(tar) # :nodoc:
     @spec.files.each do |file|
+      if invalid_windows_filename?(file)
+        alert_warning "filename '#{file}' contains characters that are invalid on Windows (e.g., colons). This gem may fail to install on Windows."
+      end
+
       stat = File.lstat file
 
       if stat.symlink?
@@ -265,8 +335,8 @@ class Gem::Package
       next unless stat.file?
 
       tar.add_file_simple file, stat.mode, stat.size do |dst_io|
-        File.open file, 'rb' do |src_io|
-          dst_io.write src_io.read 16384 until src_io.eof?
+        File.open file, "rb" do |src_io|
+          copy_stream(src_io, dst_io, stat.size)
         end
       end
     end
@@ -276,13 +346,13 @@ class Gem::Package
   # Adds the package's Gem::Specification to the +tar+ file
 
   def add_metadata(tar) # :nodoc:
-    digests = tar.add_file_signed 'metadata.gz', 0444, @signer do |io|
+    digests = tar.add_file_signed "metadata.gz", 0o444, @signer do |io|
       gzip_to io do |gz_io|
         gz_io.write @spec.to_yaml
       end
     end
 
-    @checksums['metadata.gz'] = digests
+    @checksums["metadata.gz"] = digests
   end
 
   ##
@@ -293,7 +363,6 @@ class Gem::Package
 
     Gem.load_yaml
 
-    @spec.mark_version
     @spec.validate true, strict_validation unless skip_validation
 
     setup_signer(
@@ -310,14 +379,43 @@ class Gem::Package
       end
     end
 
-    say <<-EOM
+    message = <<-EOM
   Successfully built RubyGem
   Name: #{@spec.name}
   Version: #{@spec.version}
-  File: #{File.basename @gem.path}
 EOM
+
+    message += "  File: #{File.basename(@gem.path)}\n" if @gem.path
+    say message
   ensure
     @signer = nil
+  end
+
+  ##
+  # Builds this package and writes it to a content-addressable file name
+  # derived from the SHA-256 digest of the gem contents, for example
+  # "example-1.0-01234567.gem". Returns the written file name.
+  #
+  # The spec is validated for content addressing. Its
+  # +required_ruby_version+ determines the Ruby ABI, while its
+  # +required_rubygems_version+ is constrained before building.
+
+  def build_content_addressable_file(skip_validation = false, strict_validation = false)
+    Gem::ContentAddress.eligible!(@spec)
+    ruby_abi = Gem::ContentAddress.ruby_abi_for(@spec.required_ruby_version)
+    @spec.required_rubygems_version = normalized_required_rubygems_version(ruby_abi)
+
+    build skip_validation, strict_validation
+
+    bytes = @gem.with_read_io(&:read)
+    gem_file = "#{@spec.name}-#{@spec.version}-#{Gem::ContentAddress.address_for(bytes)}.gem"
+    File.binwrite(gem_file, bytes)
+
+    say "  File: #{gem_file}"
+    say "  Platform: #{@spec.platform}"
+    say "  Ruby ABI: #{ruby_abi}"
+
+    gem_file
   end
 
   ##
@@ -334,7 +432,7 @@ EOM
       gem_tar = Gem::Package::TarReader.new io
 
       gem_tar.each do |entry|
-        next unless entry.full_name == 'data.tar.gz'
+        next unless entry.full_name == "data.tar.gz"
 
         open_tar_gz entry do |pkg_tar|
           pkg_tar.each do |contents_entry|
@@ -345,6 +443,8 @@ EOM
         return @contents
       end
     end
+  rescue Zlib::GzipFile::Error, EOFError, Gem::Package::TarInvalidError => e
+    raise Gem::Package::FormatError.new e.message, @gem
   end
 
   ##
@@ -353,18 +453,21 @@ EOM
 
   def digest(entry) # :nodoc:
     algorithms = if @checksums
-                   @checksums.keys
-                 else
-                   [Gem::Security::DIGEST_NAME].compact
-                 end
+      @checksums.to_h {|algorithm, _| [algorithm, Gem::Security.create_digest(algorithm)] }
+    elsif Gem::Security::DIGEST_NAME
+      { Gem::Security::DIGEST_NAME => Gem::Security.create_digest(Gem::Security::DIGEST_NAME) }
+    end
 
-    algorithms.each do |algorithm|
-      digester = Gem::Security.create_digest(algorithm)
+    return @digests if algorithms.nil? || algorithms.empty?
 
-      digester << entry.read(16384) until entry.eof?
+    buf = String.new(capacity: 16_384, encoding: Encoding::BINARY)
+    until entry.eof?
+      entry.readpartial(16_384, buf)
+      algorithms.each_value {|digester| digester << buf }
+    end
+    entry.rewind
 
-      entry.rewind
-
+    algorithms.each do |algorithm, digester|
       @digests[algorithm][entry.full_name] = digester
     end
 
@@ -380,19 +483,21 @@ EOM
   def extract_files(destination_dir, pattern = "*")
     verify unless @spec
 
-    FileUtils.mkdir_p destination_dir, :mode => dir_mode && 0755
+    FileUtils.mkdir_p destination_dir, mode: dir_mode && 0o755
 
     @gem.with_read_io do |io|
       reader = Gem::Package::TarReader.new io
 
       reader.each do |entry|
-        next unless entry.full_name == 'data.tar.gz'
+        next unless entry.full_name == "data.tar.gz"
 
         extract_tar_gz entry, destination_dir, pattern
 
-        return # ignore further entries
+        break # ignore further entries
       end
     end
+  rescue Zlib::GzipFile::Error, EOFError, Gem::Package::TarInvalidError => e
+    raise Gem::Package::FormatError.new e.message, @gem
   end
 
   ##
@@ -407,25 +512,33 @@ EOM
   # extracted.
 
   def extract_tar_gz(io, destination_dir, pattern = "*") # :nodoc:
+    destination_dir = File.realpath(destination_dir)
+
     directories = []
+    symlinks = []
+
     open_tar_gz io do |tar|
       tar.each do |entry|
-        next unless File.fnmatch pattern, entry.full_name, File::FNM_DOTMATCH
+        full_name = entry.full_name
+        next unless File.fnmatch pattern, full_name, File::FNM_DOTMATCH
 
-        destination = install_location entry.full_name, destination_dir
+        if Gem.win_platform? && invalid_windows_filename?(full_name)
+          gem_name = @spec ? @spec.full_name : "unknown"
+          raise Gem::Package::InvalidWindowsFileNameError.new(full_name, gem_name)
+        end
+
+        destination = install_location full_name, destination_dir
 
         if entry.symlink?
           link_target = entry.header.linkname
-          real_destination = link_target.start_with?("/") ? link_target : File.expand_path(link_target, File.dirname(destination))
+          real_destination = File.expand_path(link_target, File.dirname(destination))
 
-          raise Gem::Package::SymlinkError.new(entry.full_name, real_destination, destination_dir) unless
-            normalize_path(real_destination).start_with? normalize_path(destination_dir + '/')
+          raise Gem::Package::SymlinkError.new(full_name, real_destination, destination_dir) unless
+            normalize_path(real_destination).start_with? normalize_path(destination_dir + "/")
+
+          symlinks << [full_name, link_target, destination, real_destination]
         end
 
-        FileUtils.rm_rf destination
-
-        mkdir_options = {}
-        mkdir_options[:mode] = dir_mode ? 0755 : (entry.header.mode if entry.directory?)
         mkdir =
           if entry.directory?
             destination
@@ -434,28 +547,50 @@ EOM
           end
 
         unless directories.include?(mkdir)
-          FileUtils.mkdir_p mkdir, **mkdir_options
+          FileUtils.mkdir_p mkdir, mode: dir_mode ? 0o755 : (entry.header.mode & 0o777 if entry.directory?)
           directories << mkdir
         end
 
-        File.open destination, 'wb' do |out|
-          out.write entry.read
-          FileUtils.chmod file_mode(entry.header.mode), destination
-        end if entry.file?
+        verify_extraction_dir mkdir, destination_dir
 
-        File.symlink(entry.header.linkname, destination) if entry.symlink?
+        if entry.file?
+          raise Gem::Package::PathError.new(destination, destination_dir) if
+            File.symlink?(destination)
+
+          File.open(destination, "wb") do |out|
+            copy_stream(tar.io, out, entry.size)
+            # Flush needs to happen before chmod because there could be data
+            # in the IO buffer that needs to be written, and that could be
+            # written after the chmod (on close) which would mess up the perms
+            out.flush
+            out.chmod file_mode(entry.header.mode) & ~File.umask
+          end
+        end
 
         verbose destination
       end
     end
 
-    if dir_mode
+    symlinks.each do |name, target, destination, real_destination|
+      if File.exist?(real_destination)
+        create_symlink(target, destination)
+      else
+        alert_warning "#{@spec.full_name} ships with a dangling symlink named #{name} pointing to missing #{target} file. Ignoring"
+      end
+    end
+
+    if dir_mode && !directories.empty?
       File.chmod(dir_mode, *directories)
     end
   end
 
   def file_mode(mode) # :nodoc:
-    ((mode & 0111).zero? ? data_mode : prog_mode) || mode
+    ((mode & 0o111).zero? ? data_mode : prog_mode) ||
+      # If we're not using one of the default modes, then we're going to fall
+      # back to the permission bits from the tarball. Masking drops setuid,
+      # setgid and sticky bits along with anything that does not fit into a
+      # mode in CRuby (an unsigned short).
+      (mode & 0o777)
   end
 
   ##
@@ -473,43 +608,37 @@ EOM
     gz_io.close
   end
 
-  ##
-  # Returns the full path for installing +filename+.
-  #
-  # If +filename+ is not inside +destination_dir+ an exception is raised.
-
-  def install_location(filename, destination_dir) # :nodoc:
-    raise Gem::Package::PathError.new(filename, destination_dir) if
-      filename.start_with? '/'
-
-    destination_dir = File.realpath(destination_dir)
-    destination = File.expand_path(filename, destination_dir)
-
-    raise Gem::Package::PathError.new(destination, destination_dir) unless
-      normalize_path(destination).start_with? normalize_path(destination_dir + '/')
-
-    destination.tap(&Gem::UNTAINT)
-    destination
-  end
-
-  def normalize_path(pathname)
-    if Gem.win_platform?
+  if Gem.win_platform?
+    def normalize_path(pathname) # :nodoc:
       pathname.downcase
-    else
+    end
+  else
+    def normalize_path(pathname) # :nodoc:
       pathname
     end
   end
 
   ##
+  # Checks if a filename contains characters that are invalid on Windows.
+  # Windows doesn't allow: < > : " | ? * \ and control characters (0x00-0x1F).
+  # Colons are the most common issue since they're allowed on Unix.
+  # Note: Colons are only valid as drive letter separators (e.g., C:), not in filenames.
+
+  def invalid_windows_filename?(filename) # :nodoc:
+    filename.to_s.split("/").any? {|part| part.match?(/[:<>"|?*\\\x00-\x1f]/) }
+  end
+
+  ##
   # Loads a Gem::Specification from the TarEntry +entry+
 
-  def load_spec(entry) # :nodoc:
+  def load_spec_from_metadata(entry) # :nodoc:
+    limit = 10 * 1024 * 1024
     case entry.full_name
-    when 'metadata' then
-      @spec = Gem::Specification.from_yaml entry.read
-    when 'metadata.gz' then
+    when "metadata" then
+      @spec = Gem::Specification.from_yaml limit_read(entry, "metadata", limit)
+    when "metadata.gz" then
       Zlib::GzipReader.wrap(entry, external_encoding: Encoding::UTF_8) do |gzio|
-        @spec = Gem::Specification.from_yaml gzio.read
+        @spec = Gem::Specification.from_yaml limit_read(gzio, "metadata.gz", limit)
       end
     end
   end
@@ -522,6 +651,15 @@ EOM
       tar = Gem::Package::TarReader.new gzio
 
       yield tar
+    ensure
+      # Consume remaining gzip data to prevent the
+      # "attempt to close unfinished zstream; reset forced" warning
+      # when the GzipReader is closed with unconsumed compressed data.
+      begin
+        IO.copy_stream(gzio, IO::NULL)
+      rescue Zlib::GzipFile::Error, IOError
+        nil
+      end
     end
   end
 
@@ -531,9 +669,9 @@ EOM
   def read_checksums(gem)
     Gem.load_yaml
 
-    @checksums = gem.seek 'checksums.yaml.gz' do |entry|
+    @checksums = gem.seek "checksums.yaml.gz" do |entry|
       Zlib::GzipReader.wrap entry do |gz_io|
-        Gem::SafeYAML.safe_load gz_io.read
+        Gem::SafeYAML.safe_load limit_read(gz_io, "checksums.yaml.gz", 10 * 1024 * 1024)
       end
     end
   end
@@ -543,7 +681,7 @@ EOM
   # certificate and key are not present only checksum generation is set up.
 
   def setup_signer(signer_options: {})
-    passphrase = ENV['GEM_PRIVATE_KEY_PASSPHRASE']
+    passphrase = ENV["GEM_PRIVATE_KEY_PASSPHRASE"]
     if @spec.signing_key
       @signer =
         Gem::Security::Signer.new(
@@ -554,10 +692,10 @@ EOM
         )
 
       @spec.signing_key = nil
-      @spec.cert_chain = @signer.cert_chain.map {|cert| cert.to_s }
+      @spec.cert_chain = @signer.cert_chain.map(&:to_s)
     else
       @signer = Gem::Security::Signer.new nil, nil, passphrase
-      @spec.cert_chain = @signer.cert_chain.map {|cert| cert.to_pem } if
+      @spec.cert_chain = @signer.cert_chain.map(&:to_pem) if
         @signer.cert_chain
     end
   end
@@ -599,8 +737,7 @@ EOM
 
     verify_checksums @digests, @checksums
 
-    @security_policy.verify_signatures @spec, @digests, @signatures if
-      @security_policy
+    @security_policy&.verify_signatures @spec, @digests, @signatures
 
     true
   rescue Gem::Security::Exception
@@ -609,8 +746,112 @@ EOM
     raise
   rescue Errno::ENOENT => e
     raise Gem::Package::FormatError.new e.message
-  rescue Gem::Package::TarInvalidError => e
+  rescue Zlib::GzipFile::Error, EOFError, Gem::Package::TarInvalidError => e
     raise Gem::Package::FormatError.new e.message, @gem
+  end
+
+  private
+
+  ##
+  # The +required_rubygems_version+ for a content-addressable build: the
+  # spec's requirement raised to at least MINIMUM_RUBYGEMS_VERSION, warning
+  # if it had to be changed. Raises if the requirement excludes every version
+  # satisfying that floor, since no RubyGems could install the built gem.
+
+  def normalized_required_rubygems_version(ruby_abi)
+    minimum = Gem::Requirement.new(MINIMUM_RUBYGEMS_VERSION)
+    existing = @spec.required_rubygems_version
+
+    return minimum if existing.nil? || existing == Gem::Requirement.default
+
+    floor = minimum.requirements.first.last
+
+    if excludes_rubygems_floor?(existing, floor)
+      raise ArgumentError,
+        "Cannot build gem for Ruby ABI #{ruby_abi} because required_rubygems_version is set to #{existing}, " \
+        "which excludes RubyGems #{MINIMUM_RUBYGEMS_VERSION} required to install content addressable gems. " \
+        "Please remove or loosen the conflicting constraint."
+    end
+
+    return existing if satisfies_rubygems_floor?(existing, floor)
+
+    preserved = existing.requirements.filter_map do |op, version|
+      "#{op} #{version}" if ["~>", "<", "<=", "!="].include?(op)
+    end
+
+    normalized = Gem::Requirement.new([MINIMUM_RUBYGEMS_VERSION, *preserved])
+
+    alert_warning \
+      "required_rubygems_version was changed from \"#{existing}\" to \"#{normalized}\" for this build " \
+      "because content addressable gems can only be installed by RubyGems #{MINIMUM_RUBYGEMS_VERSION}."
+
+    normalized
+  end
+
+  ##
+  # Whether +requirement+ excludes every RubyGems version satisfying the
+  # +floor+, so that no RubyGems could install the built gem.
+
+  def excludes_rubygems_floor?(requirement, floor)
+    capped_below_floor = requirement.requirements.any? do |op, version|
+      case op
+      when "<" then version <= floor
+      when "<=", "=" then version < floor
+      when "~>" then version.bump <= floor.release
+      else false
+      end
+    end
+
+    return true if capped_below_floor
+
+    !requirement.satisfied_by?(floor) && requirement.requirements.any? do |op, version|
+      ["<=", "="].include?(op) && version == floor
+    end
+  end
+
+  ##
+  # Whether one of the lower bounds of +requirement+ already guarantees the
+  # +floor+.
+
+  def satisfies_rubygems_floor?(requirement, floor)
+    requirement.requirements.any? do |op, version|
+      case op
+      when ">=", "~>", "=", ">" then version >= floor
+      else false
+      end
+    end
+  end
+
+  ##
+  # Returns the full path for installing +filename+ into +destination_dir+,
+  # which must already be resolved with File.realpath by the caller.
+  #
+  # If +filename+ is not inside +destination_dir+ an exception is raised.
+
+  def install_location(filename, destination_dir) # :nodoc:
+    raise Gem::Package::PathError.new(filename, destination_dir) if
+      filename.start_with? "/"
+
+    destination = File.expand_path(filename, destination_dir)
+
+    raise Gem::Package::PathError.new(destination, destination_dir) unless
+      normalize_path(destination).start_with? normalize_path(destination_dir + "/")
+
+    destination
+  end
+
+  ##
+  # Raises an exception unless +dir+, with symlinks resolved, is
+  # +destination_dir+ or a directory inside it.  +destination_dir+ must
+  # already be resolved with File.realpath by the caller.
+
+  def verify_extraction_dir(dir, destination_dir) # :nodoc:
+    real_dir = File.realpath(dir)
+
+    return if real_dir == destination_dir ||
+              normalize_path(real_dir).start_with?(normalize_path(destination_dir + "/"))
+
+    raise Gem::Package::PathError.new(real_dir, destination_dir)
   end
 
   ##
@@ -641,19 +882,14 @@ EOM
 
     case file_name
     when /\.sig$/ then
-      @signatures[$`] = entry.read if @security_policy
+      @signatures[$`] = limit_read(entry, file_name, 1024 * 1024) if @security_policy
       return
     else
       digest entry
     end
 
-    case file_name
-    when "metadata", "metadata.gz" then
-      load_spec entry
-    when 'data.tar.gz' then
-      verify_gz entry
-    end
-  rescue
+    load_spec_from_metadata entry
+  rescue StandardError
     warn "Exception while verifying #{@gem.path}"
     raise
   end
@@ -667,37 +903,59 @@ EOM
     end
 
     unless @spec
-      raise Gem::Package::FormatError.new 'package metadata is missing', @gem
+      raise Gem::Package::FormatError.new "package metadata is missing", @gem
     end
 
-    unless @files.include? 'data.tar.gz'
+    unless @files.include? "data.tar.gz"
       raise Gem::Package::FormatError.new \
-              'package content (data.tar.gz) is missing', @gem
+        "package content (data.tar.gz) is missing", @gem
     end
 
-    if duplicates = @files.group_by {|f| f }.select {|k,v| v.size > 1 }.map(&:first) and duplicates.any?
-      raise Gem::Security::Exception, "duplicate files in the package: (#{duplicates.map(&:inspect).join(', ')})"
+    if (duplicates = @files.group_by {|f| f }.select {|_k,v| v.size > 1 }.map(&:first)) && duplicates.any?
+      raise Gem::Security::Exception, "duplicate files in the package: (#{duplicates.map(&:inspect).join(", ")})"
     end
   end
 
-  ##
-  # Verifies that +entry+ is a valid gzipped file.
-
-  def verify_gz(entry) # :nodoc:
-    Zlib::GzipReader.wrap entry do |gzio|
-      gzio.read 16384 until gzio.eof? # gzip checksum verification
+  if RUBY_ENGINE == "truffleruby"
+    def copy_stream(src, dst, size) # :nodoc:
+      dst.write src.read(size)
     end
-  rescue Zlib::GzipFile::Error => e
-    raise Gem::Package::FormatError.new(e.message, entry.full_name)
+  else
+    def copy_stream(src, dst, size) # :nodoc:
+      IO.copy_stream(src, dst, size)
+    end
+  end
+
+  def limit_read(io, name, limit)
+    bytes = io.read(limit + 1)
+    raise Gem::Package::FormatError, "#{name} is too big (over #{limit} bytes)" if bytes.size > limit
+    bytes
+  end
+
+  if Gem.win_platform?
+    # Create a symlink and fallback to copy the file or directory on Windows,
+    # where symlink creation needs special privileges in form of the Developer Mode.
+    # JRuby on Windows raises TypeError from the wincode path-conversion helper
+    # when it cannot create the symlink, so fall back to copy in that case too.
+    def create_symlink(old_name, new_name)
+      File.symlink(old_name, new_name)
+    rescue Errno::EACCES, TypeError
+      from = File.expand_path(old_name, File.dirname(new_name))
+      FileUtils.cp_r(from, new_name)
+    end
+  else
+    def create_symlink(old_name, new_name)
+      File.symlink(old_name, new_name)
+    end
   end
 end
 
-require_relative 'package/digest_io'
-require_relative 'package/source'
-require_relative 'package/file_source'
-require_relative 'package/io_source'
-require_relative 'package/old'
-require_relative 'package/tar_header'
-require_relative 'package/tar_reader'
-require_relative 'package/tar_reader/entry'
-require_relative 'package/tar_writer'
+require_relative "package/digest_io"
+require_relative "package/source"
+require_relative "package/file_source"
+require_relative "package/io_source"
+require_relative "package/old"
+require_relative "package/tar_header"
+require_relative "package/tar_reader"
+require_relative "package/tar_reader/entry"
+require_relative "package/tar_writer"

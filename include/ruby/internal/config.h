@@ -50,7 +50,7 @@
 #  define HAVE_VA_ARGS_MACRO
 # elif defined(__INTEL_CXX11_MODE__)
 #  define HAVE_VA_ARGS_MACRO
-# elif RBIMPL_COMPILER_SINCE(MSVC, 16, 0, 0)
+# elif RBIMPL_COMPILER_IS(MSVC)
 #  define HAVE_VA_ARGS_MACRO
 # else
 #  /* NG, not known. */
@@ -113,6 +113,8 @@
 # define UNALIGNED_WORD_ACCESS 1
 #elif defined(__powerpc64__)
 # define UNALIGNED_WORD_ACCESS 1
+#elif defined(__POWERPC__) // __POWERPC__ is defined for ppc and ppc64 on Darwin
+# define UNALIGNED_WORD_ACCESS 1
 #elif defined(__aarch64__)
 # define UNALIGNED_WORD_ACCESS 1
 #elif defined(__mc68020__)
@@ -122,10 +124,7 @@
 #endif
 
 /* Detection of __VA_OPT__ */
-#if ! defined(HAVE_VA_ARGS_MACRO)
-# undef HAVE___VA_OPT__
-
-#elif defined(__cplusplus)
+#if defined(__cplusplus)
 # if __cplusplus > 201703L
 #  define HAVE___VA_OPT__
 # else
@@ -145,9 +144,5 @@
 # undef RBIMPL_TEST2
 # undef RBIMPL_TEST3
 #endif /* HAVE_VA_ARGS_MACRO */
-
-#ifndef USE_RVARGC
-# define USE_RVARGC 0
-#endif
 
 #endif /* RBIMPL_CONFIG_H */

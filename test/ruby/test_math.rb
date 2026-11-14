@@ -5,6 +5,7 @@ class TestMath < Test::Unit::TestCase
   def assert_infinity(a, *rest)
     rest = ["not infinity: #{a.inspect}"] if rest.empty?
     assert_predicate(a, :infinite?, *rest)
+    assert_predicate(a, :positive?, *rest)
   end
 
   def assert_nan(a, *rest)
@@ -146,6 +147,13 @@ class TestMath < Test::Unit::TestCase
     check(Math::E ** 2, Math.exp(2))
   end
 
+  def test_expm1
+    check(0, Math.expm1(0))
+    check(Math.sqrt(Math::E) - 1, Math.expm1(0.5))
+    check(Math::E - 1, Math.expm1(1))
+    check(Math::E ** 2 - 1, Math.expm1(2))
+  end
+
   def test_log
     check(0, Math.log(1))
     check(1, Math.log(Math::E))
@@ -165,6 +173,9 @@ class TestMath < Test::Unit::TestCase
     assert_nothing_raised { assert_nan(Math.log(0.0, 0.0)) }
     assert_nothing_raised { assert_nan(Math.log(Float::NAN)) }
     assert_nothing_raised { assert_nan(Math.log(1.0, Float::NAN)) }
+    assert_nothing_raised { assert_infinity(-Math.log(0)) }
+    assert_nothing_raised { assert_infinity(-Math.log(0, 2)) }
+    check(307.95368556425274, Math.log(2**1023, 10))
   end
 
   def test_log2
@@ -179,6 +190,7 @@ class TestMath < Test::Unit::TestCase
     assert_raise_with_message(Math::DomainError, /\blog2\b/) { Math.log2(-1.0) }
     assert_raise_with_message(Math::DomainError, /\blog2\b/) { Math.log2(-Float::EPSILON) }
     assert_nothing_raised { assert_nan(Math.log2(Float::NAN)) }
+    assert_nothing_raised { assert_infinity(-Math.log2(0)) }
   end
 
   def test_log10
@@ -193,6 +205,20 @@ class TestMath < Test::Unit::TestCase
     assert_raise_with_message(Math::DomainError, /\blog10\b/) { Math.log10(-1.0) }
     assert_raise_with_message(Math::DomainError, /\blog10\b/) { Math.log10(-Float::EPSILON) }
     assert_nothing_raised { assert_nan(Math.log10(Float::NAN)) }
+    assert_nothing_raised { assert_infinity(-Math.log10(0)) }
+  end
+
+  def test_log1p
+    check(0, Math.log1p(0))
+    check(1, Math.log1p(Math::E - 1))
+    check(Math.log(2.0 ** 64 + 1), Math.log1p(1 << 64))
+    check(Math.log(2) * 1024.0, Math.log1p(2 ** 1024))
+    assert_nothing_raised { assert_infinity(Math.log1p(1.0/0)) }
+    assert_nothing_raised { assert_infinity(-Math.log1p(-1.0)) }
+    assert_raise_with_message(Math::DomainError, /\blog1p\b/) { Math.log1p(-1.1) }
+    assert_raise_with_message(Math::DomainError, /\blog1p\b/) { Math.log1p(-Float::EPSILON-1) }
+    assert_nothing_raised { assert_nan(Math.log1p(Float::NAN)) }
+    assert_nothing_raised { assert_infinity(-Math.log1p(-1)) }
   end
 
   def test_sqrt
@@ -277,8 +303,7 @@ class TestMath < Test::Unit::TestCase
     assert_raise_with_message(Math::DomainError, /\bgamma\b/) { Math.gamma(-1.0) }
     x = Math.gamma(-0.0)
     mesg = "Math.gamma(-0.0) should be -INF"
-    assert_infinity(x, mesg)
-    assert_predicate(x, :negative?, mesg)
+    assert_infinity(-x, mesg)
     assert_nan(Math.gamma(Float::NAN))
   end
 
@@ -296,12 +321,21 @@ class TestMath < Test::Unit::TestCase
     assert_float_and_int([Math.log(6),                1], Math.lgamma(4))
 
     assert_raise_with_message(Math::DomainError, /\blgamma\b/) { Math.lgamma(-Float::INFINITY) }
+
+    x, sign = Math.lgamma(+0.0)
+    mesg = "Math.lgamma(+0.0) should be [INF, +1]"
+    assert_infinity(x, mesg)
+    assert_equal(+1, sign, mesg)
+
     x, sign = Math.lgamma(-0.0)
     mesg = "Math.lgamma(-0.0) should be [INF, -1]"
     assert_infinity(x, mesg)
-    assert_predicate(x, :positive?, mesg)
     assert_equal(-1, sign, mesg)
-    x, sign = Math.lgamma(Float::NAN)
+
+    x, = Math.lgamma(-1)
+    assert_infinity(x, "Math.lgamma(-1) should be +INF")
+
+    x, = Math.lgamma(Float::NAN)
     assert_nan(x)
   end
 

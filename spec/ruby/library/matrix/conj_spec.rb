@@ -1,9 +1,8 @@
 require_relative '../../spec_helper'
+require 'matrix'
 
-ruby_version_is ""..."3.1" do
-  require_relative 'shared/conjugate'
-
-  describe "Matrix#conj" do
-    it_behaves_like :matrix_conjugate, :conj
+describe "Matrix#conj" do
+  it "is an alias of Matrix#conjugate" do
+    Matrix.instance_method(:conj).should == Matrix.instance_method(:conjugate)
   end
 end

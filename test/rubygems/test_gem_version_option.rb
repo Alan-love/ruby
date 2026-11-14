@@ -1,13 +1,14 @@
 # frozen_string_literal: true
-require_relative 'helper'
-require 'rubygems/command'
-require 'rubygems/version_option'
+
+require_relative "helper"
+require "rubygems/command"
+require "rubygems/version_option"
 
 class TestGemVersionOption < Gem::TestCase
   def setup
     super
 
-    @cmd = Gem::Command.new 'dummy', 'dummy'
+    @cmd = Gem::Command.new "dummy", "dummy"
     @cmd.extend Gem::VersionOption
   end
 
@@ -21,6 +22,26 @@ class TestGemVersionOption < Gem::TestCase
     @cmd.add_version_option
 
     assert @cmd.handles?(%w[--version >1])
+  end
+
+  def test_add_ruby_abi_option
+    @cmd.add_ruby_abi_option
+
+    @cmd.handle_options %w[--ruby-abi 3.4]
+
+    assert_equal "3.4", @cmd.options[:ruby_abi]
+  end
+
+  def test_ruby_abi_option_rejects_invalid_format
+    @cmd.add_ruby_abi_option
+
+    ["3", "3.4.1", "abc", "3.x"].each do |invalid|
+      error = assert_raise Gem::OptionParser::InvalidArgument do
+        @cmd.handle_options ["--ruby-abi", invalid]
+      end
+
+      assert_match(/Ruby ABI must be in X.Y format/, error.message)
+    end
   end
 
   def test_enables_prerelease
@@ -43,8 +64,8 @@ class TestGemVersionOption < Gem::TestCase
 
     expected = [
       Gem::Platform::RUBY,
-      Gem::Platform.new('x86-freebsd6'),
-      Gem::Platform.new('x86-freebsd7'),
+      Gem::Platform.new("x86-freebsd6"),
+      Gem::Platform.new("x86-freebsd7"),
     ]
 
     assert_equal expected, Gem.platforms
@@ -69,7 +90,7 @@ class TestGemVersionOption < Gem::TestCase
 
     expected = [
       Gem::Platform::RUBY,
-      Gem::Platform.new('x86-freebsd6'),
+      Gem::Platform.new("x86-freebsd6"),
     ]
 
     assert_equal expected, Gem.platforms
@@ -81,10 +102,10 @@ class TestGemVersionOption < Gem::TestCase
     @cmd.handle_options %w[--version >1]
 
     expected = {
-      :args => [],
-      :explicit_prerelease => false,
-      :prerelease => false,
-      :version => Gem::Requirement.new('> 1'),
+      args: [],
+      explicit_prerelease: false,
+      prerelease: false,
+      version: Gem::Requirement.new("> 1"),
     }
 
     assert_equal expected, @cmd.options
@@ -93,13 +114,13 @@ class TestGemVersionOption < Gem::TestCase
   def test_version_option_compound
     @cmd.add_version_option
 
-    @cmd.handle_options ['--version', '< 1, > 0.9']
+    @cmd.handle_options ["--version", "< 1, > 0.9"]
 
     expected = {
-      :args => [],
-      :explicit_prerelease => false,
-      :prerelease => false,
-      :version => Gem::Requirement.new('< 1', '> 0.9'),
+      args: [],
+      explicit_prerelease: false,
+      prerelease: false,
+      version: Gem::Requirement.new("< 1", "> 0.9"),
     }
 
     assert_equal expected, @cmd.options
@@ -108,13 +129,13 @@ class TestGemVersionOption < Gem::TestCase
   def test_multiple_version_operator_option_compound
     @cmd.add_version_option
 
-    @cmd.handle_options ['--version', '< 1', '--version', '> 0.9']
+    @cmd.handle_options ["--version", "< 1", "--version", "> 0.9"]
 
     expected = {
-      :args => [],
-      :explicit_prerelease => false,
-      :prerelease => false,
-      :version => Gem::Requirement.new('< 1', '> 0.9'),
+      args: [],
+      explicit_prerelease: false,
+      prerelease: false,
+      version: Gem::Requirement.new("< 1", "> 0.9"),
     }
 
     assert_equal expected, @cmd.options
@@ -127,10 +148,10 @@ class TestGemVersionOption < Gem::TestCase
     @cmd.handle_options %w[--pre --version >1]
 
     expected = {
-      :args => [],
-      :explicit_prerelease => true,
-      :prerelease => true,
-      :version => Gem::Requirement.new('> 1'),
+      args: [],
+      explicit_prerelease: true,
+      prerelease: true,
+      version: Gem::Requirement.new("> 1"),
     }
 
     assert_equal expected, @cmd.options
@@ -142,10 +163,10 @@ class TestGemVersionOption < Gem::TestCase
     @cmd.handle_options %w[--version >1.a]
 
     expected = {
-      :args => [],
-      :explicit_prerelease => false,
-      :prerelease => true,
-      :version => Gem::Requirement.new('> 1.a'),
+      args: [],
+      explicit_prerelease: false,
+      prerelease: true,
+      version: Gem::Requirement.new("> 1.a"),
     }
 
     assert_equal expected, @cmd.options
@@ -153,10 +174,10 @@ class TestGemVersionOption < Gem::TestCase
     @cmd.handle_options %w[--version >1]
 
     expected = {
-      :args => [],
-      :explicit_prerelease => false,
-      :prerelease => false,
-      :version => Gem::Requirement.new('> 1'),
+      args: [],
+      explicit_prerelease: false,
+      prerelease: false,
+      version: Gem::Requirement.new("> 1"),
     }
 
     assert_equal expected, @cmd.options

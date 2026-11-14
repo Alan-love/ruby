@@ -52,9 +52,37 @@ module Psych
       assert_equal X, x.class
     end
 
+    class NotAnArray
+    end
+
+    def test_seq_tag_rejects_non_array_class
+      assert_raise(ArgumentError) do
+        Psych.unsafe_load "--- !seq:#{NotAnArray} []\n"
+      end
+      assert_raise(ArgumentError) do
+        Psych.unsafe_load "--- !ruby/array:#{NotAnArray} []\n"
+      end
+    end
+
     def test_self_referential
       @list << @list
       assert_cycle(@list)
+    end
+
+    def test_recursive_array
+      @list << @list
+
+      loaded = Psych.load(Psych.dump(@list), aliases: true)
+
+      assert_same loaded, loaded.last
+    end
+
+    def test_recursive_array_uses_alias
+      @list << @list
+
+      assert_raise(AliasesNotEnabled) do
+        Psych.load(Psych.dump(@list), aliases: false)
+      end
     end
 
     def test_cycle

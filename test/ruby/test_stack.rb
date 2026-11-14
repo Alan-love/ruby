@@ -18,7 +18,6 @@ class TestStack < Test::Unit::TestCase
     env = {}
     env['RUBY_FIBER_VM_STACK_SIZE'] = vm_stack_size.to_s if vm_stack_size
     env['RUBY_FIBER_MACHINE_STACK_SIZE'] = machine_stack_size.to_s if machine_stack_size
-    env['ASAN_OPTIONS'] = ENV['ASAN_OPTIONS'] if ENV['ASAN_OPTIONS']
 
     stdout, stderr, status = EnvUtil.invoke_ruby([env, '-e', script], '', true, true, timeout: 30)
     assert(!status.signaled?, FailDesc[status, nil, stderr])
@@ -66,8 +65,6 @@ class TestStack < Test::Unit::TestCase
 
   # Depending on OS, machine stack size may not change size.
   def test_machine_stack_size
-    return if /mswin|mingw/ =~ RUBY_PLATFORM
-
     script = '$stdout.sync=true; def rec; print "."; 1.times{1.times{1.times{rec}}}; end; Fiber.new{rec}.resume'
 
     vm_stack_size = 1024 * 1024

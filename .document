@@ -15,22 +15,38 @@ array.rb
 ast.rb
 dir.rb
 gc.rb
+hash.rb
 io.rb
 kernel.rb
 marshal.rb
 numeric.rb
 nilclass.rb
 pack.rb
+pathname_builtin.rb
 ractor.rb
+string.rb
+symbol.rb
 timev.rb
+thread_sync.rb
 trace_point.rb
 warning.rb
+yjit.rb
+zjit.rb
+
+# Errno::*
+known_errors.inc
 
 # the lib/ directory (which has its own .document file)
 lib
 
 # and some of the ext/ directory (which has its own .document file)
 ext
+
+# GC is split between gc.rb and gc/default/default.c
+gc/default/*.c
+
+# For `prism`, ruby code is in lib and c in the prism folder
+prism/*.c
 
 # rdoc files
 NEWS.md
@@ -40,11 +56,7 @@ README.ja.md
 
 COPYING
 COPYING.ja
-CONTRIBUTING.md
 
 LEGAL
-
-# win32/README.win32 linked from README.md
-win32
 
 doc

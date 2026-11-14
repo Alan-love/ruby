@@ -41,6 +41,20 @@ module TestStruct
     end
   end
 
+  def test_larger_than_largest_pool
+    max_embedded_members = (
+      GC::INTERNAL_CONSTANTS[:RVARGC_MAX_ALLOCATE_SIZE] -
+      GC::INTERNAL_CONSTANTS[:RBASIC_SIZE] -
+      GC::INTERNAL_CONSTANTS[:RVALUE_OVERHEAD]
+    ) / RbConfig::SIZEOF["void*"]
+
+    count = max_embedded_members + 1
+    list = Array(0..count)
+    klass = @Struct.new(*list.map { |i| :"a_#{i}"})
+    struct = klass.new(*list)
+    assert_equal 0, struct.a_0
+  end
+
   def test_small_structs
     names = [:a, :b, :c, :d]
     1.upto(4) {|n|
@@ -100,8 +114,9 @@ module TestStruct
     assert_equal([:utime, :stime, :cutime, :cstime], Process.times.members)
   end
 
-  def test_struct_new_with_empty_hash
-    assert_equal({:a=>1}, Struct.new(:a, {}).new({:a=>1}).a)
+  def test_struct_new_with_hash
+    assert_raise_with_message(TypeError, /not a symbol/) {Struct.new(:a, {})}
+    assert_raise_with_message(TypeError, /not a symbol/) {Struct.new(:a, {name: "b"})}
   end
 
   def test_struct_new_with_keyword_init
@@ -232,6 +247,8 @@ module TestStruct
     assert_equal(1, o[0])
     assert_raise_with_message(IndexError, /offset -2\b/) {o[-2]}
     assert_raise_with_message(IndexError, /offset 1\b/) {o[1]}
+    big = RbConfig::LIMITS["FIXNUM_MAX"] + 1
+    assert_raise_with_message(IndexError, /offset #{big}\b/) {o[big]}
     assert_raise_with_message(NameError, /foo/) {o["foo"]}
     assert_raise_with_message(NameError, /foo/) {o[:foo]}
   end
@@ -243,6 +260,8 @@ module TestStruct
     assert_equal(2, o[:a])
     assert_raise_with_message(IndexError, /offset -2\b/) {o[-2] = 3}
     assert_raise_with_message(IndexError, /offset 1\b/) {o[1] = 3}
+    big = RbConfig::LIMITS["FIXNUM_MAX"] + 1
+    assert_raise_with_message(IndexError, /offset #{big}\b/) {o[big] = 3}
     assert_raise_with_message(NameError, /foo/) {o["foo"] = 3}
     assert_raise_with_message(NameError, /foo/) {o[:foo] = 3}
   end
@@ -362,9 +381,8 @@ module TestStruct
   end
 
   def test_keyword_args_warning
-    warning = /warning: Passing only keyword arguments to Struct#initialize will behave differently from Ruby 3\.2\./
-    assert_warn(warning) { assert_equal({a: 1}, @Struct.new(:a).new(a: 1).a) }
-    assert_warn(warning) { assert_equal({a: 1}, @Struct.new(:a, keyword_init: nil).new(a: 1).a) }
+    assert_warn('') { assert_equal(1, @Struct.new(:a).new(a: 1).a) }
+    assert_warn('') { assert_equal(1, @Struct.new(:a, keyword_init: nil).new(a: 1).a) }
     assert_warn('') { assert_equal({a: 1}, @Struct.new(:a).new({a: 1}).a) }
     assert_warn('') { assert_equal({a: 1}, @Struct.new(:a, :b).new(1, a: 1).b) }
     assert_warn('') { assert_equal(1, @Struct.new(:a, keyword_init: true).new(a: 1).a) }
@@ -495,6 +513,55 @@ module TestStruct
     assert_equal(1, x.public_send("a"))
     assert_equal(42, x.public_send("a=", 42))
     assert_equal(42, x.public_send("a"))
+  end
+
+  def test_arity
+    klass = @Struct.new(:a)
+    assert_equal 0, klass.instance_method(:a).arity
+    assert_equal 1, klass.instance_method(:a=).arity
+
+    klass.module_eval do
+      define_method(:b=, instance_method(:a=))
+      alias c= a=
+    end
+
+    assert_equal 1, klass.instance_method(:b=).arity
+    assert_equal 1, klass.instance_method(:c=).arity
+  end
+
+  def test_parameters
+    klass = @Struct.new(:a)
+    assert_equal [], klass.instance_method(:a).parameters
+    # NOTE: :_ may not be a spec.
+    assert_equal [[:req, :_]], klass.instance_method(:a=).parameters
+
+    klass.module_eval do
+      define_method(:b=, instance_method(:a=))
+      alias c= a=
+    end
+
+    assert_equal [[:req, :_]], klass.instance_method(:b=).parameters
+    assert_equal [[:req, :_]], klass.instance_method(:c=).parameters
+  end
+
+  def test_named_structs_are_not_rooted
+    omit 'skip on riscv64-linux CI machine. See https://github.com/ruby/ruby/pull/13422' if ENV['RUBY_DEBUG'] == 'ci' && /riscv64-linux/ =~ RUBY_DESCRIPTION
+
+    # [Bug #20311]
+    assert_no_memory_leak([], <<~PREP, <<~CODE, rss: true, limit: 2.2, samples: 2..50)
+      code = proc do
+        Struct.new("A")
+        Struct.send(:remove_const, :A)
+      end
+    PREP
+      1_000.times(&code)
+    CODE
+  end
+
+  def test_frozen_subclass
+    test = Class.new(@Struct.new(:a)).freeze.new(a: 0)
+    assert_kind_of(@Struct, test)
+    assert_equal([:a], test.members)
   end
 
   class TopStruct < Test::Unit::TestCase

@@ -36,7 +36,7 @@ describe "C-API Hash function" do
       obj = mock("rb_hash no to_int")
       obj.should_receive(:hash).and_return(nil)
 
-      -> { @s.rb_hash(obj) }.should raise_error(TypeError)
+      -> { @s.rb_hash(obj) }.should.raise(TypeError)
     end
   end
 
@@ -46,7 +46,29 @@ describe "C-API Hash function" do
     end
 
     it "creates a hash with no default proc" do
-      @s.rb_hash_new {}.default_proc.should be_nil
+      @s.rb_hash_new {}.default_proc.should == nil
+    end
+  end
+
+  describe "rb_hash_new_capa" do
+    it "returns a new hash" do
+      @s.rb_hash_new_capa(3).should == {}
+    end
+
+    it "creates a hash with no default proc" do
+      @s.rb_hash_new_capa(3) {}.default_proc.should == nil
+    end
+
+    ruby_version_is ""..."4.1" do
+      it "raises RuntimeError when negative index is provided" do
+        -> { @s.rb_hash_new_capa(-1) }.should.raise(RuntimeError, "st_table too big")
+      end
+    end
+
+    ruby_version_is "4.1" do
+      it "raises ArgumentError when negative index is provided" do
+        -> { @s.rb_hash_new_capa(-1) }.should.raise(ArgumentError, "negative hash size (or size too big)")
+      end
     end
   end
 
@@ -63,13 +85,13 @@ describe "C-API Hash function" do
       hsh = {}
       dup = @s.rb_hash_dup(hsh)
       dup.should == hsh
-      dup.should_not equal(hsh)
+      dup.should_not.equal?(hsh)
     end
   end
 
   describe "rb_hash_freeze" do
     it "freezes the hash" do
-      @s.rb_hash_freeze({}).frozen?.should be_true
+      @s.rb_hash_freeze({}).frozen?.should == true
     end
   end
 
@@ -82,13 +104,13 @@ describe "C-API Hash function" do
     it "returns the default value if it exists" do
       hsh = Hash.new(0)
       @s.rb_hash_aref(hsh, :chunky).should == 0
-      @s.rb_hash_aref_nil(hsh, :chunky).should be_false
+      @s.rb_hash_aref_nil(hsh, :chunky).should == false
     end
 
     it "returns nil if the key does not exist" do
       hsh = { }
-      @s.rb_hash_aref(hsh, :chunky).should be_nil
-      @s.rb_hash_aref_nil(hsh, :chunky).should be_true
+      @s.rb_hash_aref(hsh, :chunky).should == nil
+      @s.rb_hash_aref_nil(hsh, :chunky).should == true
     end
   end
 
@@ -103,7 +125,7 @@ describe "C-API Hash function" do
   describe "rb_hash_clear" do
     it "returns self that cleared keys and values" do
       hsh = { :key => 'value' }
-      @s.rb_hash_clear(hsh).should equal(hsh)
+      @s.rb_hash_clear(hsh).should.equal?(hsh)
       hsh.should == {}
     end
   end
@@ -124,7 +146,7 @@ describe "C-API Hash function" do
     end
 
     it "returns an Enumerator when no block is passed" do
-      @s.rb_hash_delete_if({a: 1}).should be_an_instance_of(Enumerator)
+      @s.rb_hash_delete_if({a: 1}).should.instance_of?(Enumerator)
     end
   end
 
@@ -139,11 +161,11 @@ describe "C-API Hash function" do
 
     it "raises a KeyError if the key is not found and default is set" do
       @hsh.default = :d
-      -> { @s.rb_hash_fetch(@hsh, :c) }.should raise_error(KeyError)
+      -> { @s.rb_hash_fetch(@hsh, :c) }.should.raise(KeyError)
     end
 
     it "raises a KeyError if the key is not found and no default is set" do
-      -> { @s.rb_hash_fetch(@hsh, :c) }.should raise_error(KeyError)
+      -> { @s.rb_hash_fetch(@hsh, :c) }.should.raise(KeyError)
     end
 
     context "when key is not found" do
@@ -178,6 +200,61 @@ describe "C-API Hash function" do
     end
   end
 
+  describe "rb_hash_bulk_insert" do
+    it 'inserts key-value pairs into the hash' do
+      arr = [:a, 1, :b, 2, :c, 3]
+      hash = {}
+
+      @s.rb_hash_bulk_insert(arr.length, arr, hash)
+
+      hash.should == {a: 1, b: 2, c: 3}
+    end
+
+    it 'overwrites existing keys' do
+      arr = [:a, 4, :b, 5, :c, 6]
+      hash = {a: 1, b: 2}
+
+      @s.rb_hash_bulk_insert(arr.length, arr, hash)
+
+      hash.should == {a: 4, b: 5, c: 6}
+    end
+
+    it 'uses the last key in the array if it appears multiple times' do
+      arr = [:a, 1, :b, 2, :a, 3]
+      hash = {}
+
+      @s.rb_hash_bulk_insert(arr.length, arr, hash)
+
+      hash.should == {a: 3, b: 2}
+    end
+
+    it 'allows the array to be NULL if the length is zero' do
+      hash = {}
+
+      @s.rb_hash_bulk_insert(0, nil, hash)
+
+      hash.should == {}
+    end
+
+    it 'does not include any keys after the given length' do
+      arr = [:a, 1, :b, 2, :c, 3, :d, 4]
+      hash = {}
+
+      @s.rb_hash_bulk_insert(arr.length - 2, arr, hash)
+
+      hash.should == {a: 1, b: 2, c: 3}
+    end
+
+    it 'does not modify the hash if the length is zero' do
+      arr = []
+      hash = {a: 1, b: 2}
+
+      @s.rb_hash_bulk_insert(arr.length, arr, hash)
+
+      hash.should == {a: 1, b: 2}
+    end
+  end
+
   describe "rb_hash_size" do
     it "returns the size of the hash" do
       hsh = {fast: 'car', good: 'music'}
@@ -197,14 +274,14 @@ describe "C-API Hash function" do
 
     it "does not return the default value if it exists" do
       hsh = Hash.new(0)
-      @s.rb_hash_lookup(hsh, :chunky).should be_nil
-      @s.rb_hash_lookup_nil(hsh, :chunky).should be_true
+      @s.rb_hash_lookup(hsh, :chunky).should == nil
+      @s.rb_hash_lookup_nil(hsh, :chunky).should == true
     end
 
     it "returns nil if the key does not exist" do
       hsh = { }
-      @s.rb_hash_lookup(hsh, :chunky).should be_nil
-      @s.rb_hash_lookup_nil(hsh, :chunky).should be_true
+      @s.rb_hash_lookup(hsh, :chunky).should == nil
+      @s.rb_hash_lookup_nil(hsh, :chunky).should == true
     end
 
     describe "rb_hash_lookup2" do
@@ -222,7 +299,7 @@ describe "C-API Hash function" do
 
       it "returns undefined if that is the default value specified" do
         hsh = Hash.new(0)
-        @s.rb_hash_lookup2_default_undef(hsh, :chunky).should be_true
+        @s.rb_hash_lookup2_default_undef(hsh, :chunky).should == true
       end
     end
   end
@@ -253,20 +330,20 @@ describe "C-API Hash function" do
     end
 
     it "raises a TypeError if the argument does not respond to #to_hash" do
-      -> { @s.rb_Hash(42) }.should raise_error(TypeError)
+      -> { @s.rb_Hash(42) }.should.raise(TypeError)
     end
 
     it "raises a TypeError if #to_hash does not return a hash" do
       h = BasicObject.new
       def h.to_hash; 42; end
-      -> { @s.rb_Hash(h) }.should raise_error(TypeError)
+      -> { @s.rb_Hash(h) }.should.raise(TypeError)
     end
   end
 
   describe "hash code functions" do
     it "computes a deterministic number" do
       hash_code = @s.compute_a_hash_code(53)
-      hash_code.should be_an_instance_of(Integer)
+      hash_code.should.instance_of?(Integer)
       hash_code.should == @s.compute_a_hash_code(53)
       @s.compute_a_hash_code(90).should == @s.compute_a_hash_code(90)
     end

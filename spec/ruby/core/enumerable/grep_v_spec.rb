@@ -20,31 +20,28 @@ describe "Enumerable#grep_v" do
     $&.should == "e"
   end
 
-  ruby_version_is ""..."3.0.0" do
-    it "sets $~ to the last match when given no block" do
-      "z" =~ /z/ # Reset $~
-      ["abc", "def"].grep_v(/e/).should == ["abc"]
-
-      # Set by the match of "def"
-      $&.should == "e"
-
-      ["abc", "def"].grep_v(/b/)
-      $&.should == nil
-    end
+  it "does not set $~ when given no block" do
+    "z" =~ /z/ # Reset $~
+    ["abc", "def"].grep_v(/e/).should == ["abc"]
+    $&.should == "z"
   end
 
-  ruby_version_is "3.0.0" do
-    it "does not set $~ when given no block" do
-      "z" =~ /z/ # Reset $~
-      ["abc", "def"].grep_v(/e/).should == ["abc"]
-      $&.should == "z"
-    end
+  it "does not modify Regexp.last_match without block" do
+    "z" =~ /z/ # Reset last match
+    ["abc", "def"].grep_v(/e/).should == ["abc"]
+    Regexp.last_match[0].should == "z"
+  end
 
-    it "does not modify Regexp.last_match without block" do
-      "z" =~ /z/ # Reset last match
-      ["abc", "def"].grep_v(/e/).should == ["abc"]
-      Regexp.last_match[0].should == "z"
+  it "correctly handles non-string elements" do
+    'set last match' =~ /set last (.*)/
+    [:a, 'b', 'z', :c, 42, nil].grep_v(/[a-d]/).should == ['z', 42, nil]
+    $1.should == 'match'
+
+    o = Object.new
+    def o.to_str
+      'hello'
     end
+    [o].grep_v(/mm/).first.should.equal?(o)
   end
 
   describe "without block" do
@@ -58,7 +55,7 @@ describe "Enumerable#grep_v" do
     end
 
     it "raises an ArgumentError when not given a pattern" do
-      -> { @numerous.grep_v }.should raise_error(ArgumentError)
+      -> { @numerous.grep_v }.should.raise(ArgumentError)
     end
   end
 
@@ -73,7 +70,7 @@ describe "Enumerable#grep_v" do
     end
 
     it "raises an ArgumentError when not given a pattern" do
-      -> { @numerous.grep_v { |e| e } }.should raise_error(ArgumentError)
+      -> { @numerous.grep_v { |e| e } }.should.raise(ArgumentError)
     end
   end
 end

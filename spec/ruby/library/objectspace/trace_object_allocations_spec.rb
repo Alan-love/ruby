@@ -2,6 +2,20 @@ require_relative '../../spec_helper'
 require 'objspace'
 
 describe "ObjectSpace.trace_object_allocations" do
+  def has_class_frame?
+    Class.new {
+      attr_reader :c
+
+      def initialize
+        @c = caller_locations.first.label =~ /new/
+      end
+    }.new.c
+  end
+
+  def obj_class_path
+    has_class_frame? ? "Class" : nil
+  end
+
   it "runs a block" do
     ScratchPad.clear
     ObjectSpace.trace_object_allocations do
@@ -13,7 +27,7 @@ describe "ObjectSpace.trace_object_allocations" do
   it "records info for allocation_class_path" do
     ObjectSpace.trace_object_allocations do
       o = Object.new
-      ObjectSpace.allocation_class_path(o).should == "Class"
+      ObjectSpace.allocation_class_path(o).should == obj_class_path
       a = [1, 2, 3]
       ObjectSpace.allocation_class_path(a).should == nil
     end
@@ -31,7 +45,7 @@ describe "ObjectSpace.trace_object_allocations" do
   it "records info for allocation_method_id" do
     ObjectSpace.trace_object_allocations do
       o = Object.new
-      ObjectSpace.allocation_method_id(o).should == :new
+      ObjectSpace.allocation_method_id(o).should == (has_class_frame? ? :new : nil)
       a = [1, 2, 3]
       ObjectSpace.allocation_method_id(a).should == nil
     end
@@ -58,9 +72,9 @@ describe "ObjectSpace.trace_object_allocations" do
   it "can be cleared using trace_object_allocations_clear" do
     ObjectSpace.trace_object_allocations do
       o = Object.new
-      ObjectSpace.allocation_class_path(o).should == "Class"
+      ObjectSpace.allocation_class_path(o).should == obj_class_path
       ObjectSpace.trace_object_allocations_clear
-      ObjectSpace.allocation_class_path(o).should be_nil
+      ObjectSpace.allocation_class_path(o).should == nil
     end
   end
 
@@ -69,14 +83,14 @@ describe "ObjectSpace.trace_object_allocations" do
     ObjectSpace.trace_object_allocations do
       o = Object.new
     end
-    ObjectSpace.allocation_class_path(o).should == "Class"
+    ObjectSpace.allocation_class_path(o).should == obj_class_path
   end
 
   it "can be used without a block using trace_object_allocations_start and _stop" do
     ObjectSpace.trace_object_allocations_start
     begin
       o = Object.new
-      ObjectSpace.allocation_class_path(o).should == "Class"
+      ObjectSpace.allocation_class_path(o).should == obj_class_path
       a = [1, 2, 3]
       ObjectSpace.allocation_class_path(a).should == nil
     ensure
@@ -91,14 +105,14 @@ describe "ObjectSpace.trace_object_allocations" do
     ensure
       ObjectSpace.trace_object_allocations_stop
     end
-    ObjectSpace.allocation_class_path(o).should == "Class"
+    ObjectSpace.allocation_class_path(o).should == obj_class_path
   end
 
   it "can be nested" do
     ObjectSpace.trace_object_allocations do
       ObjectSpace.trace_object_allocations do
         o = Object.new
-        ObjectSpace.allocation_class_path(o).should == "Class"
+        ObjectSpace.allocation_class_path(o).should == obj_class_path
       end
     end
   end
@@ -109,7 +123,7 @@ describe "ObjectSpace.trace_object_allocations" do
       ObjectSpace.trace_object_allocations_start
       begin
         o = Object.new
-        ObjectSpace.allocation_class_path(o).should == "Class"
+        ObjectSpace.allocation_class_path(o).should == obj_class_path
       ensure
         ObjectSpace.trace_object_allocations_stop
       end
@@ -122,8 +136,26 @@ describe "ObjectSpace.trace_object_allocations" do
     ObjectSpace.trace_object_allocations_start
     begin
       o = Object.new
-      ObjectSpace.allocation_class_path(o).should == "Class"
+      ObjectSpace.allocation_class_path(o).should == obj_class_path
       ObjectSpace.trace_object_allocations_stop
+    ensure
+      ObjectSpace.trace_object_allocations_stop
+    end
+  end
+
+  it "returns nil for class_path, generation, method_id, sourcefile, and sourceline for immutable objects" do
+    ObjectSpace.trace_object_allocations_start
+    begin
+      one = nil
+      two = 42
+      three = :foo
+      [one, two, three].each do |i|
+        ObjectSpace.allocation_class_path(i).should == nil
+        ObjectSpace.allocation_generation(i).should == nil
+        ObjectSpace.allocation_method_id(i).should == nil
+        ObjectSpace.allocation_sourcefile(i).should == nil
+        ObjectSpace.allocation_sourceline(i).should == nil
+      end
     ensure
       ObjectSpace.trace_object_allocations_stop
     end

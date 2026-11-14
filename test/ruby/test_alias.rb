@@ -208,13 +208,39 @@ class TestAlias < Test::Unit::TestCase
     begin;
       bug = ARGV[0]
 
-      m = Module.new do
-        alias orig_to_s to_s
+      m = EnvUtil.suppress_warning do
+        Module.new do
+          alias orig_to_s to_s
+        end
       end
 
       o = Object.new.extend(m)
       assert_equal(o.to_s, o.orig_to_s, bug)
     end;
+  end
+
+  def test_alias_fallback_to_object_is_deprecated
+    bug22276 = '[ruby-core:126537] [Bug #22276]'
+    message = /the fallback to Object for alias of 'to_s' in module '.*' is deprecated and will be removed in Ruby 4\.3/
+
+    m = nil
+    assert_deprecated_warning(message) do
+      m = Module.new { alias orig_to_s to_s }
+    end
+    o = Object.new.extend(m)
+    assert_equal(o.to_s, o.orig_to_s, bug22276)
+
+    assert_deprecated_warning(message) do
+      Module.new { alias_method :orig_to_s, :to_s }
+    end
+
+    assert_warning('', bug22276) do
+      EnvUtil.deprecation_warning do
+        Module.new { def foo; end; alias bar foo }
+        Module.new { include Comparable; alias in_range? between? }
+        Class.new { alias to_str to_s }
+      end
+    end
   end
 
   class C0; def foo; end; end
@@ -252,5 +278,109 @@ class TestAlias < Test::Unit::TestCase
     }
     assert_equal(:foo, k.instance_method(:bar).original_name)
     assert_equal(:foo, name)
+  end
+
+  def test_alias_suppressing_redefinition
+    assert_in_out_err(%w[-w], "#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      class A
+        def foo; end
+        alias foo foo
+        def foo; end
+      end
+    end;
+  end
+
+  class C2
+    public :system
+    alias_method :bar, :system
+    alias_method :system, :bar
+  end
+
+  def test_zsuper_alias_visibility
+    assert(C2.new.respond_to?(:system))
+  end
+
+  def test_alias_memory_leak
+    assert_no_memory_leak([], "#{<<~"begin;"}", "#{<<~'end;'}", rss: true)
+    begin;
+      class A
+        500.times do
+          1000.times do |i|
+            define_method(:"foo_#{i}") {}
+
+            alias :"foo_#{i}" :"foo_#{i}"
+
+            remove_method :"foo_#{i}"
+          end
+          GC.start
+        end
+      end
+    end;
+  end
+
+  def test_alias_complemented_method
+    assert_in_out_err(%w[-w], "#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      module M
+        def foo = 1
+        self.extend M
+      end
+
+      3.times{|i|
+        module M
+          alias foo2 foo
+          remove_method :foo
+          def foo = 2
+        ensure
+          remove_method :foo
+          alias foo foo2
+          remove_method :foo2
+        end
+
+        M.foo
+
+        original_foo = M.method(:foo)
+
+        M.class_eval do
+          remove_method :foo
+          def foo = 3
+        end
+
+        M.class_eval do
+          remove_method :foo
+          define_method :foo, original_foo
+        end
+      }
+    end;
+  end
+
+  def test_alias_bmethod_in_multi_ractor_mode
+    # rb_method_definition_eq() used to dispatch Proc#== for bmethods, but
+    # rb_method_entry_make() calls it under the VM lock, where rb_vm_check_ints()
+    # must not run.
+    assert_ractor("#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      $-w = nil
+      Ractor.new {}.join # leave single-ractor mode so the VM lock is taken
+      obj = Object.new
+      obj.define_singleton_method(:a) { 1 }
+      obj.define_singleton_method(:b) { 2 }
+      obj.singleton_class.alias_method :a, :b
+      assert_equal 2, obj.a
+    end;
+  end
+
+  def test_undef_method_error_message_with_zsuper_method
+    modules = [
+      Module.new { private :class },
+      Module.new { prepend Module.new { private :class } },
+    ]
+    message = "undefined method 'class' for module '%s'"
+    modules.each do |mod|
+      assert_raise_with_message(NameError, message % mod) do
+        mod.alias_method :xyz, :class
+      end
+    end
   end
 end

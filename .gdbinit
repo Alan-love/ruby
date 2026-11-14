@@ -1,23 +1,7 @@
-set startup-with-shell off
-
-define hook-run
-  set $color_type = 0
-  set $color_highlite = 0
-  set $color_end = 0
-end
-
 define ruby_gdb_init
-  if !$color_type
-    set $color_type = "\033[31m"
-  end
-  if !$color_highlite
-    set $color_highlite = "\033[36m"
-  end
-  if !$color_end
-    set $color_end = "\033[m"
-  end
-  if ruby_dummy_gdb_enums.special_consts
-  end
+  init-if-undefined $color_type = "\033[31m"
+  init-if-undefined $color_highlite = "\033[36m"
+  init-if-undefined $color_end = "\033[m"
 end
 
 # set prompt \033[36m(gdb)\033[m\040
@@ -67,7 +51,7 @@ define rp
     printf "%sT_OBJECT%s: ", $color_type, $color_end
     print ((struct RObject *)($arg0))->basic
     if ($flags & ROBJECT_EMBED)
-      print/x *((VALUE*)((struct RObject*)($arg0))->as.ary) @ (ROBJECT_EMBED_LEN_MAX+0)
+      print/x *((VALUE*)((struct RObject*)($arg0))->as.ary) @ (RSHAPE_CAPACITY(rb_obj_shape_id($arg0)))
     else
       print (((struct RObject *)($arg0))->as.heap)
       if (((struct RObject*)($arg0))->as.heap.numiv) > 0
@@ -99,13 +83,11 @@ define rp
     set $regsrc = ((struct RRegexp*)($arg0))->src
     set $rsflags = ((struct RBasic*)$regsrc)->flags
     printf "%sT_REGEXP%s: ", $color_type, $color_end
-    set $len = ($rsflags & RUBY_FL_USER1) ? \
-            ((struct RString*)$regsrc)->as.heap.len : \
-            (($rsflags & (RUBY_FL_USER2|RUBY_FL_USER3|RUBY_FL_USER4|RUBY_FL_USER5|RUBY_FL_USER6)) >> RUBY_FL_USHIFT+2)
+    set $len = ((struct RString*)($arg0))->len
     set print address off
     output *(char *)(($rsflags & RUBY_FL_USER1) ? \
-	    ((struct RString*)$regsrc)->as.heap.ptr : \
-	    ((struct RString*)$regsrc)->as.ary) @ $len
+            ((struct RString*)$regsrc)->as.heap.ptr : \
+            ((struct RString*)$regsrc)->as.embed.ary) @ $len
     set print address on
     printf " len:%ld ", $len
     if $flags & RUBY_FL_USER6
@@ -126,26 +108,26 @@ define rp
       printf "%sT_ARRAY%s: len=%ld ", $color_type, $color_end, $len
       printf "(embed) "
       if ($len == 0)
-	printf "{(empty)} "
+        printf "{(empty)} "
       else
-	print/x *((VALUE*)((struct RArray*)($arg0))->as.ary) @ $len
-	printf " "
+        print/x *((VALUE*)((struct RArray*)($arg0))->as.ary) @ $len
+        printf " "
       end
     else
       set $len = ((struct RArray*)($arg0))->as.heap.len
       printf "%sT_ARRAY%s: len=%ld ", $color_type, $color_end, $len
       if ($flags & RUBY_FL_USER2)
-	printf "(shared) shared="
-	output/x ((struct RArray*)($arg0))->as.heap.aux.shared_root
-	printf " "
+        printf "(shared) shared="
+        output/x ((struct RArray*)($arg0))->as.heap.aux.shared_root
+        printf " "
       else
-	printf "(ownership) capa=%ld ", ((struct RArray*)($arg0))->as.heap.aux.capa
+        printf "(ownership) capa=%ld ", ((struct RArray*)($arg0))->as.heap.aux.capa
       end
       if ($len == 0)
-	printf "{(empty)} "
+        printf "{(empty)} "
       else
-	print/x *((VALUE*)((struct RArray*)($arg0))->as.heap.ptr) @ $len
-	printf " "
+        print/x *((VALUE*)((struct RArray*)($arg0))->as.heap.ptr) @ $len
+        printf " "
       end
     end
     print (struct RArray *)($arg0)
@@ -157,13 +139,15 @@ define rp
   if ($flags & RUBY_T_MASK) == RUBY_T_HASH
     printf "%sT_HASH%s: ", $color_type, $color_end,
     if (((struct RHash *)($arg0))->basic.flags & RHASH_ST_TABLE_FLAG)
-      printf "st len=%ld ", ((struct RHash *)($arg0))->as.st->num_entries
+      set $st = (struct st_table *)((uintptr_t)($arg0) + sizeof(struct RHash))
+      printf "st len=%ld ", $st->num_entries
+      print $st
     else
       printf "li len=%ld bound=%ld ", \
         ((((struct RHash *)($arg0))->basic.flags & RHASH_AR_TABLE_SIZE_MASK) >> RHASH_AR_TABLE_SIZE_SHIFT), \
         ((((struct RHash *)($arg0))->basic.flags & RHASH_AR_TABLE_BOUND_MASK) >> RHASH_AR_TABLE_BOUND_SHIFT)
+	print (struct ar_table_struct *)((uintptr_t)($arg0) + sizeof(struct RHash))
     end
-    print (struct RHash *)($arg0)
   else
   if ($flags & RUBY_T_MASK) == RUBY_T_STRUCT
     set $len = (($flags & (RUBY_FL_USER1|RUBY_FL_USER2)) ? \
@@ -201,12 +185,14 @@ define rp
     print (struct RBasic *)($arg0)
   else
   if ($flags & RUBY_T_MASK) == RUBY_T_DATA
-    if ((struct RTypedData *)($arg0))->typed_flag == 1
-      printf "%sT_DATA%s(%s): ", $color_type, $color_end, ((struct RTypedData *)($arg0))->type->wrap_struct_name
-      print (struct RTypedData *)($arg0)
+    set $data = (struct RTypedData *)($arg0)
+    set $type = (const rb_data_type_t *)($data->type & ~1)
+    printf "%sT_DATA%s(%s): ", $color_type, $color_end, $type->wrap_struct_name
+    print *$type
+    if ($data->type & 1)
+      print (void *)&$data->data
     else
-      printf "%sT_DATA%s: ", $color_type, $color_end
-      print (struct RData *)($arg0)
+      print $data
     end
   else
   if ($flags & RUBY_T_MASK) == RUBY_T_MATCH
@@ -251,7 +237,7 @@ define rp
   else
   if ($flags & RUBY_T_MASK) == RUBY_T_IMEMO
     printf "%sT_IMEMO%s(", $color_type, $color_end
-    output (enum imemo_type)(($flags>>RUBY_FL_USHIFT)&RUBY_IMEMO_MASK)
+    output (enum imemo_type)(($flags&RUBY_IMEMO_MASK)>>RUBY_FL_USHIFT)
     printf "): "
     rp_imemo $arg0
   else
@@ -440,13 +426,11 @@ end
 
 define output_string
   set $flags = ((struct RBasic*)($arg0))->flags
-  set $len = ($flags & RUBY_FL_USER1) ? \
-          ((struct RString*)($arg0))->as.heap.len : \
-          (($flags & (RUBY_FL_USER2|RUBY_FL_USER3|RUBY_FL_USER4|RUBY_FL_USER5|RUBY_FL_USER6)) >> RUBY_FL_USHIFT+2)
+  set $len = ((struct RString*)($arg0))->len
   if $len > 0
     output *(char *)(($flags & RUBY_FL_USER1) ? \
-	    ((struct RString*)($arg0))->as.heap.ptr : \
-	    ((struct RString*)($arg0))->as.ary) @ $len
+            ((struct RString*)($arg0))->as.heap.ptr : \
+            ((struct RString*)($arg0))->as.embed.ary) @ $len
   else
     output ""
   end
@@ -454,13 +438,11 @@ end
 
 define print_string
   set $flags = ((struct RBasic*)($arg0))->flags
-  set $len = ($flags & RUBY_FL_USER1) ? \
-          ((struct RString*)($arg0))->as.heap.len : \
-          (($flags & (RUBY_FL_USER2|RUBY_FL_USER3|RUBY_FL_USER4|RUBY_FL_USER5|RUBY_FL_USER6)) >> RUBY_FL_USHIFT+2)
+  set $len = ((struct RString*)($arg0))->len
   if $len > 0
     printf "%s", *(char *)(($flags & RUBY_FL_USER1) ? \
-	    ((struct RString*)($arg0))->as.heap.ptr : \
-	    ((struct RString*)($arg0))->as.ary) @ $len
+            ((struct RString*)($arg0))->as.heap.ptr : \
+            ((struct RString*)($arg0))->as.embed.ary) @ $len
   end
 end
 
@@ -543,21 +525,21 @@ document rp_bignum
 end
 
 define rp_class
+  set $class_and_classext = (struct RClass_and_rb_classext_t *)($arg0)
   printf "(struct RClass *) %p", (void*)$arg0
-  if ((struct RClass *)($arg0))->ptr.origin_ != $arg0
-    printf " -> %p", ((struct RClass *)($arg0))->ptr.origin_
+  if $class_and_classext->classext->origin_ != (VALUE)$arg0
+    printf " -> %p", $class_and_classext->classext->origin_
   end
   printf "\n"
   rb_classname $arg0
-  print/x *(struct RClass *)($arg0)
-  print *((struct RClass *)($arg0))->ptr
+  print/x *$class_and_classext
 end
 document rp_class
   Print the content of a Class/Module.
 end
 
 define rp_imemo
-  set $flags = (enum imemo_type)((((struct RBasic *)($arg0))->flags >> RUBY_FL_USHIFT) & RUBY_IMEMO_MASK)
+  set $flags = (enum imemo_type)((((struct RBasic *)($arg0))->flags & RUBY_IMEMO_MASK) >> RUBY_FL_USHIFT)
   if $flags == imemo_cref
     printf "(rb_cref_t *) %p\n", (void*)$arg0
     print *(rb_cref_t *)$arg0
@@ -688,11 +670,6 @@ define nd_stts
   rp ($arg0).u1.node
 end
 
-
-define nd_entry
-  printf "%su3.entry%s: ", $color_highlite, $color_end
-  p ($arg0).u3.entry
-end
 
 define nd_vid
   printf "%su1.id%s: ", $color_highlite, $color_end
@@ -868,22 +845,22 @@ define rb_numtable_entry
     set $rb_numtable_p = $rb_numtable_tbl->as.packed.bins
     while $rb_numtable_p && $rb_numtable_p < $rb_numtable_tbl->as.packed.bins+$rb_numtable_tbl->num_entries
       if $rb_numtable_p.k == $rb_numtable_id
-	set $rb_numtable_key = $rb_numtable_p.k
-	set $rb_numtable_rec = $rb_numtable_p.v
-	set $rb_numtable_p = 0
+        set $rb_numtable_key = $rb_numtable_p.k
+        set $rb_numtable_rec = $rb_numtable_p.v
+        set $rb_numtable_p = 0
       else
-	set $rb_numtable_p = $rb_numtable_p + 1
+        set $rb_numtable_p = $rb_numtable_p + 1
       end
     end
   else
     set $rb_numtable_p = $rb_numtable_tbl->as.big.bins[st_numhash($rb_numtable_id) % $rb_numtable_tbl->num_bins]
     while $rb_numtable_p
       if $rb_numtable_p->key == $rb_numtable_id
-	set $rb_numtable_key = $rb_numtable_p->key
-	set $rb_numtable_rec = $rb_numtable_p->record
-	set $rb_numtable_p = 0
+        set $rb_numtable_key = $rb_numtable_p->key
+        set $rb_numtable_rec = $rb_numtable_p->record
+        set $rb_numtable_p = 0
       else
-	set $rb_numtable_p = $rb_numtable_p->next
+        set $rb_numtable_p = $rb_numtable_p->next
       end
     end
   end
@@ -921,10 +898,10 @@ document rb_method_entry
 end
 
 define rb_classname
-  # up to 128bit int
-  set $rb_classname = rb_mod_name($arg0)
-  if $rb_classname != RUBY_Qnil
-    rp $rb_classname
+  set $rb_classname = ((struct RClass_and_rb_classext_t*)$arg0)->classext->classpath
+  if $rb_classname != RUBY_Qfalse
+    print_string $rb_classname
+    printf "\n"
   else
     echo anonymous class/module\n
   end
@@ -961,7 +938,7 @@ define iseq
       set $operand_size = ((INSN*)($arg0))->operand_size
       set $operands = ((INSN*)($arg0))->operands
       while $i < $operand_size
-	rp $operands[$i++]
+        rp $operands[$i++]
       end
     end
   end
@@ -979,8 +956,8 @@ end
 
 define rb_ps_vm
   print $ps_vm = (rb_vm_t*)$arg0
-  set $ps_thread_ln = $ps_vm->living_threads.n.next
-  set $ps_thread_ln_last = $ps_vm->living_threads.n.prev
+  set $ps_thread_ln      = $ps_vm->ractor.main_ractor.threads.set.n.next
+  set $ps_thread_ln_last = $ps_vm->ractor.main_ractor.threads.set.n.prev
   while 1
     set $ps_thread_th = (rb_thread_t *)$ps_thread_ln
     set $ps_thread = (VALUE)($ps_thread_th->self)
@@ -995,10 +972,31 @@ document rb_ps_vm
 Dump all threads in a (rb_vm_t*) and their callstacks
 end
 
+# CFP_ISEQ() and CFP_PC() in zjit.h, written without calling a function so
+# that they work on a core file too. Sets $iseq and $cfp_pc.
+define cfp_iseq_pc
+  set $iseq = $arg0->_iseq
+  set $cfp_pc = $arg0->pc
+  python gdb.set_convenience_variable('zjit_built', gdb.lookup_global_symbol('rb_zjit_entry') is not None)
+  if $zjit_built
+    if rb_zjit_entry && $arg0->jit_return
+      if (VALUE)$arg0->jit_return == 1
+        # ZJIT_JIT_RETURN_C_FRAME
+        set $iseq = 0
+        set $cfp_pc = 0
+      else
+        set $jit_frame = ((zjit_jit_frame_t **)$arg0->jit_return)[-1]
+        set $iseq = $jit_frame->iseq
+        set $cfp_pc = $jit_frame->pc
+      end
+    end
+  end
+end
+
 define print_lineno
   set $cfp = $arg0
-  set $iseq = $cfp->iseq
-  set $pos = $cfp->pc - $iseq->body->iseq_encoded
+  cfp_iseq_pc $cfp
+  set $pos = $cfp_pc - $iseq->body->iseq_encoded
   if $pos != 0
     set $pos = $pos - 1
   end
@@ -1006,49 +1004,35 @@ define print_lineno
   set $index = 0
   set $size = $iseq->body->insns_info.size
   set $table = $iseq->body->insns_info.body
-  set $positions = $iseq->body->insns_info.positions
   #printf "size: %d\n", $size
   if $size == 0
   else
   if $size == 1
     printf "%d", $table[0].line_no
   else
-    if $positions
-      # get_insn_info_linear_search
-      set $index = 1
-      while $index < $size
-        #printf "table[%d]: position: %d, line: %d, pos: %d\n", $i, $positions[$i], $table[$i].line_no, $pos
-        if $positions[$index] > $pos
-          loop_break
-        end
-        set $index = $index + 1
-        if $positions[$index] == $pos
-          loop_break
-        end
-      end
+    # get_insn_info_succinct_bitvector (VM_INSN_INFO_TABLE_IMPL == 2).
+    # insns_info.positions and insns_info.succ_index_table share a union, and
+    # an iseq running on the stack always has succ_index_table.
+    set $sd = $iseq->body->insns_info.positions_or_succ_index_table.succ_index_table
+    set $immediate_table_size = sizeof($sd->imm_part) / sizeof(uint64_t) * 9
+    if $pos < $immediate_table_size
+      set $i = $pos / 9
+      set $j = $pos % 9
+      set $index = ((int)($sd->imm_part[$i] >> ($j * 7))) & 0x7f
     else
-      # get_insn_info_succinct_bitvector
-      set $sd = $iseq->body->insns_info.succ_index_table
-      set $immediate_table_size = sizeof($sd->imm_part) / sizeof(uint64_t) * 9
-      if $pos < $immediate_table_size
-        set $i = $pos / 9
-        set $j = $pos % 9
-        set $index = ((int)($sd->imm_part[$i] >> ($j * 7))) & 0x7f
-      else
-        set $block_index = ($pos - $immediate_table_size) / 512
-        set $block = &$sd->succ_part[$block_index]
-        set $block_bit_index = ($pos - $immediate_table_size) % 512
-        set $small_block_index = $block_bit_index / 64
-        set $small_block_popcount = $small_block_index == 0 ? 0 : (((int)($block->small_block_ranks >> (($small_block_index - 1) * 9))) & 0x1ff)
-        set $x = $block->bits[$small_block_index] << (63 - $block_bit_index % 64)
-        set $x = ($x & 0x5555555555555555) + ($x >> 1 & 0x5555555555555555)
-        set $x = ($x & 0x3333333333333333) + ($x >> 2 & 0x3333333333333333)
-        set $x = ($x & 0x0707070707070707) + ($x >> 4 & 0x0707070707070707)
-        set $x = ($x & 0x001f001f001f001f) + ($x >> 8 & 0x001f001f001f001f)
-        set $x = ($x & 0x0000003f0000003f) + ($x >>16 & 0x0000003f0000003f)
-        set $popcnt = ($x & 0x7f) + ($x >>32 & 0x7f)
-        set $index = $block->rank + $small_block_popcount + $popcnt
-      end
+      set $block_index = ($pos - $immediate_table_size) / 512
+      set $block = &$sd->succ_part[$block_index]
+      set $block_bit_index = ($pos - $immediate_table_size) % 512
+      set $small_block_index = $block_bit_index / 64
+      set $small_block_popcount = $small_block_index == 0 ? 0 : (((int)($block->small_block_ranks >> (($small_block_index - 1) * 9))) & 0x1ff)
+      set $x = $block->bits[$small_block_index] << (63 - $block_bit_index % 64)
+      set $x = ($x & 0x5555555555555555) + ($x >> 1 & 0x5555555555555555)
+      set $x = ($x & 0x3333333333333333) + ($x >> 2 & 0x3333333333333333)
+      set $x = ($x & 0x0707070707070707) + ($x >> 4 & 0x0707070707070707)
+      set $x = ($x & 0x001f001f001f001f) + ($x >> 8 & 0x001f001f001f001f)
+      set $x = ($x & 0x0000003f0000003f) + ($x >>16 & 0x0000003f0000003f)
+      set $popcnt = ($x & 0x7f) + ($x >>32 & 0x7f)
+      set $index = $block->rank + $small_block_popcount + $popcnt
     end
     printf "%d", $table[$index-1].line_no
   end
@@ -1078,31 +1062,16 @@ define print_id
   else
     set $serial = (rb_id_serial_t)$id
   end
-  if $serial && $serial <= ruby_global_symbols.last_id
+  if $serial && $serial < ruby_global_symbols.next_id
     set $idx = $serial / ID_ENTRY_UNIT
-    set $ids = (struct RArray *)ruby_global_symbols.ids
-    set $flags = $ids->basic.flags
-    if ($flags & RUBY_FL_USER1)
-      set $idsptr = $ids->as.ary
-      set $idslen = (($flags & (RUBY_FL_USER3|RUBY_FL_USER4)) >> (RUBY_FL_USHIFT+3))
-    else
-      set $idsptr = $ids->as.heap.ptr
-      set $idslen = $ids->as.heap.len
-    end
-    if $idx < $idslen
-      set $t = 0
-      set $ary = (struct RArray *)$idsptr[$idx]
-      if $ary != RUBY_Qnil
-        set $flags = $ary->basic.flags
-        if ($flags & RUBY_FL_USER1)
-          set $aryptr = $ary->as.ary
-          set $arylen = (($flags & (RUBY_FL_USER3|RUBY_FL_USER4)) >> (RUBY_FL_USHIFT+3))
-        else
-          set $aryptr = $ary->as.heap.ptr
-          set $arylen = $ary->as.heap.len
-        end
-        set $result = $aryptr[($serial % ID_ENTRY_UNIT) * ID_ENTRY_SIZE + $t]
-        if $result != RUBY_Qnil
+    set $dir = (struct id_entry_dir *)((struct RTypedData *)ruby_global_symbols.ids)->data
+    if $idx < $dir->capa
+      set $bucket = $dir->entries[$idx]
+      if $bucket
+        # rb_darray(struct sym_id_entry)
+        set $entries = (struct sym_id_entry *)((rb_darray_meta_t *)((struct RTypedData *)$bucket)->data + 1)
+        set $result = $entries[$serial % ID_ENTRY_UNIT].str
+        if $result
           print_string $result
         else
           echo undef
@@ -1131,20 +1100,21 @@ define rb_ps_thread
   set $ps_thread = (struct RTypedData*)$arg0
   set $ps_thread_th = (rb_thread_t*)$ps_thread->data
   printf "* #<Thread:%p rb_thread_t:%p native_thread:%p>\n", \
-    $ps_thread, $ps_thread_th, $ps_thread_th->thread_id
+    $ps_thread, $ps_thread_th, $ps_thread_th->nt
   set $cfp = $ps_thread_th->ec->cfp
   set $cfpend = (rb_control_frame_t *)($ps_thread_th->ec->vm_stack + $ps_thread_th->ec->vm_stack_size)-1
   while $cfp < $cfpend
-    if $cfp->iseq
-      if !((VALUE)$cfp->iseq & RUBY_IMMEDIATE_MASK) && (((imemo_ifunc << RUBY_FL_USHIFT) | RUBY_T_IMEMO)==$cfp->iseq->flags & ((RUBY_IMEMO_MASK << RUBY_FL_USHIFT) | RUBY_T_MASK))
+    cfp_iseq_pc $cfp
+    if $iseq
+      if !((VALUE)$iseq & RUBY_IMMEDIATE_MASK) && (((imemo_ifunc << RUBY_FL_USHIFT) | RUBY_T_IMEMO)==$iseq->flags & (RUBY_IMEMO_MASK | RUBY_T_MASK))
         printf "%d:ifunc ", $cfpend-$cfp
         set print symbol-filename on
-        output/a $cfp->iseq.body
+        output/a $iseq.body
         set print symbol-filename off
         printf "\n"
       else
-      if $cfp->pc
-        set $location = $cfp->iseq->body->location
+      if $cfp_pc
+        set $location = $iseq->body->location
         printf "%d:", $cfpend-$cfp
         print_pathobj $location.pathobj
         printf ":"
@@ -1279,9 +1249,9 @@ document rb_count_objects
   Counts all objects grouped by type.
 end
 
-# Details: https://bugs.ruby-lang.org/projects/ruby-master/wiki/MachineInstructionsTraceWithGDB
+# Details: https://github.com/ruby/ruby/wiki/Machine-Instructions-Trace-with-GDB
 define trace_machine_instructions
-  set logging on
+  set logging enabled
   set height 0
   set width 0
   display/i $pc
@@ -1316,13 +1286,12 @@ define dump_node
   set $flags = ((struct RBasic*)($str))->flags
   printf "%s", (char *)(($flags & RUBY_FL_USER1) ? \
                         ((struct RString*)$str)->as.heap.ptr : \
-                        ((struct RString*)$str)->as.ary)
+                        ((struct RString*)$str)->as.embed.ary)
 end
 
 define print_flags
   printf "RUBY_FL_WB_PROTECTED: %s\n", ((struct RBasic*)($arg0))->flags & RUBY_FL_WB_PROTECTED ? "1" : "0"
-  printf "RUBY_FL_PROMOTED0   : %s\n", ((struct RBasic*)($arg0))->flags & RUBY_FL_PROMOTED0 ? "1" : "0"
-  printf "RUBY_FL_PROMOTED1   : %s\n", ((struct RBasic*)($arg0))->flags & RUBY_FL_PROMOTED1 ? "1" : "0"
+  printf "RUBY_FL_PROMOTED    : %s\n", ((struct RBasic*)($arg0))->flags & RUBY_FL_PROMOTED ? "1" : "0"
   printf "RUBY_FL_FINALIZE    : %s\n", ((struct RBasic*)($arg0))->flags & RUBY_FL_FINALIZE ? "1" : "0"
   printf "RUBY_FL_SHAREABLE   : %s\n", ((struct RBasic*)($arg0))->flags & RUBY_FL_SHAREABLE ? "1" : "0"
   printf "RUBY_FL_EXIVAR      : %s\n", ((struct RBasic*)($arg0))->flags & RUBY_FL_EXIVAR ? "1" : "0"
@@ -1348,3 +1317,8 @@ define print_flags
   printf "RUBY_FL_USER17      : %s\n", ((struct RBasic*)($arg0))->flags & RUBY_FL_USER17 ? "1" : "0"
   printf "RUBY_FL_USER18      : %s\n", ((struct RBasic*)($arg0))->flags & RUBY_FL_USER18 ? "1" : "0"
 end
+
+source -s misc/gdb.py
+
+# Moved from beginning, since it fails on older gdbs
+set startup-with-shell off

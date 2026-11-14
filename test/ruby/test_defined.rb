@@ -62,6 +62,34 @@ class TestDefined < Test::Unit::TestCase
     f.bar(Class.new(Foo).new) { |v| assert(v, "inherited protected method") }
   end
 
+  module ProtectedInModule
+    def m
+      :m
+    end
+    protected :m
+    def call_m(o)
+      o.m
+    end
+    def defined_m(o)
+      defined?(o.m)
+    end
+  end
+  class ProtectedIncluderA
+    include ProtectedInModule
+  end
+  class ProtectedIncluderB
+    include ProtectedInModule
+  end
+
+  def test_defined_protected_method_in_included_module
+    a = ProtectedIncluderA.new
+    b = ProtectedIncluderB.new
+    assert_equal(:m, a.call_m(a))
+    assert_equal(:m, a.call_m(b))
+    assert_equal("method", a.defined_m(a))
+    assert_equal("method", a.defined_m(b))
+  end
+
   def test_defined_undefined_method
     f = Foo.new
     assert_nil(defined?(f.quux))        # undefined method
@@ -125,6 +153,53 @@ class TestDefined < Test::Unit::TestCase
     assert_equal 'global-variable', defined?($+)
     assert_equal 'global-variable', defined?($1)
     assert_equal nil, defined?($2)
+  end
+
+  def test_defined_assignment
+    assert_equal("assignment", defined?(a = 1))
+    assert_equal("assignment", defined?(a += 1))
+    assert_equal("assignment", defined?(a &&= 1))
+    assert_equal("assignment", eval('defined?(A = 1)'))
+    assert_equal("assignment", eval('defined?(A += 1)'))
+    assert_equal("assignment", eval('defined?(A &&= 1)'))
+    assert_equal("assignment", eval('defined?(A::B = 1)'))
+    assert_equal("assignment", eval('defined?(A::B += 1)'))
+    assert_equal("assignment", eval('defined?(A::B &&= 1)'))
+  end
+
+  def test_defined_splat
+    assert_nil(defined?([*a]))
+    assert_nil(defined?(itself(*a)))
+    assert_equal("expression", defined?([*itself]))
+    assert_equal("method", defined?(itself(*itself)))
+  end
+
+  def test_defined_hash
+    assert_nil(defined?({a: a}))
+    assert_nil(defined?({a => 1}))
+    assert_nil(defined?({a => a}))
+    assert_nil(defined?({**a}))
+    assert_nil(defined?(itself(a: a)))
+    assert_nil(defined?(itself(a => 1)))
+    assert_nil(defined?(itself(a => a)))
+    assert_nil(defined?(itself(**a)))
+    assert_nil(defined?(itself({a: a})))
+    assert_nil(defined?(itself({a => 1})))
+    assert_nil(defined?(itself({a => a})))
+    assert_nil(defined?(itself({**a})))
+
+    assert_equal("expression", defined?({a: itself}))
+    assert_equal("expression", defined?({itself => 1}))
+    assert_equal("expression", defined?({itself => itself}))
+    assert_equal("expression", defined?({**itself}))
+    assert_equal("method", defined?(itself(a: itself)))
+    assert_equal("method", defined?(itself(itself => 1)))
+    assert_equal("method", defined?(itself(itself => itself)))
+    assert_equal("method", defined?(itself(**itself)))
+    assert_equal("method", defined?(itself({a: itself})))
+    assert_equal("method", defined?(itself({itself => 1})))
+    assert_equal("method", defined?(itself({itself => itself})))
+    assert_equal("method", defined?(itself({**itself})))
   end
 
   def test_defined_literal
@@ -194,6 +269,26 @@ class TestDefined < Test::Unit::TestCase
 
   def test_defined_empty_paren_arg
     assert_nil(defined?(p () + 1))
+  end
+
+  def test_defined_paren_void_stmts
+    assert_equal("expression", defined? (;x))
+    assert_equal("expression", defined? (x;))
+    assert_nil(defined? (
+
+      x
+
+    ))
+
+    x = 1
+
+    assert_equal("expression", defined? (;x))
+    assert_equal("expression", defined? (x;))
+    assert_equal("local-variable", defined? (
+
+      x
+
+    ))
   end
 
   def test_defined_impl_specific
@@ -301,6 +396,20 @@ class TestDefined < Test::Unit::TestCase
     o = c.new
     o.extend(m)
     assert_equal("super", o.x, bug8367)
+  end
+
+  def test_super_in_basic_object
+    BasicObject.class_eval do
+      def a
+        defined?(super)
+      end
+    end
+
+    assert_nil(a)
+  ensure
+    BasicObject.class_eval do
+      undef_method :a if defined?(a)
+    end
   end
 
   def test_super_toplevel

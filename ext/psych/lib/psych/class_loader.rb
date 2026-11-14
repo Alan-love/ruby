@@ -6,8 +6,10 @@ module Psych
   class ClassLoader # :nodoc:
     BIG_DECIMAL = 'BigDecimal'
     COMPLEX     = 'Complex'
+    DATA        = 'Data' unless RUBY_VERSION < "3.2"
     DATE        = 'Date'
     DATE_TIME   = 'DateTime'
+    ENCODING    = 'Encoding'
     EXCEPTION   = 'Exception'
     OBJECT      = 'Object'
     PSYCH_OMAP  = 'Psych::Omap'
@@ -35,7 +37,7 @@ module Psych
 
     constants.each do |const|
       konst = const_get const
-      class_eval <<~RUBY
+      class_eval <<~RUBY, __FILE__, __LINE__ + 1
         def #{const.to_s.downcase}
           load #{konst.inspect}
         end

@@ -1,18 +1,18 @@
 describe :process_fork, shared: true do
-  platform_is :windows do
+  guard_not -> { Process.respond_to?(:fork) } do
     it "returns false from #respond_to?" do
       # Workaround for Kernel::Method being public and losing the "non-respond_to? magic"
       mod = @object.class.name == "KernelSpecs::Method" ? Object.new : @object
-      mod.respond_to?(:fork).should be_false
-      mod.respond_to?(:fork, true).should be_false
+      mod.respond_to?(:fork).should == false
+      mod.respond_to?(:fork, true).should == false
     end
 
     it "raises a NotImplementedError when called" do
-      -> { @object.fork }.should raise_error(NotImplementedError)
+      -> { @object.fork }.should.raise(NotImplementedError)
     end
   end
 
-  platform_is_not :windows do
+  guard -> { Process.respond_to?(:fork) } do
     before :each do
       @file = tmp('i_exist')
       rm_r @file
@@ -23,31 +23,31 @@ describe :process_fork, shared: true do
     end
 
     it "returns status zero" do
-      pid = Process.fork { exit! 0 }
+      pid = @object.fork { exit! 0 }
       _, result = Process.wait2(pid)
       result.exitstatus.should == 0
     end
 
     it "returns status zero" do
-      pid = Process.fork { exit 0 }
+      pid = @object.fork { exit 0 }
       _, result = Process.wait2(pid)
       result.exitstatus.should == 0
     end
 
     it "returns status zero" do
-      pid = Process.fork {}
+      pid = @object.fork {}
       _, result = Process.wait2(pid)
       result.exitstatus.should == 0
     end
 
     it "returns status non-zero" do
-      pid = Process.fork { exit! 42 }
+      pid = @object.fork { exit! 42 }
       _, result = Process.wait2(pid)
       result.exitstatus.should == 42
     end
 
     it "returns status non-zero" do
-      pid = Process.fork { exit 42 }
+      pid = @object.fork { exit 42 }
       _, result = Process.wait2(pid)
       result.exitstatus.should == 42
     end
@@ -74,16 +74,19 @@ describe :process_fork, shared: true do
 
     it "marks threads from the parent as killed" do
       t = Thread.new { sleep }
-      pid = @object.fork {
-        touch(@file) do |f|
-          f.write Thread.current.alive?
-          f.write t.alive?
-        end
-        Process.exit!
-      }
-      Process.waitpid(pid)
-      t.kill
-      t.join
+      begin
+        pid = @object.fork {
+          touch(@file) do |f|
+            f.write Thread.current.alive?
+            f.write t.alive?
+          end
+          Process.exit!
+        }
+        Process.waitpid(pid)
+      ensure
+        t.kill
+        t.join
+      end
       File.read(@file).should == "truefalse"
     end
   end

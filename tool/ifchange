@@ -1,7 +1,8 @@
 #!/bin/sh
 # usage: ifchange target temporary
 
-# Used in generating revision.h via Makefiles.
+# Used in generating various files such as rbconfig.rb, revision.h,
+# etc. via Makefiles.
 
 help() {
     cat <<HELP
@@ -18,8 +19,9 @@ HELP
 set -e
 timestamp=
 keepsuffix=
-empty=
+srcavail=f
 color=auto
+[ "x${NO_COLOR-}" = x ] || color=never
 until [ $# -eq 0 ]; do
     case "$1" in
 	--)
@@ -39,7 +41,7 @@ until [ $# -eq 0 ]; do
 	    keepsuffix=`expr \( "$1" : '[^=]*=\(.*\)' \)`
 	    ;;
 	--empty)
-	    empty=yes
+	    srcavail=s
 	    ;;
 	--color)
 	    color=always
@@ -97,7 +99,7 @@ fi
 
 targetdir=
 case "$target" in */*) targetdir=`dirname "$target"`;; esac
-if [ -f "$target" -a ! -${empty:+f}${empty:-s} "$temp" ] || cmp "$target" "$temp" >/dev/null 2>&1; then
+if [ -f "$target" -a ! -${srcavail} "$temp" ] || cmp "$target" "$temp" >/dev/null 2>&1; then
     echo "$target ${msg_unchanged}unchanged${msg_reset}"
     rm -f "$temp"
 else

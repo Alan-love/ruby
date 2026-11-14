@@ -1,5 +1,6 @@
 require_relative '../../spec_helper'
 require_relative 'fixtures/classes'
+require_relative 'shared/attr_added'
 
 describe "Module#attr" do
   before :each do
@@ -89,8 +90,8 @@ describe "Module#attr" do
       attr :foo, true
     end
 
-    -> { c.new.foo }.should raise_error(NoMethodError)
-    -> { c.new.foo=1 }.should raise_error(NoMethodError)
+    -> { c.new.foo }.should.raise(NoMethodError)
+    -> { c.new.foo=1 }.should.raise(NoMethodError)
   end
 
   it "creates a getter but no setter for all given attribute names" do
@@ -120,8 +121,8 @@ describe "Module#attr" do
       attr :foo, :bar
     end
 
-    -> { c.new.foo }.should raise_error(NoMethodError)
-    -> { c.new.bar }.should raise_error(NoMethodError)
+    -> { c.new.foo }.should.raise(NoMethodError)
+    -> { c.new.bar }.should.raise(NoMethodError)
   end
 
   it "converts non string/symbol names to strings using to_str" do
@@ -131,9 +132,9 @@ describe "Module#attr" do
 
   it "raises a TypeError when the given names can't be converted to strings using to_str" do
     o = mock('o')
-    -> { Class.new { attr o } }.should raise_error(TypeError)
+    -> { Class.new { attr o } }.should.raise(TypeError)
     (o = mock('123')).should_receive(:to_str).and_return(123)
-    -> { Class.new { attr o } }.should raise_error(TypeError)
+    -> { Class.new { attr o } }.should.raise(TypeError)
   end
 
   it "with a boolean argument emits a warning when $VERBOSE is true" do
@@ -143,26 +144,16 @@ describe "Module#attr" do
   end
 
   it "is a public method" do
-    Module.should have_public_instance_method(:attr, false)
+    Module.public_instance_methods(false).should.include?(:attr)
   end
 
-  ruby_version_is ""..."3.0" do
-    it "returns nil" do
-      Class.new do
-        (attr :foo, 'bar').should == nil
-        (attr :baz, false).should == nil
-        (attr :qux, true).should == nil
-      end
+  it "returns an array of defined method names as symbols" do
+    Class.new do
+      (attr :foo, 'bar').should == [:foo, :bar]
+      (attr :baz, false).should == [:baz]
+      (attr :qux, true).should == [:qux, :qux=]
     end
   end
 
-  ruby_version_is "3.0" do
-    it "returns an array of defined method names as symbols" do
-      Class.new do
-        (attr :foo, 'bar').should == [:foo, :bar]
-        (attr :baz, false).should == [:baz]
-        (attr :qux, true).should == [:qux, :qux=]
-      end
-    end
-  end
+  it_behaves_like :module_attr_added, :attr
 end

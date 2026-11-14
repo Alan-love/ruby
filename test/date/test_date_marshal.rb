@@ -40,12 +40,21 @@ class TestDateMarshal < Test::Unit::TestCase
     expected_error = defined?(FrozenError) ? FrozenError : RuntimeError
     assert_raise(expected_error){d.marshal_load(a)}
 
-    d = Date.new + 1/2r + 2304/65437r/86400
+    d = assert_deprecated_warn(/fractional day/) { Date.new + 1/2r + 2304/65437r/86400 }
     m = Marshal.dump(d)
     d2 = Marshal.load(m)
     assert_equal(d, d2)
     assert_equal(d.start, d2.start)
     assert_instance_of(String, d2.to_s)
+  end
+
+  def test_marshal_nth
+    [Date.new(-123456,7,8), Date.new(2**40,3,31)].each do |d|
+      assert_equal(d, Marshal.load(Marshal.dump(d)))
+    end
+
+    s = "\x04\bU:\tDate[\vi\xFAi\x04\xF4)#\ni\x00i\x00i\x00f\f2299161".b
+    assert_equal(Date.new(-123456,7,8), Marshal.load(s))
   end
 
   def test_memsize

@@ -856,6 +856,20 @@ class TestEncodingConverter < Test::Unit::TestCase
       "\222\xA1x".encode("iso-2022-jp", "stateless-iso-2022-jp", :invalid => :replace))
   end
 
+  def test_inspect_decorator_source_name
+    decorator_names = %w[
+      amp_escape xml_text_escape xml_attr_content_escape xml_attr_quote
+      universal_newline crlf_newline cr_newline lf_newline
+    ]
+    all_assertions_foreach(nil, *decorator_names) do |decorator|
+      ec = Encoding::Converter.new('', decorator)
+      inspect = ec.inspect
+      10_000.times {"A"*100}
+      GC.start(full_mark: true, immediate_sweep: true)
+      assert_equal inspect, ec.inspect
+    end
+  end
+
   def test_convpath
     eucjp = Encoding::EUC_JP
     utf8 = Encoding::UTF_8
@@ -931,7 +945,7 @@ class TestEncodingConverter < Test::Unit::TestCase
 
   def test_default_external
     Encoding.list.grep(->(enc) {/\AISO-8859-\d+\z/i =~ enc.name}) do |enc|
-      assert_separately(%W[--disable=gems -d - #{enc.name}], <<-EOS, ignore_stderr: true)
+      assert_separately(%W[-d - #{enc.name}], <<-EOS, ignore_stderr: true)
     Encoding.default_external = ext = ARGV[0]
     Encoding.default_internal = int ='utf-8'
     assert_nothing_raised do

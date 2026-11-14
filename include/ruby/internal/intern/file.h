@@ -24,6 +24,9 @@
 #include "ruby/internal/attr/pure.h"
 #include "ruby/internal/dllexport.h"
 #include "ruby/internal/value.h"
+#if !defined RUBY_EXPORT && !defined RUBY_NO_OLD_COMPATIBILITY
+# include "ruby/backward.h"
+#endif
 
 RBIMPL_SYMBOL_EXPORT_BEGIN()
 
@@ -198,13 +201,15 @@ int rb_is_absolute_path(const char *path);
  * @exception   rb_eFrozenError      `file` is frozen.
  * @exception   rb_eIOError          `file` is closed.
  * @exception   rb_eSystemCallError  Permission denied etc.
+ * @exception   rb_eNoMethodError    The given non-file object doesn't respond
+ *                                   to `#size`.
  * @return      The size of the passed file.
  * @note        Passing a non-regular file such as a UNIX domain socket to this
  *              function  is   not  a  failure.    But  the  return   value  is
  *              unpredictable.  POSIX's `<sys/stat.h>` states  that "the use of
  *              this field is unspecified" then.
  */
-off_t rb_file_size(VALUE file);
+rb_off_t rb_file_size(VALUE file);
 
 RBIMPL_SYMBOL_EXPORT_END()
 

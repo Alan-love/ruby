@@ -1,5 +1,4 @@
 require_relative '../../spec_helper'
-require 'thread'
 
 describe "ConditionVariable#wait" do
   it "calls #sleep on the given object" do
@@ -164,7 +163,7 @@ describe "ConditionVariable#wait" do
         # On TruffleRuby, this causes a safepoint which has interesting
         # interactions with the ConditionVariable.
         bt = t.backtrace
-        bt.should be_kind_of(Array)
+        bt.should.is_a?(Array)
         bt.size.should >= 2
       }
     end

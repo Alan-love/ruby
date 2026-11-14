@@ -4,6 +4,7 @@
  */
 
 #include "eval_intern.h"
+#include "internal/ractor.h"
 
 /* exit */
 
@@ -40,8 +41,9 @@ rb_f_at_exit(VALUE _)
     VALUE proc;
 
     if (!rb_block_given_p()) {
-	rb_raise(rb_eArgError, "called without a block");
+        rb_raise(rb_eArgError, "called without a block");
     }
+    rb_ractor_ensure_main_ractor("can not call at_exit from non-main Ractors");
     proc = rb_block_proc();
     rb_set_end_proc(rb_call_end_proc, proc);
     return proc;
@@ -63,10 +65,10 @@ rb_set_end_proc(void (*func)(VALUE), VALUE data)
     rb_thread_t *th = GET_THREAD();
 
     if (th->top_wrapper) {
-	list = &ephemeral_end_procs;
+        list = &ephemeral_end_procs;
     }
     else {
-	list = &end_procs;
+        list = &end_procs;
     }
     link->next = *list;
     link->func = func;
@@ -81,13 +83,13 @@ rb_mark_end_proc(void)
 
     link = end_procs;
     while (link) {
-	rb_gc_mark(link->data);
-	link = link->next;
+        rb_gc_mark(link->data);
+        link = link->next;
     }
     link = ephemeral_end_procs;
     while (link) {
-	rb_gc_mark(link->data);
-	link = link->next;
+        rb_gc_mark(link->data);
+        link = link->next;
     }
 }
 
@@ -99,11 +101,11 @@ exec_end_procs_chain(struct end_proc_data *volatile *procs, VALUE *errp)
     VALUE errinfo = *errp;
 
     while ((link = *procs) != 0) {
-	*procs = link->next;
-	endproc = *link;
-	xfree(link);
-	(*endproc.func) (endproc.data);
-	*errp = errinfo;
+        *procs = link->next;
+        endproc = *link;
+        SIZED_FREE(link);
+        (*endproc.func) (endproc.data);
+        *errp = errinfo;
     }
 }
 
@@ -112,21 +114,25 @@ rb_ec_exec_end_proc(rb_execution_context_t * ec)
 {
     enum ruby_tag_type state;
     volatile VALUE errinfo = ec->errinfo;
+    /* Share only among END/at_exit handlers to avoid repeated causes. */
+    VALUE shown_causes = 0;
+    volatile bool finished = false;
 
-    EC_PUSH_TAG(ec);
-    if ((state = EC_EXEC_TAG()) == TAG_NONE) {
-      again:
-	exec_end_procs_chain(&ephemeral_end_procs, &ec->errinfo);
-	exec_end_procs_chain(&end_procs, &ec->errinfo);
+    while (!finished) {
+        EC_PUSH_TAG(ec);
+        if ((state = EC_EXEC_TAG()) == TAG_NONE) {
+            exec_end_procs_chain(&ephemeral_end_procs, &ec->errinfo);
+            exec_end_procs_chain(&end_procs, &ec->errinfo);
+            finished = true;
+        }
+        EC_POP_TAG();
+        if (state != TAG_NONE) {
+            VALUE err = ec->errinfo;
+            add_shown_cause(errinfo, &shown_causes);
+            error_handle_with_shown_causes(ec, err, state, &shown_causes);
+            if (!NIL_P(err)) errinfo = err;
+        }
     }
-    else {
-	EC_TMPPOP_TAG();
-        error_handle(ec, state);
-	if (!NIL_P(ec->errinfo)) errinfo = ec->errinfo;
-	EC_REPUSH_TAG();
-	goto again;
-    }
-    EC_POP_TAG();
 
     ec->errinfo = errinfo;
 }

@@ -1,9 +1,10 @@
 # frozen_string_literal: true
-require_relative 'remote_fetcher'
-require_relative 'user_interaction'
-require_relative 'errors'
-require_relative 'text'
-require_relative 'name_tuple'
+
+require_relative "remote_fetcher"
+require_relative "user_interaction"
+require_relative "errors"
+require_relative "text"
+require_relative "name_tuple"
 
 ##
 # SpecFetcher handles metadata updates from remote gem repositories.
@@ -68,9 +69,9 @@ class Gem::SpecFetcher
     @prerelease_specs = {}
 
     @caches = {
-      :latest => @latest_specs,
-      :prerelease => @prerelease_specs,
-      :released => @specs,
+      latest: @latest_specs,
+      prerelease: @prerelease_specs,
+      released: @specs,
     }
 
     @fetcher = Gem::RemoteFetcher.fetcher
@@ -81,32 +82,39 @@ class Gem::SpecFetcher
   # Find and fetch gem name tuples that match +dependency+.
   #
   # If +matching_platform+ is false, gems for all platforms are returned.
+  #
+  # +type+ overrides the index type derived from +dependency+.  See
+  # #available_specs for the list of types.
 
-  def search_for_dependency(dependency, matching_platform=true)
+  def search_for_dependency(dependency, matching_platform = true, type: nil)
     found = {}
 
     rejected_specs = {}
 
-    list, errors = available_specs(dependency.identity)
+    specs_type = type || dependency.identity
+    list, errors = available_specs(specs_type)
 
     list.each do |source, specs|
       if dependency.name.is_a?(String) && specs.respond_to?(:bsearch)
-        start_index = (0 ... specs.length).bsearch{|i| specs[i].name >= dependency.name }
-        end_index   = (0 ... specs.length).bsearch{|i| specs[i].name > dependency.name }
-        specs = specs[start_index ... end_index] if start_index && end_index
+        start_index = (0...specs.length).bsearch {|i| specs[i].name >= dependency.name }
+        end_index   = (0...specs.length).bsearch {|i| specs[i].name > dependency.name }
+        specs = specs[start_index...end_index] if start_index && end_index
       end
 
+      specs = specs.select {|tup| dependency.match?(tup) }
+      specs = decode_source_content_addressable_tuples(source, specs, latest: specs_type == :latest)
+
       found[source] = specs.select do |tup|
-        if dependency.match?(tup)
-          if matching_platform and !Gem::Platform.match_gem?(tup.platform, tup.name)
-            pm = (
-              rejected_specs[dependency] ||= \
-                Gem::PlatformMismatch.new(tup.name, tup.version))
-            pm.add_platform tup.platform
-            false
-          else
-            true
-          end
+        if matching_platform && !Gem::Platform.match_gem?(tup.platform, tup.name)
+          pm = (
+            rejected_specs[dependency] ||= \
+              Gem::PlatformMismatch.new(tup.name, tup.version))
+          pm.add_platform tup.platform
+          false
+        elsif matching_platform && !ruby_abi_match?(tup)
+          false
+        else
+          true
         end
       end
     end
@@ -121,15 +129,15 @@ class Gem::SpecFetcher
       end
     end
 
-    tuples = tuples.sort_by {|x| x[0] }
+    tuples = tuples.sort_by {|x| x[0].version }
 
-    return [tuples, errors]
+    [tuples, errors]
   end
 
   ##
   # Return all gem name tuples who's names match +obj+
 
-  def detect(type=:complete)
+  def detect(type = :complete)
     tuples = []
 
     list, _ = available_specs(type)
@@ -149,21 +157,31 @@ class Gem::SpecFetcher
   #
   # If +matching_platform+ is false, gems for all platforms are returned.
 
-  def spec_for_dependency(dependency, matching_platform=true)
+  def spec_for_dependency(dependency, matching_platform = true)
     tuples, errors = search_for_dependency(dependency, matching_platform)
 
     specs = []
     tuples.each do |tup, source|
-      begin
-        spec = source.fetch_spec(tup)
-      rescue Gem::RemoteFetcher::FetchError => e
-        errors << Gem::SourceFetchProblem.new(source, e)
-      else
-        specs << [spec, source]
-      end
+      spec = source.fetch_spec(tup)
+      spec.content_address = tup.content_address if tup.content_address
+    rescue Gem::RemoteFetcher::FetchError => e
+      errors << Gem::SourceFetchProblem.new(source, e)
+    else
+      specs << [spec, source]
     end
 
-    return [specs, errors]
+    [specs, errors]
+  end
+
+  ##
+  # Decodes the content-addressable tuples in +spec_tuples+ ([tuple, source]
+  # pairs) to carry their real platform and Ruby ABI via each source.
+
+  def decode_content_addressable_tuples(spec_tuples, latest: false)
+    spec_tuples.group_by {|_, source| source }.flat_map do |source, source_tuples|
+      tuples = source_tuples.map(&:first)
+      decode_source_content_addressable_tuples(source, tuples, latest: latest).map {|tuple| [tuple, source] }
+    end
   end
 
   ##
@@ -171,32 +189,64 @@ class Gem::SpecFetcher
   # alternative gem names.
 
   def suggest_gems_from_name(gem_name, type = :latest, num_results = 5)
-    gem_name        = gem_name.downcase.tr('_-', '')
-    max             = gem_name.size / 2
-    names           = available_specs(type).first.values.flatten(1)
+    gem_name = gem_name.downcase.tr("_-", "")
 
-    matches = names.map do |n|
+    # All results for 3-character-or-shorter (minus hyphens/underscores) gem
+    # names get rejected, so we just return an empty array immediately instead.
+    return [] if gem_name.length <= 3
+
+    max   = gem_name.size / 2
+    names = available_specs(type).first.values.flatten(1)
+
+    min_length = gem_name.length - max
+    max_length = gem_name.length + max
+
+    gem_name_with_postfix = "#{gem_name}ruby"
+    gem_name_with_prefix = "ruby#{gem_name}"
+
+    matches = names.filter_map do |n|
+      len = n.name.length
+      # If the gem doesn't support the current platform, bail early.
       next unless n.match_platform?
-      [n.name, 0] if n.name.downcase.tr('_-', '').include?(gem_name)
-    end.compact
 
-    if matches.length < num_results
-      matches += names.map do |n|
-        next unless n.match_platform?
-        distance = levenshtein_distance gem_name, n.name.downcase.tr('_-', '')
-        next if distance >= max
-        return [n.name] if distance == 0
-        [n.name, distance]
-      end.compact
+      # If the length is min_length or shorter, we've done `max` deletions.
+      # This would be rejected later, so we skip it for performance.
+      next if len <= min_length
+
+      # The candidate name, normalized the same as gem_name.
+      normalized_name = n.name.downcase
+      normalized_name.tr!("_-", "")
+
+      # If the gem is "{NAME}-ruby" and "ruby-{NAME}", we want to return it.
+      # But we already removed hyphens, so we check "{NAME}ruby" and "ruby{NAME}".
+      next [n.name, 0] if normalized_name == gem_name_with_postfix
+      next [n.name, 0] if normalized_name == gem_name_with_prefix
+
+      # If the length is max_length or longer, we've done `max` insertions.
+      # This would be rejected later, so we skip it for performance.
+      next if len >= max_length
+
+      # If we found an exact match (after stripping underscores and hyphens),
+      # that's our most likely candidate.
+      # Return it immediately, and skip the rest of the loop.
+      return [n.name] if normalized_name == gem_name
+
+      distance = levenshtein_distance gem_name, normalized_name
+
+      # Skip current candidate, if the edit distance is greater than allowed.
+      next if distance >= max
+
+      # If all else fails, return the name and the calculated distance.
+      [n.name, distance]
     end
 
     matches = if matches.empty? && type != :prerelease
-                suggest_gems_from_name gem_name, :prerelease
-              else
-                matches.uniq.sort_by {|name, dist| dist }
-              end
+      suggest_gems_from_name gem_name, :prerelease
+    else
+      matches.uniq.sort_by {|_name, dist| dist }
+    end
 
-    matches.map {|name, dist| name }.uniq.first(num_results)
+    matches.map {|name, _dist| name }.uniq.first(num_results)
   end
 
   ##
@@ -214,34 +264,32 @@ class Gem::SpecFetcher
     list = {}
 
     @sources.each_source do |source|
-      begin
-        names = case type
-                when :latest
-                  tuples_for source, :latest
-                when :released
-                  tuples_for source, :released
-                when :complete
-                  names =
-                    tuples_for(source, :prerelease, true) +
-                    tuples_for(source, :released)
+      names = case type
+              when :latest
+                tuples_for source, :latest
+              when :released
+                tuples_for source, :released
+              when :complete
+                names =
+                  tuples_for(source, :prerelease, true) +
+                  tuples_for(source, :released)
 
-                  names.sort
-                when :abs_latest
-                  names =
-                    tuples_for(source, :prerelease, true) +
-                    tuples_for(source, :latest)
+                names.sort
+              when :abs_latest
+                names =
+                  tuples_for(source, :prerelease, true) +
+                  tuples_for(source, :latest)
 
-                  names.sort
-                when :prerelease
-                  tuples_for(source, :prerelease)
-                else
-                  raise Gem::Exception, "Unknown type - :#{type}"
-                end
-      rescue Gem::RemoteFetcher::FetchError => e
-        errors << Gem::SourceFetchProblem.new(source, e)
-      else
-        list[source] = names
+                names.sort
+              when :prerelease
+                tuples_for(source, :prerelease)
+              else
+                raise Gem::Exception, "Unknown type - :#{type}"
       end
+    rescue Gem::RemoteFetcher::FetchError => e
+      errors << Gem::SourceFetchProblem.new(source, e)
+    else
+      list[source] = names
     end
 
     [list, errors]
@@ -251,11 +299,27 @@ class Gem::SpecFetcher
   # Retrieves NameTuples from +source+ of the given +type+ (:prerelease,
   # etc.).  If +gracefully_ignore+ is true, errors are ignored.
 
-  def tuples_for(source, type, gracefully_ignore=false) # :nodoc:
+  def tuples_for(source, type, gracefully_ignore = false) # :nodoc:
     @caches[type][source.uri] ||=
-      source.load_specs(type).sort_by {|tup| tup.name }
+      source.load_specs(type).sort_by(&:name)
   rescue Gem::RemoteFetcher::FetchError
     raise unless gracefully_ignore
     []
+  end
+
+  private
+
+  def decode_source_content_addressable_tuples(source, tuples, latest: false) # :nodoc:
+    return tuples unless source.respond_to?(:decode_content_addressable_tuples)
+
+    source.decode_content_addressable_tuples(tuples, latest: latest)
+  end
+
+  def ruby_abi_match?(tuple) # :nodoc:
+    !tuple.ruby_abi || tuple.ruby_abi == current_ruby_abi
+  end
+
+  def current_ruby_abi # :nodoc:
+    @current_ruby_abi ||= Gem.ruby_abi
   end
 end

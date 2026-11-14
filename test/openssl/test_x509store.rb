@@ -91,6 +91,18 @@ class OpenSSL::TestX509Store < OpenSSL::TestCase
     assert_match(/ok/i, store.error_string)
     assert_equal(OpenSSL::X509::V_OK, store.error)
     assert_equal([ee1_cert, ca2_cert, ca1_cert], store.chain)
+
+    # Manually instantiated StoreContext
+    # Nothing trusted
+    store = OpenSSL::X509::Store.new
+    ctx = OpenSSL::X509::StoreContext.new(store, ee1_cert)
+    assert_nil(ctx.current_cert)
+    assert_nil(ctx.current_crl)
+    assert_equal(false, ctx.verify)
+    assert_equal(OpenSSL::X509::V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY, ctx.error)
+    assert_equal(0, ctx.error_depth)
+    assert_equal([ee1_cert], ctx.chain)
+    assert_equal(ee1_cert, ctx.current_cert)
   end
 
   def test_verify_callback
@@ -157,6 +169,37 @@ class OpenSSL::TestX509Store < OpenSSL::TestCase
     blk = proc { |preverify_ok, sctx| called = :block; preverify_ok }
     assert_equal(true, store.verify(ee1_cert, [ca2_cert], &blk))
     assert_equal(:block, called)
+  end
+
+  def test_verify_callback_warning_raises
+    # StoreContext must be detached even if the warning raises
+    assert_separately(["-ropenssl"], <<~"end;")
+      module Warning
+        def self.warn(message, *)
+          raise "warn raised" if message.include?("verify_callback")
+        end
+      end
+
+      key = OpenSSL::PKey::EC.generate("prime256v1")
+      cert = OpenSSL::X509::Certificate.new
+      cert.version = 2
+      cert.serial = 1
+      cert.subject = cert.issuer = OpenSSL::X509::Name.parse("/CN=x")
+      cert.public_key = key
+      cert.not_before = Time.now - 10
+      cert.not_after = Time.now + 1000
+      cert.sign(key, "sha256")
+
+      saved = nil
+      store = OpenSSL::X509::Store.new
+      store.verify_callback = proc { |_, sctx| saved = sctx; raise "callback raised" }
+      ctx = OpenSSL::X509::StoreContext.new(store, cert)
+      begin
+        ctx.verify
+      rescue RuntimeError
+      end
+      assert_raise_with_message(RuntimeError, /out of scope/) { saved.error }
+    end;
   end
 
   def test_verify_purpose
@@ -329,15 +372,12 @@ class OpenSSL::TestX509Store < OpenSSL::TestCase
   end
 
   def test_add_cert_duplicate
-    # Up until OpenSSL 1.1.0, X509_STORE_add_{cert,crl}() returned an error
-    # if the given certificate is already in the X509_STORE
-    return if openssl?(1, 1, 0) || libressl?
     ca1 = OpenSSL::X509::Name.parse_rfc2253("CN=Root CA")
     ca1_key = Fixtures.pkey("rsa-1")
     ca1_cert = issue_cert(ca1, ca1_key, 1, [], nil, nil)
     store = OpenSSL::X509::Store.new
     store.add_cert(ca1_cert)
-    assert_raise(OpenSSL::X509::StoreError){
+    assert_nothing_raised {
       store.add_cert(ca1_cert)  # add same certificate twice
     }
 
@@ -349,7 +389,7 @@ class OpenSSL::TestX509Store < OpenSSL::TestCase
     crl2 = issue_crl(revoke_info, 2, now+1800, now+3600, [],
                      ca1_cert, ca1_key, "sha256")
     store.add_crl(crl1)
-    assert_raise(OpenSSL::X509::StoreError){
+    assert_nothing_raised {
       store.add_crl(crl2) # add CRL issued by same CA twice.
     }
   end
@@ -359,6 +399,24 @@ class OpenSSL::TestX509Store < OpenSSL::TestCase
     assert_raise(NoMethodError) { store.dup }
     ctx = OpenSSL::X509::StoreContext.new(store)
     assert_raise(NoMethodError) { ctx.dup }
+  end
+
+  def test_flags_clear
+    store = OpenSSL::X509::Store.new
+    assert_equal(0, store.flags)
+    store.flags = OpenSSL::X509::V_FLAG_CRL_CHECK
+    assert_equal(OpenSSL::X509::V_FLAG_CRL_CHECK, store.flags)
+    assert_warning(/clear_flags/) {
+      store.flags = OpenSSL::X509::V_FLAG_CRL_CHECK_ALL
+    }
+    assert_equal(
+      OpenSSL::X509::V_FLAG_CRL_CHECK|OpenSSL::X509::V_FLAG_CRL_CHECK_ALL,
+      store.flags
+    )
+    store.clear_flags(OpenSSL::X509::V_FLAG_CRL_CHECK_ALL)
+    assert_equal(OpenSSL::X509::V_FLAG_CRL_CHECK, store.flags)
+    store.clear_flags
+    assert_equal(0, store.flags)
   end
 
   def test_ctx_cleanup

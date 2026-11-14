@@ -2,14 +2,13 @@
 
 RSpec.describe "bundle cache with path" do
   it "is no-op when the path is within the bundle" do
-    build_lib "foo", :path => bundled_app("lib/foo")
+    build_lib "foo", path: bundled_app("lib/foo")
 
     install_gemfile <<-G
-      source "#{file_uri_for(gem_repo1)}"
+      source "https://gem.repo1"
       gem "foo", :path => '#{bundled_app("lib/foo")}'
     G
 
-    bundle "config set cache_all true"
     bundle :cache
     expect(bundled_app("vendor/cache/foo-1.0")).not_to exist
     expect(the_bundle).to include_gems "foo 1.0"
@@ -19,11 +18,10 @@ RSpec.describe "bundle cache with path" do
     build_lib "foo"
 
     install_gemfile <<-G
-      source "#{file_uri_for(gem_repo1)}"
+      source "https://gem.repo1"
       gem "foo", :path => '#{lib_path("foo-1.0")}'
     G
 
-    bundle "config set cache_all true"
     bundle :cache
     expect(bundled_app("vendor/cache/foo-1.0")).to exist
     expect(bundled_app("vendor/cache/foo-1.0/.bundlecache")).to be_file
@@ -35,14 +33,13 @@ RSpec.describe "bundle cache with path" do
     libname = File.basename(bundled_app) + "_gem"
     libpath = File.join(File.dirname(bundled_app), libname)
 
-    build_lib libname, :path => libpath
+    build_lib libname, path: libpath
 
     install_gemfile <<-G
-      source "#{file_uri_for(gem_repo1)}"
+      source "https://gem.repo1"
       gem "#{libname}", :path => '#{libpath}'
     G
 
-    bundle "config set cache_all true"
     bundle :cache
     expect(bundled_app("vendor/cache/#{libname}")).to exist
     expect(bundled_app("vendor/cache/#{libname}/.bundlecache")).to be_file
@@ -54,11 +51,10 @@ RSpec.describe "bundle cache with path" do
     build_lib "foo"
 
     install_gemfile <<-G
-      source "#{file_uri_for(gem_repo1)}"
+      source "https://gem.repo1"
       gem "foo", :path => '#{lib_path("foo-1.0")}'
     G
 
-    bundle "config set cache_all true"
     bundle :cache
 
     build_lib "foo" do |s|
@@ -77,11 +73,10 @@ RSpec.describe "bundle cache with path" do
     build_lib "foo"
 
     install_gemfile <<-G
-      source "#{file_uri_for(gem_repo1)}"
+      source "https://gem.repo1"
       gem "foo", :path => '#{lib_path("foo-1.0")}'
     G
 
-    bundle "config set cache_all true"
     bundle :cache
 
     expect(bundled_app("vendor/cache/foo-1.0")).to exist
@@ -89,7 +84,7 @@ RSpec.describe "bundle cache with path" do
     build_lib "bar"
 
     install_gemfile <<-G
-      source "#{file_uri_for(gem_repo1)}"
+      source "https://gem.repo1"
       gem "bar", :path => '#{lib_path("bar-1.0")}'
     G
 
@@ -97,73 +92,55 @@ RSpec.describe "bundle cache with path" do
     expect(bundled_app("vendor/cache/foo-1.0")).not_to exist
   end
 
-  it "does not cache path gems by default", :bundler => "< 3" do
+  it "removes stale entries whose names look like home directory expansions" do
     build_lib "foo"
 
     install_gemfile <<-G
-      source "#{file_uri_for(gem_repo1)}"
+      source "https://gem.repo1"
       gem "foo", :path => '#{lib_path("foo-1.0")}'
     G
+
+    bundle :cache
+
+    tilde_entry = bundled_app("vendor/cache/~")
+    # a name no account can have, so a regression cannot resolve it to a real home
+    tilde_user_entry = bundled_app("vendor/cache/~nonexistent.user")
+    [tilde_entry, tilde_user_entry].each do |entry|
+      FileUtils.mkdir_p entry
+      FileUtils.touch entry.join(".bundlecache")
+    end
+
+    bundle :cache
+
+    expect(tilde_entry).not_to exist
+    expect(tilde_user_entry).not_to exist
+    expect(home).to exist
+  end
+
+  it "does not cache path gems if cache_all is set to false" do
+    build_lib "foo"
+
+    install_gemfile <<-G
+      source "https://gem.repo1"
+      gem "foo", :path => '#{lib_path("foo-1.0")}'
+    G
+    bundle_config "cache_all false"
 
     bundle :cache
     expect(err).to be_empty
     expect(bundled_app("vendor/cache/foo-1.0")).not_to exist
   end
 
-  it "caches path gems by default", :bundler => "3" do
+  it "caches path gems by default" do
     build_lib "foo"
 
     install_gemfile <<-G
-      source "#{file_uri_for(gem_repo1)}"
+      source "https://gem.repo1"
       gem "foo", :path => '#{lib_path("foo-1.0")}'
     G
 
     bundle :cache
     expect(err).to be_empty
     expect(bundled_app("vendor/cache/foo-1.0")).to exist
-  end
-
-  it "stores the given flag" do
-    build_lib "foo"
-
-    install_gemfile <<-G
-      source "#{file_uri_for(gem_repo1)}"
-      gem "foo", :path => '#{lib_path("foo-1.0")}'
-    G
-
-    bundle "config set cache_all true"
-    bundle :cache
-    build_lib "bar"
-
-    install_gemfile <<-G
-      source "#{file_uri_for(gem_repo1)}"
-      gem "foo", :path => '#{lib_path("foo-1.0")}'
-      gem "bar", :path => '#{lib_path("bar-1.0")}'
-    G
-
-    bundle :cache
-    expect(bundled_app("vendor/cache/bar-1.0")).to exist
-  end
-
-  it "can rewind chosen configuration" do
-    build_lib "foo"
-
-    install_gemfile <<-G
-      source "#{file_uri_for(gem_repo1)}"
-      gem "foo", :path => '#{lib_path("foo-1.0")}'
-    G
-
-    bundle "config set cache_all true"
-    bundle :cache
-    build_lib "baz"
-
-    gemfile <<-G
-      source "#{file_uri_for(gem_repo1)}"
-      gem "foo", :path => '#{lib_path("foo-1.0")}'
-      gem "baz", :path => '#{lib_path("baz-1.0")}'
-    G
-
-    bundle "cache --no-all", :raise_on_error => false
-    expect(bundled_app("vendor/cache/baz-1.0")).not_to exist
   end
 end

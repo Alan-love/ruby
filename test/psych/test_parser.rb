@@ -16,13 +16,46 @@ module Psych
 
       (Handler.instance_methods(true) -
        Object.instance_methods).each do |m|
-        class_eval %{
+        class_eval <<~RUBY, __FILE__, __LINE__ + 1
           def #{m} *args
             super
             @marks << @parser.mark if @parser
             @calls << [:#{m}, args]
           end
-        }
+        RUBY
+      end
+    end
+
+    # Calls Parser#parse again, once, from inside a callback of the parse it is
+    # already handling.
+    class ReentrantHandler < Handler
+      attr_accessor :parser, :inner_yaml
+      attr_reader :inner_error, :scalars, :empty_calls
+
+      def initialize
+        @parser      = nil
+        @inner_yaml  = nil
+        @inner_error = nil
+        @scalars     = []
+        @empty_calls = 0
+      end
+
+      def empty
+        @empty_calls += 1
+        raise "handler#empty keeps being called, the parse loop is not terminating" if @empty_calls > 1000
+      end
+
+      def scalar value, anchor, tag, plain, quoted, style
+        @scalars << value
+
+        inner, @inner_yaml = @inner_yaml, nil
+        return unless inner
+
+        begin
+          @parser.parse inner
+        rescue => e
+          @inner_error = e
+        end
       end
     end
 
@@ -70,6 +103,56 @@ module Psych
       end
     end
 
+    def test_event_location_exception_is_propagated
+      klass = Class.new(Psych::Handler) do
+        def event_location start_line, start_column, end_line, end_column
+          raise "from event_location"
+        end
+      end
+
+      parser = Psych::Parser.new klass.new
+      2.times do
+        ex = assert_raise(RuntimeError) { parser.parse "--- hello\n" }
+        assert_equal "from event_location", ex.message
+      end
+    end
+
+    def test_parse_is_not_reentrant
+      pend "Failing on JRuby" if RUBY_PLATFORM =~ /java/
+
+      handler = ReentrantHandler.new
+      handler.inner_yaml = "--- inner\n"
+      parser = Psych::Parser.new handler
+      handler.parser = parser
+
+      parser.parse "--- outer\n"
+
+      assert_kind_of Psych::Exception, handler.inner_error
+      assert_equal ['outer'], handler.scalars
+      assert_equal 0, handler.empty_calls
+
+      # The in-use flag is cleared when the parse finishes, so the same parser
+      # can be used again afterwards.
+      handler.scalars.clear
+      parser.parse "--- second\n"
+      assert_equal ['second'], handler.scalars
+    end
+
+    def test_parse_is_not_reentrant_with_invalid_inner_document
+      pend "Failing on JRuby" if RUBY_PLATFORM =~ /java/
+
+      handler = ReentrantHandler.new
+      handler.inner_yaml = "--- \x00bad\n"
+      parser = Psych::Parser.new handler
+      handler.parser = parser
+
+      parser.parse "--- outer\n"
+
+      assert_kind_of Psych::Exception, handler.inner_error
+      assert_equal ['outer'], handler.scalars
+      assert_equal 0, handler.empty_calls
+    end
+
     def test_multiparse
       3.times do
         @parser.parse '--- foo'
@@ -84,7 +167,10 @@ module Psych
     end
 
     def test_line_numbers
+      omit 'libfyaml reports event marks differently from libyaml' if libfyaml?
       assert_equal 0, @parser.mark.line
+      pend "Failing on JRuby" if RUBY_PLATFORM =~ /java/
+
       @parser.parse "---\n- hello\n- world"
       line_calls = @handler.marks.map(&:line).zip(@handler.calls.map(&:first))
       assert_equal [
@@ -109,7 +195,10 @@ module Psych
     end
 
     def test_column_numbers
+      omit 'libfyaml reports event marks differently from libyaml' if libfyaml?
       assert_equal 0, @parser.mark.column
+      pend "Failing on JRuby" if RUBY_PLATFORM =~ /java/
+
       @parser.parse "---\n- hello\n- world"
       col_calls = @handler.marks.map(&:column).zip(@handler.calls.map(&:first))
       assert_equal [
@@ -134,7 +223,10 @@ module Psych
     end
 
     def test_index_numbers
+      omit 'libfyaml reports event marks differently from libyaml' if libfyaml?
       assert_equal 0, @parser.mark.index
+      pend "Failing on JRuby" if RUBY_PLATFORM =~ /java/
+
       @parser.parse "---\n- hello\n- world"
       idx_calls = @handler.marks.map(&:index).zip(@handler.calls.map(&:first))
       assert_equal [
@@ -167,6 +259,45 @@ module Psych
       assert_equal tadpole, @parser.handler.calls.find { |method, args| method == :scalar }[1].first
     end
 
+    # BOM + multi-line mapping used to lose every line after the first one
+    # https://github.com/ruby/psych/issues/331
+    def test_bom_multiline_utf8
+      @parser.parse "\uFEFFa: b\nc: d\n"
+      assert_equal %w[a b c d], scalars(@parser.handler)
+    end
+
+    def test_bom_multiline_utf16
+      %w[UTF-16LE UTF-16BE].each do |enc|
+        handler = EventCatcher.new
+        Psych::Parser.new(handler).parse "\uFEFFa: b\nc: d\n".encode(enc)
+        assert_equal %w[a b c d], scalars(handler), enc
+      end
+    end
+
+    def test_bom_multiline_utf32
+      %w[UTF-32LE UTF-32BE].each do |enc|
+        handler = EventCatcher.new
+        Psych::Parser.new(handler).parse "\uFEFFa: b\nc: d\n".encode(enc)
+        assert_equal %w[a b c d], scalars(handler), enc
+      end
+    end
+
+    def test_bom_multiline_io
+      @parser.parse StringIO.new("\uFEFFa: b\nc: d\n")
+      assert_equal %w[a b c d], scalars(@parser.handler)
+    end
+
+    def test_bom_only
+      @parser.parse "\uFEFF"
+      assert_equal [], scalars(@parser.handler)
+    end
+
+    def test_io_without_bom_is_not_modified
+      io = StringIO.new "a: b\nc: d\n".freeze
+      @parser.parse io
+      assert_equal %w[a b c d], scalars(@parser.handler)
+    end
+
     def test_external_encoding
       tadpole = 'おたまじゃくし'
 
@@ -190,6 +321,48 @@ module Psych
       assert_called :start_stream
       assert_called :scalar
       assert_called :end_stream
+    end
+
+    def test_parse_io_returns_more_bytes_than_requested
+      # An IO-like source whose #read returns more bytes than the size it was
+      # asked for must not overflow libyaml's read buffer.
+      io = Object.new
+      def io.external_encoding; Encoding::UTF_8 end
+      def io.read len
+        return nil if @done
+        @done = true
+        "--- a\n" + ("#" * (len + (1 << 20)))
+      end
+
+      # CRuby clamps the over-read and parses; JRuby's parser rejects the
+      # over-reading IO with an IOError. Either way there is no overflow.
+      begin
+        @parser.parse io
+      rescue IOError
+        return
+      end
+      assert_called :start_stream
+      assert_called :scalar
+      assert_called :end_stream
+    end
+
+    def test_parse_io_returns_more_bytes_than_requested_multibyte
+      # The over-read is rounded down to a character boundary so a multibyte
+      # character is never split when the copy is clamped.
+      io = Object.new
+      def io.external_encoding; Encoding::UTF_8 end
+      def io.read len
+        return nil if @done
+        @done = true
+        "--- a\n#" + ("あ" * (len + (1 << 20)))
+      end
+
+      begin
+        @parser.parse io
+      rescue IOError
+        return
+      end
+      assert_called :scalar
     end
 
     def test_syntax_error
@@ -352,6 +525,8 @@ module Psych
     end
 
     def test_event_location
+      pend "Failing on JRuby" if RUBY_PLATFORM =~ /java/
+
       @parser.parse "foo:\n" \
                     "  barbaz: [1, 2]"
 
@@ -374,6 +549,29 @@ module Psych
                      [:end_mapping, [2, 0, 2, 0]],
                      [:end_document, [2, 0, 2, 0]],
                      [:end_stream, [2, 0, 2, 0]]], events
+    end
+
+    if Psych::Parser.method_defined?(:code_point_limit)
+      def test_code_point_limit
+        yaml = "foo: bar\n" * 500_000
+        assert_raise(org.snakeyaml.engine.v2.exceptions.YamlEngineException) do
+          Psych.load(yaml)
+        end
+
+        assert_nothing_raised do
+          begin
+            old_code_point_limit, Psych::Parser.code_point_limit = Psych::Parser::code_point_limit, 5_000_000
+
+            Psych.load(yaml)
+          ensure
+            Psych::Parser.code_point_limit = old_code_point_limit
+          end
+        end
+      end
+    end
+
+    def scalars handler
+      handler.calls.select { |method, _| method == :scalar }.map { |_, args| args.first }
     end
 
     def assert_called call, with = nil, parser = @parser

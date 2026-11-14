@@ -86,13 +86,13 @@ tests = [
   [ 'putobject',            %q{ /(?<x>x)/ =~ "x"; x == "x" }, ],
 
   [ 'putspecialobject',         %q{ {//=>true}[//] }, ],
-  [ 'putstring',                %q{ "true" }, ],
+  [ 'dupstring',                %q{ "true" }, ],
   [ 'tostring / concatstrings', %q{ "#{true}" }, ],
   [ 'toregexp',                 %q{ /#{true}/ =~ "true" && $~ }, ],
   [ 'intern',                   %q{ :"#{true}" }, ],
 
   [ 'newarray',    %q{ ["true"][0] }, ],
-  [ 'newarraykwsplat', %q{ [**{x:'true'}][0][:x] }, ],
+  [ 'pushtoarraykwsplat', %q{ [**{x:'true'}][0][:x] }, ],
   [ 'duparray',    %q{ [ true ][0] }, ],
   [ 'expandarray', %q{ y = [ true, false, nil ]; x, = y; x }, ],
   [ 'expandarray', %q{ y = [ true, false, nil ]; x, *z = y; x }, ],
@@ -214,9 +214,24 @@ tests = [
     'true'.freeze
   },
 
-  [ 'opt_newarray_max', %q{ [ ].max.nil? }, ],
-  [ 'opt_newarray_max', %q{ [1, x = 2, 3].max == 3 }, ],
-  [ 'opt_newarray_max', <<-'},', ], # {
+  [ 'opt_duparray_send', %q{ x = :a; [:a, :b].include?(x) }, ],
+  [ 'opt_duparray_send', <<-'},', ], # {
+    class Array
+      def include?(i)
+        i == 1
+      end
+    end
+    x = 1
+    [:a, :b].include?(x)
+  },
+
+  [ 'opt_newarray_send', %q{ ![ ].hash.nil? }, ],
+
+  [ 'opt_newarray_send', %q{ v=2; [1, Object.new, 2].include?(v) }, ],
+
+  [ 'opt_newarray_send', %q{ [ ].max.nil? }, ],
+  [ 'opt_newarray_send', %q{ [1, x = 2, 3].max == 3 }, ],
+  [ 'opt_newarray_send', <<-'},', ], # {
     class Array
       def max
         true
@@ -224,15 +239,57 @@ tests = [
     end
     [1, x = 2, 3].max
   },
-  [ 'opt_newarray_min', %q{ [ ].min.nil? }, ],
-  [ 'opt_newarray_min', %q{ [3, x = 2, 1].min == 1 }, ],
-  [ 'opt_newarray_min', <<-'},', ], # {
+  [ 'opt_newarray_send', %q{ [ ].min.nil? }, ],
+  [ 'opt_newarray_send', %q{ [3, x = 2, 1].min == 1 }, ],
+  [ 'opt_newarray_send', <<-'},', ], # {
     class Array
       def min
         true
       end
     end
     [3, x = 2, 1].min
+  },
+  [ 'opt_newarray_send', %q{ v = 1.23; [v, v*2].pack("E*").unpack("E*") == [v, v*2] }, ],
+  [ 'opt_newarray_send', %q{ v = 4.56; b = +"x"; [v, v*2].pack("E*", buffer: b); b[1..].unpack("E*") == [v, v*2] }, ],
+  [ 'opt_newarray_send', <<-'},', ], # {
+    v = 7.89;
+    b = +"x";
+    class Array
+      alias _pack pack
+      def pack(s, buffer: nil, prefix: "y")
+        buffer ||= +"b"
+        buffer << prefix
+        _pack(s, buffer: buffer)
+      end
+    end
+    tests = []
+
+    ret = [v].pack("E*", prefix: "z")
+    tests << (ret[0..1] == "bz")
+    tests << (ret[2..].unpack("E*") == [v])
+
+    ret = [v].pack("E*")
+    tests << (ret[0..1] == "by")
+    tests << (ret[2..].unpack("E*") == [v])
+
+    [v, v*2, v*3].pack("E*", buffer: b)
+    tests << (b[0..1] == "xy")
+    tests << (b[2..].unpack("E*") == [v, v*2, v*3])
+
+    class Array
+      def pack(_fmt, buffer:) = buffer
+    end
+
+    b = nil
+    tests << [v].pack("E*", buffer: b).nil?
+
+    class Array
+      def pack(_fmt, **kw) = kw.empty?
+    end
+
+    tests << [v].pack("E*") == true
+
+    tests.all? or puts tests
   },
 
   [ 'throw',        %q{ false.tap { break true } }, ],
@@ -352,7 +409,7 @@ tests = [
   [ 'opt_ge', %q{ +0.0.next_float >= 0.0 }, ],
   [ 'opt_ge', %q{              ?z >= ?a }, ],
 
-  [ 'opt_ltlt', %q{  '' << 'true' }, ],
+  [ 'opt_ltlt', %q{  +'' << 'true' }, ],
   [ 'opt_ltlt', %q{ ([] << 'true').join }, ],
   [ 'opt_ltlt', %q{ (1 << 31) == 2147483648 }, ],
 
@@ -361,18 +418,13 @@ tests = [
   [ 'opt_aref', %q{ 'true'[0] == ?t }, ],
   [ 'opt_aset', %q{ [][0] = true }, ],
   [ 'opt_aset', %q{ {}[0] = true }, ],
-  [ 'opt_aset', %q{ x = 'frue'; x[0] = 't'; x }, ],
+  [ 'opt_aset', %q{ x = +'frue'; x[0] = 't'; x }, ],
   [ 'opt_aset', <<-'},', ], # {
     # opt_aref / opt_aset mixup situation
     class X; def x; {}; end; end
     x = X.new
     x&.x[true] ||= true         # here
   },
-
-  [ 'opt_aref_with', %q{ { 'true' => true }['true'] }, ],
-  [ 'opt_aref_with', %q{ Struct.new(:nil).new['nil'].nil? }, ],
-  [ 'opt_aset_with', %q{ {}['true'] = true }, ],
-  [ 'opt_aset_with', %q{ Struct.new(:true).new['true'] = true }, ],
 
   [ 'opt_length',  %q{   'true'       .length == 4 }, ],
   [ 'opt_length',  %q{   :true        .length == 4 }, ],

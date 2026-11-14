@@ -7,11 +7,14 @@
 
 = Licence
   This program is licensed under the same licence as Ruby.
-  (See the file 'LICENCE'.)
+  (See the file 'COPYING'.)
 =end
 
 require "openssl/buffering"
-require "io/nonblock"
+
+if defined?(OpenSSL::SSL)
+
+require "io/wait" if RUBY_VERSION < "3.2"
 require "ipaddr"
 require "socket"
 
@@ -19,7 +22,6 @@ module OpenSSL
   module SSL
     class SSLContext
       DEFAULT_PARAMS = { # :nodoc:
-        :min_version => OpenSSL::SSL::TLS1_VERSION,
         :verify_mode => OpenSSL::SSL::VERIFY_PEER,
         :verify_hostname => true,
         :options => -> {
@@ -30,28 +32,9 @@ module OpenSSL
         }.call
       }
 
-      if defined?(OpenSSL::PKey::DH)
-        DEFAULT_2048 = OpenSSL::PKey::DH.new <<-_end_of_pem_
------BEGIN DH PARAMETERS-----
-MIIBCAKCAQEA7E6kBrYiyvmKAMzQ7i8WvwVk9Y/+f8S7sCTN712KkK3cqd1jhJDY
-JbrYeNV3kUIKhPxWHhObHKpD1R84UpL+s2b55+iMd6GmL7OYmNIT/FccKhTcveab
-VBmZT86BZKYyf45hUF9FOuUM9xPzuK3Vd8oJQvfYMCd7LPC0taAEljQLR4Edf8E6
-YoaOffgTf5qxiwkjnlVZQc3whgnEt9FpVMvQ9eknyeGB5KHfayAc3+hUAvI3/Cr3
-1bNveX5wInh5GDx1FGhKBZ+s1H+aedudCm7sCgRwv8lKWYGiHzObSma8A86KG+MD
-7Lo5JquQ3DlBodj3IDyPrxIv96lvRPFtAwIBAg==
------END DH PARAMETERS-----
-        _end_of_pem_
-        private_constant :DEFAULT_2048
-
-        DEFAULT_TMP_DH_CALLBACK = lambda { |ctx, is_export, keylen| # :nodoc:
-          warn "using default DH parameters." if $VERBOSE
-          DEFAULT_2048
-        }
-      end
-
-      if !(OpenSSL::OPENSSL_VERSION.start_with?("OpenSSL") &&
-           OpenSSL::OPENSSL_VERSION_NUMBER >= 0x10100000)
+      if !OpenSSL::OPENSSL_VERSION.start_with?("OpenSSL")
         DEFAULT_PARAMS.merge!(
+          min_version: OpenSSL::SSL::TLS1_VERSION,
           ciphers: %w{
             ECDHE-ECDSA-AES128-GCM-SHA256
             ECDHE-RSA-AES128-GCM-SHA256
@@ -83,32 +66,45 @@ YoaOffgTf5qxiwkjnlVZQc3whgnEt9FpVMvQ9eknyeGB5KHfayAc3+hUAvI3/Cr3
             AES256-SHA256
             AES128-SHA
             AES256-SHA
-          }.join(":"),
+          }.join(":").freeze,
         )
       end
+      DEFAULT_PARAMS.freeze
 
       DEFAULT_CERT_STORE = OpenSSL::X509::Store.new # :nodoc:
       DEFAULT_CERT_STORE.set_default_paths
-      DEFAULT_CERT_STORE.flags = OpenSSL::X509::V_FLAG_CRL_CHECK_ALL
 
-      # A callback invoked when DH parameters are required for ephemeral DH key
-      # exchange.
+      # A callback invoked during the server-side handshake when the client
+      # sends the Server Name Indication (SNI) extension.
       #
-      # The callback is invoked with the SSLSocket, a
-      # flag indicating the use of an export cipher and the keylength
-      # required.
+      # The callback is invoked with an SSLSocket and the server name requested
+      # by the client as a String.
       #
-      # The callback must return an OpenSSL::PKey::DH instance of the correct
-      # key length.
+      # A typical use case is to select the appropriate server certificate.
+      # The callback can use SSLSocket#add_certificate to add certificates and
+      # their corresponding private keys. It should return +nil+ to continue
+      # the handshake and notify the client that the server name is accepted.
       #
-      # <b>Deprecated in version 3.0.</b> Use #tmp_dh= instead.
-      attr_accessor :tmp_dh_callback
-
-      # A callback invoked at connect time to distinguish between multiple
-      # server names.
+      # Alternatively, the callback can return an SSLContext to switch the
+      # context used for the connection. However, doing so is discouraged
+      # because the underlying \OpenSSL API SSL_set_SSL_CTX() has complex and
+      # inconsistent semantics.
       #
-      # The callback is invoked with an SSLSocket and a server name.  The
-      # callback must return an SSLContext for the server name or nil.
+      # See also the man page SSL_CTX_set_tlsext_servername_callback(3).
+      #
+      # === Example
+      #   ctx = OpenSSL::SSL::SSLContext.new
+      #   ctx.servername_cb = proc do |ssl_socket, server_name|
+      #     if server_name == "example.com"
+      #       cert = OpenSSL::X509::Certificate.new(File.read("cert.pem"))
+      #       privkey = OpenSSL::PKey.read(File.read("cert_privkey.pem"))
+      #       ssl_socket.add_certificate(cert, privkey)
+      #     else
+      #       # Aborts the handshake with an "unrecognized_name" alert.
+      #       raise "unknown SNI hostname: #{server_name}"
+      #     end
+      #     nil
+      #   end
       attr_accessor :servername_cb
 
       # call-seq:
@@ -122,7 +118,6 @@ YoaOffgTf5qxiwkjnlVZQc3whgnEt9FpVMvQ9eknyeGB5KHfayAc3+hUAvI3/Cr3
       # that this form is deprecated. New applications should use #min_version=
       # and #max_version= as necessary.
       def initialize(version = nil)
-        self.options |= OpenSSL::SSL::OP_ALL
         self.ssl_version = version if version
         self.verify_mode = OpenSSL::SSL::VERIFY_NONE
         self.verify_hostname = false
@@ -142,51 +137,21 @@ YoaOffgTf5qxiwkjnlVZQc3whgnEt9FpVMvQ9eknyeGB5KHfayAc3+hUAvI3/Cr3
       # used.
       def set_params(params={})
         params = DEFAULT_PARAMS.merge(params)
-        self.options = params.delete(:options) # set before min_version/max_version
+        self.options |= params.delete(:options) # set before min_version/max_version
         params.each{|name, value| self.__send__("#{name}=", value) }
         if self.verify_mode != OpenSSL::SSL::VERIFY_NONE
           unless self.ca_file or self.ca_path or self.cert_store
-            self.cert_store = DEFAULT_CERT_STORE
+            if not defined?(Ractor) or Ractor.current == Ractor.main
+              self.cert_store = DEFAULT_CERT_STORE
+            else
+              self.cert_store = Ractor.current[:__openssl_default_store__] ||=
+                OpenSSL::X509::Store.new.tap { |store|
+                  store.set_default_paths
+                }
+            end
           end
         end
         return params
-      end
-
-      # call-seq:
-      #    ctx.min_version = OpenSSL::SSL::TLS1_2_VERSION
-      #    ctx.min_version = :TLS1_2
-      #    ctx.min_version = nil
-      #
-      # Sets the lower bound on the supported SSL/TLS protocol version. The
-      # version may be specified by an integer constant named
-      # OpenSSL::SSL::*_VERSION, a Symbol, or +nil+ which means "any version".
-      #
-      # Be careful that you don't overwrite OpenSSL::SSL::OP_NO_{SSL,TLS}v*
-      # options by #options= once you have called #min_version= or
-      # #max_version=.
-      #
-      # === Example
-      #   ctx = OpenSSL::SSL::SSLContext.new
-      #   ctx.min_version = OpenSSL::SSL::TLS1_1_VERSION
-      #   ctx.max_version = OpenSSL::SSL::TLS1_2_VERSION
-      #
-      #   sock = OpenSSL::SSL::SSLSocket.new(tcp_sock, ctx)
-      #   sock.connect # Initiates a connection using either TLS 1.1 or TLS 1.2
-      def min_version=(version)
-        set_minmax_proto_version(version, @max_proto_version ||= nil)
-        @min_proto_version = version
-      end
-
-      # call-seq:
-      #    ctx.max_version = OpenSSL::SSL::TLS1_2_VERSION
-      #    ctx.max_version = :TLS1_2
-      #    ctx.max_version = nil
-      #
-      # Sets the upper bound of the supported SSL/TLS protocol version. See
-      # #min_version= for the possible values.
-      def max_version=(version)
-        set_minmax_proto_version(@min_proto_version ||= nil, version)
-        @max_proto_version = version
       end
 
       # call-seq:
@@ -213,8 +178,7 @@ YoaOffgTf5qxiwkjnlVZQc3whgnEt9FpVMvQ9eknyeGB5KHfayAc3+hUAvI3/Cr3
         end
         version = METHODS_MAP[meth.intern] or
           raise ArgumentError, "unknown SSL method `%s'" % meth
-        set_minmax_proto_version(version, version)
-        @min_proto_version = @max_proto_version = version
+        self.min_version = self.max_version = version
       end
 
       METHODS_MAP = {
@@ -249,6 +213,14 @@ YoaOffgTf5qxiwkjnlVZQc3whgnEt9FpVMvQ9eknyeGB5KHfayAc3+hUAvI3/Cr3
         to_io.peeraddr
       end
 
+      def local_address
+        to_io.local_address
+      end
+
+      def remote_address
+        to_io.remote_address
+      end
+
       def setsockopt(level, optname, optval)
         to_io.setsockopt(level, optname, optval)
       end
@@ -267,6 +239,54 @@ YoaOffgTf5qxiwkjnlVZQc3whgnEt9FpVMvQ9eknyeGB5KHfayAc3+hUAvI3/Cr3
 
       def do_not_reverse_lookup=(flag)
         to_io.do_not_reverse_lookup = flag
+      end
+
+      def close_on_exec=(value)
+        to_io.close_on_exec = value
+      end
+
+      def close_on_exec?
+        to_io.close_on_exec?
+      end
+
+      # Calls IO#wait on the underlying socket.
+      #
+      # Note that this method may block even when there is data immediately
+      # available to read, unlike IO#wait_readable.
+      def wait(*args)
+        to_io.wait(*args)
+      end
+
+      # Calls IO#wait_readable on the underlying socket.
+      #
+      # Note that this method may block even when there is data immediately
+      # available to read, unlike IO#wait_readable.
+      def wait_readable(*args)
+        to_io.wait_readable(*args)
+      end
+
+      # Calls IO#wait_writable on the underlying socket.
+      def wait_writable(*args)
+        to_io.wait_writable(*args)
+      end
+
+      if IO.method_defined?(:timeout)
+        def timeout
+          to_io.timeout
+        end
+
+        def timeout=(value)
+          to_io.timeout=(value)
+        end
+      else
+        def timeout
+          nil
+        end
+
+        def timeout=(value)
+          raise NotImplementedError,
+            "IO#timeout= is not available on this Ruby version"
+        end
       end
     end
 
@@ -340,7 +360,7 @@ YoaOffgTf5qxiwkjnlVZQc3whgnEt9FpVMvQ9eknyeGB5KHfayAc3+hUAvI3/Cr3
       parts = san_component.split("*", -1)
 
       return false if parts.size > 2
-      return san_component == domain_component if parts.size == 1
+      return san_component == domain_component if parts.size <= 1
 
       # RFC 6125, section 6.4.3, subitem 3.
       # The client SHOULD NOT attempt to match a presented identifier
@@ -384,6 +404,169 @@ YoaOffgTf5qxiwkjnlVZQc3whgnEt9FpVMvQ9eknyeGB5KHfayAc3+hUAvI3/Cr3
         io.close if sync_close
       end
 
+      # Ruby 3.2
+      IO_TimeoutError = defined?(IO::TimeoutError) ? IO::TimeoutError : IOError
+      private_constant :IO_TimeoutError
+
+      private def blocking(timeout = self.timeout)
+        if timeout
+          remaining = timeout
+          start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        end
+
+        while true
+          ret = yield
+          if :wait_readable == ret
+            io.wait_readable(remaining) or raise IO_TimeoutError,
+              "Timed out while waiting to become readable!"
+          elsif :wait_writable == ret
+            io.wait_writable(remaining) or raise IO_TimeoutError,
+              "Timed out while waiting to become writable!"
+          else
+            return ret
+          end
+
+          if timeout
+            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            remaining = [0, timeout - (now - start)].max
+          end
+        end
+      end
+
+      private def check_nonblock(ret)
+        if :wait_readable == ret
+          raise SSLErrorWaitReadable, "read would block"
+        elsif :wait_writable == ret
+          raise SSLErrorWaitWritable, "write would block"
+        else
+          ret
+        end
+      end
+
+      # :call-seq:
+      #    ssl.connect(timeout: ssl.timeout) -> self
+      #
+      # Initiates an SSL/TLS handshake with a server.
+      #
+      # If _timeout_ is specified, and if the handshake does not complete
+      # within _timeout_ seconds, IO::TimeoutError is raised.
+      def connect(timeout: self.timeout)
+        blocking(timeout) { ssl_connect }
+      end
+
+      # :call-seq:
+      #    ssl.connect_nonblock -> self
+      #    ssl.connect_nonblock(exception: false) -> self, :wait_readable, or :wait_writable
+      #
+      # Initiates the SSL/TLS handshake as a client in non-blocking manner.
+      #
+      #   # emulates blocking connect
+      #   begin
+      #     ssl.connect_nonblock
+      #   rescue IO::WaitReadable
+      #     IO.select([s2])
+      #     retry
+      #   rescue IO::WaitWritable
+      #     IO.select(nil, [s2])
+      #     retry
+      #   end
+      #
+      # By specifying a keyword argument _exception_ to +false+, you can
+      # indicate that connect_nonblock should not raise an IO::WaitReadable or
+      # IO::WaitWritable exception, but return the symbol +:wait_readable+ or
+      # +:wait_writable+ instead.
+      def connect_nonblock(exception: true)
+        ret = ssl_connect
+        check_nonblock(ret) if exception
+        ret
+      end
+
+      # :call-seq:
+      #    ssl.accept(timeout: ssl.timeout) -> self
+      #
+      # Waits for a SSL/TLS client to initiate a handshake.
+      #
+      # If _timeout_ is specified, and if the handshake does not complete
+      # within _timeout_ seconds, IO::TimeoutError is raised.
+      def accept(timeout: self.timeout)
+        blocking(timeout) { ssl_accept }
+      end
+
+      # :call-seq:
+      #    ssl.accept_nonblock -> self
+      #    ssl.accept_nonblock(exception: false) -> self, :wait_readable, or :wait_writable
+      #
+      # Initiates the SSL/TLS handshake as a server in non-blocking manner.
+      #
+      #   # emulates blocking accept
+      #   begin
+      #     ssl.accept_nonblock
+      #   rescue IO::WaitReadable
+      #     IO.select([s2])
+      #     retry
+      #   rescue IO::WaitWritable
+      #     IO.select(nil, [s2])
+      #     retry
+      #   end
+      #
+      # By specifying a keyword argument _exception_ to +false+, you can
+      # indicate that accept_nonblock should not raise an IO::WaitReadable or
+      # IO::WaitWritable exception, but return the symbol +:wait_readable+ or
+      # +:wait_writable+ instead.
+      def accept_nonblock(exception: true)
+        ret = ssl_accept
+        check_nonblock(ret) if exception
+        ret
+      end
+
+      # :call-seq:
+      #    ssl.sysread(length) -> string
+      #    ssl.sysread(length, buffer) -> buffer
+      #
+      # Reads _length_ bytes from the SSL connection.  If a pre-allocated
+      # _buffer_ is provided the data will be written into it.
+      def sysread(length, buffer = nil)
+        buffer ||= string_new_capacity(length)
+        blocking {
+          ssl_read(length, buffer) or raise EOFError, "end of file reached"
+        }
+      end
+
+      # :call-seq:
+      #    ssl.sysread_nonblock(length) -> string
+      #    ssl.sysread_nonblock(length, buffer) -> buffer
+      #    ssl.sysread_nonblock(length, buffer, exception: false) -> buffer, nil, :wait_readable, or :wait_writable
+      #
+      # A non-blocking version of #sysread.
+      private def sysread_nonblock(length, buffer = nil, exception: true)
+        buffer ||= string_new_capacity(length)
+        ret = ssl_read(length, buffer)
+        if exception
+          raise EOFError, "end of file reached" if ret.nil?
+          check_nonblock(ret)
+        end
+        ret
+      end
+
+      # :call-seq:
+      #    ssl.syswrite(string) -> Integer
+      #
+      # Writes _string_ to the SSL connection.
+      def syswrite(string)
+        blocking { ssl_write(string) }
+      end
+
+      # :call-seq:
+      #    ssl.syswrite_nonblock(string) -> Integer
+      #    ssl.syswrite_nonblock(string, exception: false) -> Integer, :wait_readable, or :wait_writable
+      #
+      # Writes _string_ to the SSL connection in a non-blocking manner.
+      private def syswrite_nonblock(string, exception: true)
+        ret = ssl_write(string)
+        check_nonblock(ret) if exception
+        ret
+      end
+
       # call-seq:
       #   ssl.post_connection_check(hostname) -> true
       #
@@ -418,6 +601,32 @@ YoaOffgTf5qxiwkjnlVZQc3whgnEt9FpVMvQ9eknyeGB5KHfayAc3+hUAvI3/Cr3
         nil
       end
 
+      # Close the stream for reading.
+      # This method is ignored by OpenSSL as there is no reasonable way to
+      # implement it, but exists for compatibility with IO.
+      def close_read
+        # Unsupported and ignored.
+        # Just don't read any more.
+      end
+
+      # Closes the stream for writing. The behavior of this method depends on
+      # the version of OpenSSL and the TLS protocol in use.
+      #
+      # - Sends a 'close_notify' alert to the peer.
+      # - Does not wait for the peer's 'close_notify' alert in response.
+      #
+      # In TLS 1.2 and earlier:
+      # - On receipt of a 'close_notify' alert, responds with a 'close_notify'
+      #   alert of its own and close down the connection immediately,
+      #   discarding any pending writes.
+      #
+      # Therefore, on TLS 1.2, this method will cause the connection to be
+      # completely shut down. On TLS 1.3, the connection will remain open for
+      # reading only.
+      def close_write
+        stop
+      end
+
       private
 
       def using_anon_cipher?
@@ -428,10 +637,6 @@ YoaOffgTf5qxiwkjnlVZQc3whgnEt9FpVMvQ9eknyeGB5KHfayAc3+hUAvI3/Cr3
 
       def client_cert_cb
         @context.client_cert_cb
-      end
-
-      def tmp_dh_callback
-        @context.tmp_dh_callback || OpenSSL::SSL::SSLContext::DEFAULT_TMP_DH_CALLBACK
       end
 
       def session_new_cb
@@ -477,9 +682,19 @@ YoaOffgTf5qxiwkjnlVZQc3whgnEt9FpVMvQ9eknyeGB5KHfayAc3+hUAvI3/Cr3
 
     ##
     # SSLServer represents a TCP/IP server socket with Secure Sockets Layer.
+    #
+    # *Deprecated.* Use TCPServer or Socket to accept a TCP connection, and
+    # then wrap it with OpenSSL::SSL::SSLSocket.
+    # See also OpenSSL::SSL::SSLSocket#accept.
     class SSLServer
       include SocketForwarder
-      # When true then #accept works exactly the same as TCPServer#accept
+
+      # When set to +true+, #accept will immediately perform the SSL/TLS
+      # handshake after accepting a TCP connection. Defaults to +true+.
+      #
+      # *NOTE*: #accept performs the SSL/TLS handshake synchronously. A slow
+      # client can therefore prevent the server from accepting new connections
+      # indefinitely. For this reason, SSLServer is deprecated.
       attr_accessor :start_immediately
 
       # Creates a new instance of SSLServer.
@@ -488,10 +703,10 @@ YoaOffgTf5qxiwkjnlVZQc3whgnEt9FpVMvQ9eknyeGB5KHfayAc3+hUAvI3/Cr3
       def initialize(svr, ctx)
         @svr = svr
         @ctx = ctx
-        unless ctx.session_id_context
+        if !ctx.frozen? && !ctx.session_id_context
           # see #6137 - session id may not exceed 32 bytes
           prng = ::Random.new($0.hash)
-          session_id = prng.bytes(16).unpack('H*')[0]
+          session_id = prng.bytes(16).unpack1('H*')
           @ctx.session_id_context = session_id
         end
         @start_immediately = true
@@ -513,6 +728,8 @@ YoaOffgTf5qxiwkjnlVZQc3whgnEt9FpVMvQ9eknyeGB5KHfayAc3+hUAvI3/Cr3
       end
 
       # Works similar to TCPServer#accept.
+      #
+      # *NOTE*: SSLServer is deprecated. See #start_immediately for details.
       def accept
         # Socket#accept returns [socket, addrinfo].
         # TCPServer#accept returns a socket.
@@ -539,4 +756,6 @@ YoaOffgTf5qxiwkjnlVZQc3whgnEt9FpVMvQ9eknyeGB5KHfayAc3+hUAvI3/Cr3
       end
     end
   end
+end
+
 end

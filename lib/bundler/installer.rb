@@ -7,13 +7,7 @@ require_relative "installer/gem_installer"
 
 module Bundler
   class Installer
-    class << self
-      attr_accessor :ambiguous_gems
-
-      Installer.ambiguous_gems = []
-    end
-
-    attr_reader :post_install_messages
+    attr_reader :post_install_messages, :definition
 
     # Begins the installation process for Bundler.
     # For more information see the #run method on this class.
@@ -66,12 +60,15 @@ module Bundler
     # require paths and save them in a `setup.rb` file. See `bundle standalone --help` for more
     # information.
     def run(options)
-      create_bundle_path
+      Bundler.create_bundle_path
 
       ProcessLock.lock do
-        if Bundler.frozen_bundle?
-          @definition.ensure_equivalent_gemfile_and_lockfile(options[:deployment])
-        end
+        # Invalidate any stale gem specification cache from before we acquired the lock.
+        # Another process may have installed gems while we were waiting.
+        Gem::Specification.reset
+        @definition.sources.clear_cache
+
+        @definition.ensure_equivalent_gemfile_and_lockfile(options[:deployment])
 
         if @definition.dependencies.empty?
           Bundler.ui.warn "The Gemfile specifies no dependencies"
@@ -79,26 +76,35 @@ module Bundler
           return
         end
 
-        if resolve_if_needed(options)
+        if @definition.setup_domain!(options)
           ensure_specs_are_compatible!
           load_plugins
-          options.delete(:jobs)
-        else
-          options[:jobs] = 1 # to avoid the overhead of Bundler::Worker
         end
+        warn_on_default_gem_downgrades
         install(options)
 
         Gem::Specification.reset # invalidate gem specification cache so that installed gems are immediately available
+        # Drop the source caches too, since releasing resolution memory dropped
+        # the source indexes. A resolution happening after this point would
+        # otherwise rebuild them around a snapshot of installed gems taken
+        # before the install, and materialize against remote specs that don't
+        # know where the gems they stand for ended up.
+        @definition.sources.clear_cache
 
-        lock unless Bundler.frozen_bundle?
+        lock
         Standalone.new(options[:standalone], @definition).generate if options[:standalone]
       end
     end
 
     def generate_bundler_executable_stubs(spec, options = {})
+      if spec.name == "bundler"
+        Bundler.ui.warn "Bundler itself does not use binstubs because its version is selected by RubyGems"
+        return
+      end
+
       if options[:binstubs_cmd] && spec.executables.empty?
         options = {}
-        spec.runtime_dependencies.each do |dep|
+        Override.rewrite_dependencies(@definition.overrides, spec.name, spec.runtime_dependencies).each do |dep|
           bins = @definition.specs[dep].first.executables
           options[dep.name] = bins unless bins.empty?
         end
@@ -119,12 +125,10 @@ module Bundler
       relative_gemfile_path = relative_gemfile_path
       ruby_command = Thor::Util.ruby_command
       ruby_command = ruby_command
-      template_path = File.expand_path("../templates/Executable", __FILE__)
-      if spec.name == "bundler"
-        template_path += ".bundler"
-        spec.executables = %(bundle)
-      end
+      template_path = File.expand_path("templates/Executable", __dir__)
       template = File.read(template_path)
+
+      Bundler.mkdir_p(bin_path)
 
       exists = []
       spec.executables.each do |executable|
@@ -136,16 +140,12 @@ module Bundler
 
         mode = Gem.win_platform? ? "wb:UTF-8" : "w"
         require "erb"
-        content = if RUBY_VERSION >= "2.6"
-          ERB.new(template, :trim_mode => "-").result(binding)
-        else
-          ERB.new(template, nil, "-").result(binding)
-        end
+        content = ERB.new(template, trim_mode: "-").result(binding)
 
-        File.write(binstub_path, content, :mode => mode, :perm => 0o777 & ~File.umask)
+        File.write(binstub_path, content, mode: mode, perm: 0o777 & ~File.umask)
         if Gem.win_platform? || options[:all_platforms]
           prefix = "@ruby -x \"%~f0\" %*\n@exit /b %ERRORLEVEL%\n\n"
-          File.write("#{binstub_path}.cmd", prefix + content, :mode => mode)
+          File.write("#{binstub_path}.cmd", prefix + content, mode: mode)
         end
       end
 
@@ -172,9 +172,11 @@ module Bundler
       end
       standalone_path = Bundler.root.join(path).relative_path_from(bin_path)
       standalone_path = standalone_path
-      template = File.read(File.expand_path("../templates/Executable.standalone", __FILE__))
+      template = File.read(File.expand_path("templates/Executable.standalone", __dir__))
       ruby_command = Thor::Util.ruby_command
       ruby_command = ruby_command
+
+      Bundler.mkdir_p(bin_path)
 
       spec.executables.each do |executable|
         next if executable == "bundle"
@@ -183,16 +185,12 @@ module Bundler
 
         mode = Gem.win_platform? ? "wb:UTF-8" : "w"
         require "erb"
-        content = if RUBY_VERSION >= "2.6"
-          ERB.new(template, :trim_mode => "-").result(binding)
-        else
-          ERB.new(template, nil, "-").result(binding)
-        end
+        content = ERB.new(template, trim_mode: "-").result(binding)
 
-        File.write("#{bin_path}/#{executable}", content, :mode => mode, :perm => 0o755)
+        File.write("#{bin_path}/#{executable}", content, mode: mode, perm: 0o755)
         if Gem.win_platform? || options[:all_platforms]
           prefix = "@ruby -x \"%~f0\" %*\n@exit /b %ERRORLEVEL%\n\n"
-          File.write("#{bin_path}/#{executable}.cmd", prefix + content, :mode => mode)
+          File.write("#{bin_path}/#{executable}.cmd", prefix + content, mode: mode)
         end
       end
     end
@@ -204,85 +202,83 @@ module Bundler
     # that said, it's a rare situation (other than rake), and parallel
     # installation is SO MUCH FASTER. so we let people opt in.
     def install(options)
-      force = options["force"]
-      jobs = installation_parallelization(options)
-      install_in_parallel jobs, options[:standalone], force
-    end
-
-    def installation_parallelization(options)
-      if jobs = options.delete(:jobs)
-        return jobs
-      end
-
-      if jobs = Bundler.settings[:jobs]
-        return jobs
-      end
-
-      Bundler.settings.processor_count
-    end
-
-    def load_plugins
-      Bundler.rubygems.load_plugins
-
-      requested_path_gems = @definition.requested_specs.select {|s| s.source.is_a?(Source::Path) }
-      path_plugin_files = requested_path_gems.map do |spec|
-        begin
-          Bundler.rubygems.spec_matches_for_glob(spec, "rubygems_plugin#{Bundler.rubygems.suffix_pattern}")
-        rescue TypeError
-          error_message = "#{spec.name} #{spec.version} has an invalid gemspec"
-          raise Gem::InvalidSpecificationException, error_message
-        end
-      end.flatten
-      Bundler.rubygems.load_plugin_files(path_plugin_files)
-      Bundler.rubygems.load_env_plugins
-    end
-
-    def ensure_specs_are_compatible!
-      system_ruby = Bundler::RubyVersion.system
-      rubygems_version = Gem::Version.create(Gem::VERSION)
-      @definition.specs.each do |spec|
-        if required_ruby_version = spec.required_ruby_version
-          unless required_ruby_version.satisfied_by?(system_ruby.gem_version)
-            raise InstallError, "#{spec.full_name} requires ruby version #{required_ruby_version}, " \
-              "which is incompatible with the current version, #{system_ruby}"
-          end
-        end
-        next unless required_rubygems_version = spec.required_rubygems_version
-        unless required_rubygems_version.satisfied_by?(rubygems_version)
-          raise InstallError, "#{spec.full_name} requires rubygems version #{required_rubygems_version}, " \
-            "which is incompatible with the current version, #{rubygems_version}"
-        end
-      end
-    end
-
-    def install_in_parallel(size, standalone, force = false)
-      spec_installations = ParallelInstaller.call(self, @definition.specs, size, standalone, force)
+      standalone = options[:standalone]
+      force = options[:force]
+      local = options[:local] || options[:"prefer-local"]
+      jobs = Bundler.settings.installation_parallelization
+      specs = @definition.specs
+      # Installing default gems may need the remote index again to cache
+      # their .gem files, so keep resolution memory around in that case.
+      # The bundler spec itself is excluded because it comes from the
+      # metadata source and never goes through that path.
+      @definition.release_resolution_memory! if specs.none? {|s| s.default_gem? && s.source.is_a?(Source::Rubygems) }
+      spec_installations = ParallelInstaller.call(self, specs, jobs, standalone, force, local: local)
       spec_installations.each do |installation|
         post_install_messages[installation.name] = installation.post_install_message if installation.has_post_install_message?
       end
     end
 
-    def create_bundle_path
-      SharedHelpers.filesystem_access(Bundler.bundle_path.to_s) do |p|
-        Bundler.mkdir_p(p)
-      end unless Bundler.bundle_path.exist?
-    rescue Errno::EEXIST
-      raise PathError, "Could not install to path `#{Bundler.bundle_path}` " \
-        "because a file already exists at that path. Either remove or rename the file so the directory can be created."
-    end
+    def load_plugins
+      Gem.load_plugins
 
-    # returns whether or not a re-resolve was needed
-    def resolve_if_needed(options)
-      if !@definition.unlocking? && !options["force"] && !Bundler.settings[:inline] && Bundler.default_lockfile.file?
-        return false if @definition.nothing_changed? && !@definition.missing_specs?
+      requested_path_gems = @definition.specs.select {|s| s.source.is_a?(Source::Path) }
+      path_plugin_files = requested_path_gems.flat_map do |spec|
+        spec.matches_for_glob("rubygems_plugin#{Bundler.rubygems.suffix_pattern}")
+      rescue TypeError
+        error_message = "#{spec.name} #{spec.version} has an invalid gemspec"
+        raise Gem::InvalidSpecificationException, error_message
       end
-
-      options["local"] ? @definition.resolve_with_cache! : @definition.resolve_remotely!
-      true
+      Gem.load_plugin_files(path_plugin_files)
+      Gem.load_env_plugins
     end
 
-    def lock(opts = {})
-      @definition.lock(Bundler.default_lockfile, opts[:preserve_unknown_sections])
+    def ensure_specs_are_compatible!
+      overrides = @definition.overrides
+      @definition.specs.each do |spec|
+        unless spec.matches_current_ruby_with_overrides?(overrides)
+          raise InstallError, incompatibility_message(spec, "requires ruby version #{spec.required_ruby_version}, " \
+            "which is incompatible with the current version, #{Gem.ruby_version}")
+        end
+        unless spec.matches_current_rubygems_with_overrides?(overrides)
+          raise InstallError, incompatibility_message(spec, "requires rubygems version #{spec.required_rubygems_version}, " \
+            "which is incompatible with the current version, #{Gem.rubygems_version}")
+        end
+      end
+    end
+
+    # Build the error raised when a locked spec can't run on the current Ruby or
+    # RubyGems. When the offending spec is a platform-specific variant locked in
+    # frozen mode, point users at the fix: re-resolving outside frozen mode adds
+    # the Ruby (non platform-specific) fallback variant to the lockfile.
+    def incompatibility_message(spec, reason)
+      message = "#{spec.full_name} #{reason}"
+      return message unless Bundler.frozen_bundle? && spec.platform != Gem::Platform::RUBY
+
+      message + "\n\nThe lockfile only includes the #{spec.platform} variant of #{spec.name}. " \
+        "If a compatible Ruby variant is available, run `bundle install` outside of frozen/deployment mode " \
+        "to add it to the lockfile as a fallback, then commit the updated #{SharedHelpers.relative_lockfile_path}."
+    end
+
+    def warn_on_default_gem_downgrades
+      default_gems = Bundler.rubygems.default_stubs.to_h {|spec| [spec.name, spec] }
+      downgrades = @definition.specs.sort_by(&:name).filter_map do |spec|
+        # The specs always include the running Bundler, which the Gemfile does not choose.
+        next if spec.name == "bundler"
+        default_spec = default_gems[spec.name]
+        next unless default_spec && spec.version < default_spec.version
+        [spec, default_spec]
+      end
+      return if downgrades.empty?
+
+      message = "Your bundle downgrades the following default gems shipped with #{Bundler::RubyVersion.system}:\n"
+      downgrades.each do |spec, default_spec|
+        message += "  * #{spec.name} #{spec.version} (default: #{default_spec.version})\n"
+      end
+      Bundler.ui.warn message.chomp
+    end
+
+    def lock
+      @definition.lock
     end
   end
 end

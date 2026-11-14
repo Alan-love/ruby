@@ -1,0 +1,34 @@
+// This build script is only used for `make zjit-test` for building
+// the test binary; ruby builds don't use this.
+fn main() {
+    // option_env! automatically registers a rerun-if-env-changed
+    if let Some(ruby_build_dir) = option_env!("RUBY_BUILD_DIR") {
+        // Link against libminiruby.a
+        println!("cargo:rustc-link-search=native={ruby_build_dir}");
+        println!("cargo:rustc-link-lib=static:-bundle=miniruby");
+        // Re-link when libminiruby.a changes
+        println!("cargo:rerun-if-changed={ruby_build_dir}/libminiruby.a");
+
+        // System libraries that libminiruby needs. Has to be
+        // ordered after -lminiruby above.
+        #[allow(clippy::option_env_unwrap)] // We *do* want this at runtime so cargo-check passes
+        let link_flags = option_env!("RUBY_LD_FLAGS").unwrap();
+
+        let mut split_iter = link_flags.split(" ");
+        while let Some(token) = split_iter.next() {
+            if token == "-framework" {
+                if let Some(framework) = split_iter.next() {
+                    println!("cargo:rustc-link-lib=framework={framework}");
+                }
+            } else if token == "-L" {
+                if let Some(search_dir) = split_iter.next() {
+                    println!("cargo:rustc-link-search=native={search_dir}");
+                }
+            } else if let Some(search_dir) = token.strip_prefix("-L") {
+                println!("cargo:rustc-link-search=native={search_dir}");
+            } else if let Some(lib_name) = token.strip_prefix("-l") {
+                println!("cargo:rustc-link-lib={lib_name}");
+            }
+        }
+    }
+}

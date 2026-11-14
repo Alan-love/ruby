@@ -10,12 +10,6 @@ describe "Kernel#clone" do
     @obj = KernelSpecs::Duplicate.new 1, :a
   end
 
-  it "calls #initialize_copy on the new instance" do
-    clone = @obj.clone
-    ScratchPad.recorded.should_not == @obj.object_id
-    ScratchPad.recorded.should == clone.object_id
-  end
-
   it "uses the internal allocator and does not call #allocate" do
     klass = Class.new
     instance = klass.new
@@ -25,22 +19,38 @@ describe "Kernel#clone" do
     end
 
     clone = instance.clone
-    clone.class.should equal klass
+    clone.class.should.equal? klass
   end
 
   describe "with no arguments" do
     it "copies frozen state from the original" do
       o2 = @obj.clone
+      o2.should_not.frozen?
+
       @obj.freeze
       o3 = @obj.clone
-
-      o2.should_not.frozen?
       o3.should.frozen?
     end
 
     it 'copies frozen?' do
       o = ''.freeze.clone
-      o.frozen?.should be_true
+      o.frozen?.should == true
+    end
+  end
+
+  describe "with freeze: nil" do
+    it "copies frozen state from the original, like #clone without arguments" do
+      o2 = @obj.clone(freeze: nil)
+      o2.should_not.frozen?
+
+      @obj.freeze
+      o3 = @obj.clone(freeze: nil)
+      o3.should.frozen?
+    end
+
+    it "copies frozen?" do
+      o = "".freeze.clone(freeze: nil)
+      o.frozen?.should == true
     end
   end
 
@@ -50,33 +60,19 @@ describe "Kernel#clone" do
       @obj.clone(freeze: true).should.frozen?
     end
 
-    ruby_version_is ''...'3.0' do
-      it 'does not freeze the copy even if the original is not frozen' do
-        @obj.clone(freeze: true).should_not.frozen?
-      end
-
-      it "calls #initialize_clone with no kwargs" do
-        obj = KernelSpecs::CloneFreeze.new
-        obj.clone(freeze: true)
-        ScratchPad.recorded.should == [obj, {}]
-      end
+    it 'freezes the copy even if the original was not frozen' do
+      @obj.clone(freeze: true).should.frozen?
     end
 
-    ruby_version_is '3.0' do
-      it 'freezes the copy even if the original was not frozen' do
-        @obj.clone(freeze: true).should.frozen?
-      end
+    it "calls #initialize_clone with kwargs freeze: true" do
+      obj = KernelSpecs::CloneFreeze.new
+      obj.clone(freeze: true)
+      ScratchPad.recorded.should == [obj, { freeze: true }]
+    end
 
-      it "calls #initialize_clone with kwargs freeze: true" do
-        obj = KernelSpecs::CloneFreeze.new
-        obj.clone(freeze: true)
-        ScratchPad.recorded.should == [obj, { freeze: true }]
-      end
-
-      it "calls #initialize_clone with kwargs freeze: true even if #initialize_clone only takes a single argument" do
-        obj = KernelSpecs::Clone.new
-        -> { obj.clone(freeze: true) }.should raise_error(ArgumentError, 'wrong number of arguments (given 2, expected 1)')
-      end
+    it "calls #initialize_clone with kwargs freeze: true even if #initialize_clone only takes a single argument" do
+      obj = KernelSpecs::Clone.new
+      -> { obj.clone(freeze: true) }.should.raise(ArgumentError, 'wrong number of arguments (given 2, expected 1)')
     end
   end
 
@@ -90,25 +86,23 @@ describe "Kernel#clone" do
       @obj.clone(freeze: false).should_not.frozen?
     end
 
-    ruby_version_is ''...'3.0' do
-      it "calls #initialize_clone with no kwargs" do
-        obj = KernelSpecs::CloneFreeze.new
-        obj.clone(freeze: false)
-        ScratchPad.recorded.should == [obj, {}]
-      end
+    it "calls #initialize_clone with kwargs freeze: false" do
+      obj = KernelSpecs::CloneFreeze.new
+      obj.clone(freeze: false)
+      ScratchPad.recorded.should == [obj, { freeze: false }]
     end
 
-    ruby_version_is '3.0' do
-      it "calls #initialize_clone with kwargs freeze: false" do
-        obj = KernelSpecs::CloneFreeze.new
-        obj.clone(freeze: false)
-        ScratchPad.recorded.should == [obj, { freeze: false }]
-      end
+    it "calls #initialize_clone with kwargs freeze: false even if #initialize_clone only takes a single argument" do
+      obj = KernelSpecs::Clone.new
+      -> { obj.clone(freeze: false) }.should.raise(ArgumentError, 'wrong number of arguments (given 2, expected 1)')
+    end
+  end
 
-      it "calls #initialize_clone with kwargs freeze: false even if #initialize_clone only takes a single argument" do
-        obj = KernelSpecs::Clone.new
-        -> { obj.clone(freeze: false) }.should raise_error(ArgumentError, 'wrong number of arguments (given 2, expected 1)')
-      end
+  describe "with freeze: anything else" do
+    it 'raises ArgumentError when passed not true/false/nil' do
+      -> { @obj.clone(freeze: 1) }.should.raise(ArgumentError, /unexpected value for freeze: Integer/)
+      -> { @obj.clone(freeze: "") }.should.raise(ArgumentError, /unexpected value for freeze: String/)
+      -> { @obj.clone(freeze: Object.new) }.should.raise(ArgumentError, /unexpected value for freeze: Object/)
     end
   end
 
@@ -173,12 +167,5 @@ describe "Kernel#clone" do
     end
 
     cloned.bar.should == ['a']
-  end
-
-  ruby_version_is ''...'2.7' do
-    it 'copies tainted?' do
-      o = ''.taint.clone
-      o.tainted?.should be_true
-    end
   end
 end

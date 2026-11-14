@@ -10,7 +10,7 @@ describe "Encoding.default_external" do
   end
 
   it "returns an Encoding object" do
-    Encoding.default_external.should be_an_instance_of(Encoding)
+    Encoding.default_external.should.instance_of?(Encoding)
   end
 
   it "returns the default external encoding" do
@@ -18,11 +18,9 @@ describe "Encoding.default_external" do
     Encoding.default_external.should == Encoding::SHIFT_JIS
   end
 
-  ruby_version_is "3.0" do
-    platform_is :windows do
-      it 'is UTF-8 by default on Windows' do
-        Encoding.default_external.should == Encoding::UTF_8
-      end
+  platform_is :windows do
+    it 'is UTF-8 by default on Windows' do
+      Encoding.default_external.should == Encoding::UTF_8
     end
   end
 end
@@ -62,10 +60,10 @@ describe "Encoding.default_external=" do
   end
 
   it "raises a TypeError unless the argument is an Encoding or convertible to a String" do
-    -> { Encoding.default_external = [] }.should raise_error(TypeError)
+    -> { Encoding.default_external = [] }.should.raise(TypeError)
   end
 
   it "raises an ArgumentError if the argument is nil" do
-    -> { Encoding.default_external = nil }.should raise_error(ArgumentError)
+    -> { Encoding.default_external = nil }.should.raise(ArgumentError)
   end
 end

@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+
 class Gem::AvailableSet
   include Enumerable
 
@@ -26,7 +27,7 @@ class Gem::AvailableSet
       s = o.set
     when Array
       s = o.map do |sp,so|
-        if !sp.kind_of?(Gem::Specification) or !so.kind_of?(Gem::Source)
+        if !sp.is_a?(Gem::Specification) || !so.is_a?(Gem::Source)
           raise TypeError, "Array must be in [[spec, source], ...] form"
         end
 
@@ -69,7 +70,7 @@ class Gem::AvailableSet
   end
 
   def all_specs
-    @set.map {|t| t.spec }
+    @set.map(&:spec)
   end
 
   def match_platform!
@@ -92,29 +93,6 @@ class Gem::AvailableSet
   def source_for(spec)
     f = @set.find {|t| t.spec == spec }
     f.source
-  end
-
-  ##
-  # Converts this AvailableSet into a RequestSet that can be used to install
-  # gems.
-  #
-  # If +development+ is :none then no development dependencies are installed.
-  # Other options are :shallow for only direct development dependencies of the
-  # gems in this set or :all for all development dependencies.
-
-  def to_request_set(development = :none)
-    request_set = Gem::RequestSet.new
-    request_set.development = :all == development
-
-    each_spec do |spec|
-      request_set.always_install << spec
-
-      request_set.gem spec.name, spec.version
-      request_set.import spec.development_dependencies if
-        :shallow == development
-    end
-
-    request_set
   end
 
   ##
@@ -146,19 +124,15 @@ class Gem::AvailableSet
   end
 
   def remove_installed!(dep)
-    @set.reject! do |t|
+    @set.reject! do |_t|
       # already locally installed
       Gem::Specification.any? do |installed_spec|
-        dep.name == installed_spec.name and
-          dep.requirement.satisfied_by? installed_spec.version
+        dep.name == installed_spec.name &&
+          dep.requirement.satisfied_by?(installed_spec.version)
       end
     end
 
     @sorted = nil
     self
-  end
-
-  def inject_into_list(dep_list)
-    @set.each {|t| dep_list.add t.spec }
   end
 end

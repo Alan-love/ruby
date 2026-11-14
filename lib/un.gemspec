@@ -1,15 +1,22 @@
 # frozen_string_literal: true
 
+name = File.basename(__FILE__, ".gemspec")
+version = ["lib", Array.new(name.count("-")+1).join("/")].find do |dir|
+  break File.foreach(File.join(__dir__, dir, "#{name.tr('-', '/')}.rb")) do |line|
+    /^\s*VERSION\s*=\s*"(.*)"/ =~ line and break $1
+  end rescue nil
+end
+
 Gem::Specification.new do |spec|
-  spec.name          = "un"
-  spec.version       = "0.2.0"
+  spec.name          = name
+  spec.version       = version
   spec.authors       = ["WATANABE Hirofumi"]
   spec.email         = ["eban@ruby-lang.org"]
 
   spec.summary       = "Utilities to replace common UNIX commands"
   spec.description   = spec.summary
   spec.homepage      = "https://github.com/ruby/un"
-  spec.required_ruby_version = Gem::Requirement.new(">= 2.3.0")
+  spec.required_ruby_version = Gem::Requirement.new(">= 2.6.0")
   spec.licenses      = ["Ruby", "BSD-2-Clause"]
 
   spec.metadata["homepage_uri"] = spec.homepage

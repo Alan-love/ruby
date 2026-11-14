@@ -47,7 +47,7 @@ class TestCaseMappingPreliminary < Test::Unit::TestCase
   # different properties; careful: roundtrip isn't always guaranteed
   def check_swapcase_properties(expected, start, *flags)
     assert_equal expected, start.swapcase(*flags)
-    temp = start
+    temp = +start
     assert_equal expected, temp.swapcase!(*flags)
     assert_equal start, start.swapcase(*flags).swapcase(*flags)
     assert_equal expected, expected.swapcase(*flags).swapcase(*flags)
@@ -60,11 +60,36 @@ class TestCaseMappingPreliminary < Test::Unit::TestCase
     check_swapcase_properties   'yUKIHIRO matsumoto (MAtz)', 'Yukihiro MATSUMOTO (maTZ)'
   end
 
+  def test_ascii_8bit_case_mapping_all_bytes
+    bytes = (0..255).to_a.pack("C*")
+    upper_ascii = "A".ord.."Z".ord
+    lower_ascii = "a".ord.."z".ord
+    downcase_expected = (0..255).map {|byte| upper_ascii.cover?(byte) ? byte + 32 : byte }.pack("C*")
+    upcase_expected = (0..255).map {|byte| lower_ascii.cover?(byte) ? byte - 32 : byte }.pack("C*")
+
+    assert_equal Encoding::ASCII_8BIT, bytes.encoding
+    assert_equal downcase_expected, bytes.downcase
+    assert_equal downcase_expected, bytes.downcase(:fold)
+    assert_equal upcase_expected, bytes.upcase
+
+    downcased = bytes.dup
+    assert_same downcased, downcased.downcase!
+    assert_equal downcase_expected, downcased
+
+    folded = bytes.dup
+    assert_same folded, folded.downcase!(:fold)
+    assert_equal downcase_expected, folded
+
+    upcased = bytes.dup
+    assert_same upcased, upcased.upcase!
+    assert_equal upcase_expected, upcased
+  end
+
   def test_invalid
-    assert_raise(ArgumentError, "Should not be possible to upcase invalid string.") { "\xEB".force_encoding('UTF-8').upcase }
-    assert_raise(ArgumentError, "Should not be possible to downcase invalid string.") { "\xEB".force_encoding('UTF-8').downcase }
-    assert_raise(ArgumentError, "Should not be possible to capitalize invalid string.") { "\xEB".force_encoding('UTF-8').capitalize }
-    assert_raise(ArgumentError, "Should not be possible to swapcase invalid string.") { "\xEB".force_encoding('UTF-8').swapcase }
+    assert_raise(ArgumentError, "Should not be possible to upcase invalid string.") { "\xEB".dup.force_encoding('UTF-8').upcase }
+    assert_raise(ArgumentError, "Should not be possible to downcase invalid string.") { "\xEB".dup.force_encoding('UTF-8').downcase }
+    assert_raise(ArgumentError, "Should not be possible to capitalize invalid string.") { "\xEB".dup.force_encoding('UTF-8').capitalize }
+    assert_raise(ArgumentError, "Should not be possible to swapcase invalid string.") { "\xEB".dup.force_encoding('UTF-8').swapcase }
   end
 
   def test_general

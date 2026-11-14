@@ -1,9 +1,8 @@
 require_relative '../../spec_helper'
+require 'matrix'
 
-ruby_version_is ""..."3.1" do
-  require_relative 'shared/collect'
-
-  describe "Matrix#collect" do
-    it_behaves_like :collect, :collect
+describe "Matrix#collect" do
+  it "is an alias of Matrix#map" do
+    Matrix.instance_method(:collect).should == Matrix.instance_method(:map)
   end
 end

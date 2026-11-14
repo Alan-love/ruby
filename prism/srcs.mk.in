@@ -1,0 +1,57 @@
+<% # -*- ruby -*-
+# :stopdoc:
+# templates/template.rb defines Ruby::Prism::Template, and BASERUBY may be
+# older than Ruby 4.0, where the Ruby module does not exist.
+module Ruby; end unless defined?(Ruby)
+require_relative 'templates/template'
+
+script = File.basename(__FILE__)
+srcs = output ? File.basename(output) : script.chomp('.in')
+mk = 'uncommon.mk'
+
+# %>
+PRISM_TEMPLATES_DIR = $(PRISM_SRCDIR)/templates
+PRISM_TEMPLATE = $(PRISM_TEMPLATES_DIR)/template.rb
+PRISM_RUN_TEMPLATE = $(BASERUBY) -e "module Ruby; end unless defined?(Ruby); load ARGV.shift; Ruby::Prism::Template.render(ARGV[0], write_to: ARGV[1])" $(PRISM_TEMPLATE)
+PRISM_CONFIG = $(PRISM_SRCDIR)/config.yml
+
+srcs <%=%><%=mk%>: prism/.srcs.mk.time
+
+prism/.srcs.mk.time: $(order_only) $(PRISM_BUILD_DIR)/.time
+prism/$(HAVE_BASERUBY:no=.srcs.mk.time):
+	touch $@
+prism/$(HAVE_BASERUBY:yes=.srcs.mk.time): \
+		$(PRISM_SRCDIR)/templates/template.rb \
+		$(PRISM_SRCDIR)/<%=%><%=script%>
+	$(BASERUBY) $(tooldir)/generic_erb.rb -c -t$@ -o $(PRISM_SRCDIR)/<%=%><%=srcs%> $(PRISM_SRCDIR)/<%=%><%=script%>
+
+distclean-prism-srcs::
+	$(RM) prism/.srcs.mk.time
+	$(RMDIRS) prism || $(NULLCMD)
+
+distclean-srcs-local:: distclean-prism-srcs
+
+realclean-prism-srcs:: distclean-prism-srcs
+	$(RM) $(PRISM_SRCDIR)/<%=%><%=srcs%>
+
+realclean-srcs-local:: realclean-prism-srcs
+
+main srcs: prism-srcs
+main incs: prism-incs
+<% Ruby::Prism::Template::TEMPLATES.map do |t|
+  /\.(?:[ch]|rb)\z/ =~ t or next
+  s = '$(srcdir)/' + t.sub(%r[\A(?:(src)|ext|include)/]) {$1 && 'prism/'}
+  s.sub!(%r[\A\$\(srcdir\)/lib/prism/], %q[$(srcdir)/lib/ruby/prism/])
+  s.sub!(%r[\A\$(srcdir)/prism/], '$(PRISM_SRCDIR)/')
+  target = s.end_with?('.h') ? 'incs' : 'srcs'
+# %>
+
+prism-<%=%><%=target%>: <%=%><%=s%>
+<%=%><%=s%>: $(PRISM_CONFIG) $(PRISM_TEMPLATE) $(PRISM_TEMPLATES_DIR)/<%=%><%=t%>.erb
+	$(Q) $(PRISM_RUN_TEMPLATE) <%=%><%=t%> $@
+
+realclean-prism-srcs::
+	$(RM) <%=%><%=s%>
+<%
+end
+# %>

@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+
 ##
 # The Resolver::SpecSpecification contains common functionality for
 # Resolver specifications that are backed by a Gem::Specification.
@@ -20,6 +21,10 @@ class Gem::Resolver::SpecSpecification < Gem::Resolver::Specification
 
   def dependencies
     spec.dependencies
+  end
+
+  def content_address # :nodoc:
+    spec.content_address
   end
 
   ##
@@ -64,5 +69,12 @@ class Gem::Resolver::SpecSpecification < Gem::Resolver::Specification
 
   def version
     spec.version
+  end
+
+  ##
+  # The hash value for this specification.
+
+  def hash
+    spec.hash
   end
 end

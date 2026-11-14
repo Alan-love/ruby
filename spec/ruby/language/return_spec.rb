@@ -19,7 +19,7 @@ describe "The return keyword" do
 
   it "returns nil by default" do
     def r; return; end
-    r().should be_nil
+    r().should == nil
   end
 
   describe "in a Thread" do
@@ -31,7 +31,7 @@ describe "The return keyword" do
           e
         end
       }
-      t.value.should be_an_instance_of(LocalJumpError)
+      t.value.should.instance_of?(LocalJumpError)
     end
   end
 
@@ -176,11 +176,11 @@ describe "The return keyword" do
     end
 
     it "causes lambda to return nil if invoked without any arguments" do
-      -> { return; 456 }.call.should be_nil
+      -> { return; 456 }.call.should == nil
     end
 
     it "causes lambda to return nil if invoked with an empty expression" do
-      -> { return (); 456 }.call.should be_nil
+      -> { return (); 456 }.call.should == nil
     end
 
     it "causes lambda to return the value passed to return" do
@@ -229,7 +229,7 @@ describe "The return keyword" do
       def f
         1.times { 1.times {return true}; false}; false
       end
-      f.should be_true
+      f.should == true
     end
   end
 
@@ -417,23 +417,36 @@ describe "The return keyword" do
           end
         END_OF_CODE
 
-        -> { load @filename }.should raise_error(SyntaxError)
+        -> { load @filename }.should.raise(SyntaxError)
       end
     end
 
     describe "within a block within a class" do
-      ruby_version_is "2.7" do
-        it "is not allowed" do
-          File.write(@filename, <<-END_OF_CODE)
-            class ReturnSpecs::A
-              ScratchPad << "before return"
-              1.times { return }
-              ScratchPad << "after return"
-            end
-          END_OF_CODE
+      it "is not allowed" do
+        File.write(@filename, <<-END_OF_CODE)
+          class ReturnSpecs::A
+            ScratchPad << "before return"
+            1.times { return }
+            ScratchPad << "after return"
+          end
+        END_OF_CODE
 
-          -> { load @filename }.should raise_error(LocalJumpError)
-        end
+        -> { load @filename }.should.raise(LocalJumpError)
+      end
+    end
+
+    describe "within BEGIN" do
+      it "is allowed" do
+        File.write(@filename, <<-END_OF_CODE)
+          BEGIN {
+            ScratchPad << "before call"
+            return
+            ScratchPad << "after call"
+          }
+        END_OF_CODE
+
+        load @filename
+        ScratchPad.recorded.should == ["before call"]
       end
     end
 
@@ -464,25 +477,13 @@ describe "The return keyword" do
     end
 
     describe "return with argument" do
-      ruby_version_is ""..."2.7" do
-        it "does not affect exit status" do
-          ruby_exe(<<-END_OF_CODE).should == ""
-            return 10
-          END_OF_CODE
+      it "warns but does not affect exit status" do
+        err = ruby_exe(<<-END_OF_CODE, args: "2>&1")
+          return 10
+        END_OF_CODE
+        $?.exitstatus.should == 0
 
-          $?.exitstatus.should == 0
-        end
-      end
-
-      ruby_version_is "2.7" do
-        it "warns but does not affect exit status" do
-          err = ruby_exe(<<-END_OF_CODE, args: "2>&1")
-            return 10
-          END_OF_CODE
-          $?.exitstatus.should == 0
-
-          err.should =~ /warning: argument of top-level return is ignored/
-        end
+        err.should =~ /warning: argument of top-level return is ignored/
       end
     end
   end

@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
 module Digest
-  VERSION = "3.1.0.pre3"
+  # The version string
+  VERSION = "3.3.0"
 end

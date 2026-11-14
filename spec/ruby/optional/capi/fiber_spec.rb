@@ -1,5 +1,4 @@
 require_relative 'spec_helper'
-require 'fiber'
 
 load_extension('fiber')
 
@@ -11,7 +10,7 @@ describe "C-API Fiber function" do
   describe "rb_fiber_current" do
     it "returns the current fiber" do
       result = @s.rb_fiber_current()
-      result.should be_an_instance_of(Fiber)
+      result.should.instance_of?(Fiber)
       result.should == Fiber.current
     end
   end
@@ -20,9 +19,9 @@ describe "C-API Fiber function" do
     it "returns the fibers alive status" do
       fiber = Fiber.new { Fiber.yield }
       fiber.resume
-      @s.rb_fiber_alive_p(fiber).should be_true
+      @s.rb_fiber_alive_p(fiber).should == true
       fiber.resume
-      @s.rb_fiber_alive_p(fiber).should be_false
+      @s.rb_fiber_alive_p(fiber).should == false
     end
   end
 
@@ -44,46 +43,48 @@ describe "C-API Fiber function" do
   describe "rb_fiber_new" do
     it "returns a new fiber" do
       fiber = @s.rb_fiber_new
-      fiber.should be_an_instance_of(Fiber)
+      fiber.should.instance_of?(Fiber)
       fiber.resume(42).should == "42"
+    end
+
+    it "passes non-Ruby pointers to the fiber callback" do
+      @s.rb_fiber_new_with_pointer.should == true
     end
   end
 
-  ruby_version_is '3.1' do
-    describe "rb_fiber_raise" do
-      it "raises an exception on the resumed fiber" do
-        fiber = Fiber.new do
-          begin
-            Fiber.yield
-          rescue => error
-            error
-          end
+  describe "rb_fiber_raise" do
+    it "raises an exception on the resumed fiber" do
+      fiber = Fiber.new do
+        begin
+          Fiber.yield
+        rescue => error
+          error
         end
-
-        fiber.resume
-
-        result = @s.rb_fiber_raise(fiber, "Boom!")
-        result.should be_an_instance_of(RuntimeError)
-        result.message.should == "Boom!"
       end
 
-      it "raises an exception on the transferred fiber" do
-        main = Fiber.current
+      fiber.resume
 
-        fiber = Fiber.new do
-          begin
-            main.transfer
-          rescue => error
-            error
-          end
+      result = @s.rb_fiber_raise(fiber, "Boom!")
+      result.should.instance_of?(RuntimeError)
+      result.message.should == "Boom!"
+    end
+
+    it "raises an exception on the transferred fiber" do
+      main = Fiber.current
+
+      fiber = Fiber.new do
+        begin
+          main.transfer
+        rescue => error
+          error
         end
-
-        fiber.transfer
-
-        result = @s.rb_fiber_raise(fiber, "Boom!")
-        result.should be_an_instance_of(RuntimeError)
-        result.message.should == "Boom!"
       end
+
+      fiber.transfer
+
+      result = @s.rb_fiber_raise(fiber, "Boom!")
+      result.should.instance_of?(RuntimeError)
+      result.message.should == "Boom!"
     end
   end
 end

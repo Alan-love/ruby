@@ -1,5 +1,5 @@
 require_relative '../../spec_helper'
-require_relative '../../shared/fiber/resume'
+require_relative 'shared/resume'
 
 describe "Fiber#resume" do
   it_behaves_like :fiber_resume, :resume
@@ -28,18 +28,9 @@ describe "Fiber#resume" do
     fiber.resume :second
   end
 
-  ruby_version_is '3.0' do
-    it "raises a FiberError if the Fiber tries to resume itself" do
-      fiber = Fiber.new { fiber.resume }
-      -> { fiber.resume }.should raise_error(FiberError, /current fiber/)
-    end
-  end
-
-  ruby_version_is '' ... '3.0' do
-    it "raises a FiberError if the Fiber tries to resume itself" do
-      fiber = Fiber.new { fiber.resume }
-      -> { fiber.resume }.should raise_error(FiberError, /double resume/)
-    end
+  it "raises a FiberError if the Fiber tries to resume itself" do
+    fiber = Fiber.new { fiber.resume }
+    -> { fiber.resume }.should.raise(FiberError, /current fiber/)
   end
 
   it "returns control to the calling Fiber if called from one" do
@@ -75,5 +66,38 @@ describe "Fiber#resume" do
     RUBY
 
     ruby_exe(code).should == "ensure executed\n"
+  end
+
+  it "can work with Fiber#transfer" do
+    fiber1 = Fiber.new { true }
+    fiber2 = Fiber.new { fiber1.transfer; Fiber.yield 10 ; Fiber.yield 20; raise }
+    fiber2.resume.should == 10
+    fiber2.resume.should == 20
+  end
+
+  it "raises a FiberError if the Fiber attempts to resume a resuming fiber" do
+    root_fiber = Fiber.current
+    fiber1 = Fiber.new { root_fiber.resume }
+    -> { fiber1.resume }.should.raise(FiberError, /attempt to resume a resuming fiber/)
+  end
+
+  it "can resume a fiber that was transferred away from and back before it yielded" do
+    other = nil
+    fiber = Fiber.new do
+      other.transfer
+      Fiber.yield :yielded
+      :done
+    end
+    other = Fiber.new { fiber.transfer }
+
+    fiber.resume.should == :yielded
+    fiber.resume.should == :done
+  end
+
+  it "raises a FiberError when resuming a fiber suspended by transfer" do
+    root = Fiber.current
+    fiber = Fiber.new { root.transfer }
+    fiber.transfer
+    -> { fiber.resume }.should.raise(FiberError, /attempt to resume a transferring fiber/)
   end
 end

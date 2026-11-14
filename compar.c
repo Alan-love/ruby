@@ -24,19 +24,34 @@ rb_cmp(VALUE x, VALUE y)
     return rb_funcallv(x, idCmp, 1, &y);
 }
 
-void
-rb_cmperr(VALUE x, VALUE y)
+static VALUE
+cmperr_subject(VALUE y)
 {
     VALUE classname;
 
     if (SPECIAL_CONST_P(y) || BUILTIN_TYPE(y) == T_FLOAT) {
-	classname = rb_inspect(y);
+        classname = rb_inspect(y);
     }
     else {
-	classname = rb_obj_class(y);
+        classname = rb_obj_class(y);
     }
+    return classname;
+}
+
+void
+rb_cmperr(VALUE x, VALUE y)
+{
+    VALUE classname = cmperr_subject(y);
     rb_raise(rb_eArgError, "comparison of %"PRIsVALUE" with %"PRIsVALUE" failed",
-	     rb_obj_class(x), classname);
+             rb_obj_class(x), classname);
+}
+
+void
+rb_cmperr_reason(VALUE x, VALUE y, const char *reason)
+{
+    VALUE classname = cmperr_subject(y);
+    rb_raise(rb_eArgError, "comparison of %"PRIsVALUE" with %"PRIsVALUE" failed: %s",
+             rb_obj_class(x), classname, reason);
 }
 
 static VALUE
@@ -50,12 +65,12 @@ VALUE
 rb_invcmp(VALUE x, VALUE y)
 {
     VALUE invcmp = rb_exec_recursive(invcmp_recursive, x, y);
-    if (invcmp == Qundef || NIL_P(invcmp)) {
-	return Qnil;
+    if (NIL_OR_UNDEF_P(invcmp)) {
+        return Qnil;
     }
     else {
-	int result = -rb_cmpint(invcmp, x, y);
-	return INT2FIX(result);
+        int result = -rb_cmpint(invcmp, x, y);
+        return INT2FIX(result);
     }
 }
 
@@ -95,10 +110,13 @@ cmpint(VALUE x, VALUE y)
 
 /*
  *  call-seq:
- *     obj > other    -> true or false
+ *    self > other -> true or false
  *
- *  Compares two objects based on the receiver's <code><=></code>
- *  method, returning true if it returns a value greater than 0.
+ *  Returns whether +self+ is "greater than" +other+;
+ *  equivalent to <tt>(self <=> other) > 0</tt>:
+ *
+ *    'foo' > 'foo'  # => false
+ *    'food' > 'foo' # => true
  */
 
 static VALUE
@@ -109,10 +127,15 @@ cmp_gt(VALUE x, VALUE y)
 
 /*
  *  call-seq:
- *     obj >= other    -> true or false
+ *    self >= other -> true or false
  *
- *  Compares two objects based on the receiver's <code><=></code>
- *  method, returning true if it returns a value greater than or equal to 0.
+ *  Returns whether +self+ is "greater than or equal to" +other+;
+ *  equivalent to <tt>(self <=> other) >= 0</tt>:
+ *
+ *    'food' >= 'foo'  # => true
+ *    'foo'  >= 'foo'  # => true
+ *    'foo'  >= 'food' # => false
+ *
  */
 
 static VALUE
@@ -123,10 +146,14 @@ cmp_ge(VALUE x, VALUE y)
 
 /*
  *  call-seq:
- *     obj < other    -> true or false
+ *    self < other -> true or false
  *
- *  Compares two objects based on the receiver's <code><=></code>
- *  method, returning true if it returns a value less than 0.
+ *  Returns whether +self+ is "less than" +other+;
+ *  equivalent to <tt>(self <=> other) < 0</tt>:
+ *
+ *    'foo' < 'foo'  # => false
+ *    'foo' < 'food' # => true
+ *
  */
 
 static VALUE
@@ -137,10 +164,15 @@ cmp_lt(VALUE x, VALUE y)
 
 /*
  *  call-seq:
- *     obj <= other    -> true or false
+ *    self <= other -> true or false
  *
- *  Compares two objects based on the receiver's <code><=></code>
- *  method, returning true if it returns a value less than or equal to 0.
+ *  Returns whether +self+ is "less than or equal to" +other+;
+ *  equivalent to <tt>(self <=> other) <= 0</tt>:
+ *
+ *    'foo' <= 'foo'  # => true
+ *    'foo' <= 'food' # => true
+ *    'food' <= 'foo' # => false
+ *
  */
 
 static VALUE
@@ -167,51 +199,126 @@ cmp_le(VALUE x, VALUE y)
 static VALUE
 cmp_between(VALUE x, VALUE min, VALUE max)
 {
-    if (cmpint(x, min) < 0) return Qfalse;
-    if (cmpint(x, max) > 0) return Qfalse;
-    return Qtrue;
+    return RBOOL((cmpint(x, min) >= 0 && cmpint(x, max) <= 0));
 }
 
 /*
+ *  :markup: markdown
+ *
  *  call-seq:
- *     obj.clamp(min, max) ->  obj
- *     obj.clamp(range)    ->  obj
+ *    clamp(min, max) -> min, max, or self
+ *    clamp(range) -> range.begin, range.end, or self
  *
- * In <code>(min, max)</code> form, returns _min_ if _obj_
- * <code><=></code> _min_ is less than zero, _max_ if _obj_
- * <code><=></code> _max_ is greater than zero, and _obj_
- * otherwise.
+ *  Returns an object of the same type as `self`.
  *
- *     12.clamp(0, 100)         #=> 12
- *     523.clamp(0, 100)        #=> 100
- *     -3.123.clamp(0, 100)     #=> 0
+ *  With non-`nil` arguments `min` and `max` given, returns:
  *
- *     'd'.clamp('a', 'f')      #=> 'd'
- *     'z'.clamp('a', 'f')      #=> 'f'
+ *  - `min`, if `self <= min`.
+ *  - `max`, if `self >= max`.
+ *  - `self`, otherwise.
  *
- * In <code>(range)</code> form, returns _range.begin_ if _obj_
- * <code><=></code> _range.begin_ is less than zero, _range.end_
- * if _obj_ <code><=></code> _range.end_ is greater than zero, and
- * _obj_ otherwise.
+ *  Examples:
  *
- *     12.clamp(0..100)         #=> 12
- *     523.clamp(0..100)        #=> 100
- *     -3.123.clamp(0..100)     #=> 0
+ *  ```ruby
+ *  0.clamp(0, 9)   # => 0
+ *  -1.clamp(0, 9)  # => 0
+ *  9.clamp(0, 9)   # => 9
+ *  10.clamp(0, 9)  # => 9
+ *  5.clamp(0, 9)   # => 5
+ *  ```
  *
- *     'd'.clamp('a'..'f')      #=> 'd'
- *     'z'.clamp('a'..'f')      #=> 'f'
+ *  With `nil` argument `min` given and non-`nil` argument `max` given, returns:
  *
- * If _range.begin_ is +nil+, it is considered smaller than _obj_,
- * and if _range.end_ is +nil+, it is considered greater than
- * _obj_.
+ *  - `max`, if `self >= max`.
+ *  - `self`, otherwise.
  *
- *     -20.clamp(0..)           #=> 0
- *     523.clamp(..100)         #=> 100
+ *  Examples:
  *
- * When _range.end_ is excluded and not +nil+, an exception is
- * raised.
+ *  ```ruby
+ *  9.clamp(nil, 9)  # => 9
+ *  10.clamp(nil, 9) # => 9
+ *  0.clamp(nil, 9)  # => 0
+ *  ```
  *
- *     100.clamp(0...100)       # ArgumentError
+ *  With non-`nil` argument `min` and`nil` argument `max` given, returns:
+ *
+ *  - `min`, if `self <= min`.
+ *  - `self`, otherwise.
+ *
+ *  Examples:
+ *
+ *  ```ruby
+ *  0.clamp(0, nil)  # => 0
+ *  -1.clamp(0, nil) # => 0
+ *  1.clamp(0, nil)  # => 1
+ *  ```
+ *
+ *  With `nil` arguments `min` and `max` given, returns `self`:
+ *
+ *  ```ruby
+ *  0.clamp(nil, nil) # => 0
+ *  0.clamp(nil, nil) # => 0
+ *  ```
+ *
+ *  In all cases above, raises ArgumentError if comparison fails.
+ *
+ *  With [bounded range][bounded range] `range` given, returns:
+ *
+ *  - `range.begin`, if `self <= range.begin`.
+ *  - `range.end`, if `self >= range.end`.
+ *  - `self`, otherwise.
+ *
+ *  Examples:
+ *
+ *  ```ruby
+ *  0.clamp(0..9)  # => 0
+ *  -1.clamp(0..9) # => 0
+ *  9.clamp(0..9)  # => 9
+ *  10.clamp(0..9) # => 9
+ *  5.clamp(0..9)  # => 5
+ *  5.clamp(0...9) # Raises ArgumentError:cannot clamp with an exclusive range.
+ *  ```
+ *
+ *  With [beginless range][beginless range] `range` given, returns:
+ *
+ *  - `range.end`, if `self >= range.end`.
+ *  - `self`, otherwise.
+ *
+ *  Examples:
+ *
+ *  ```ruby
+ *  9.clamp(nil..9)    # => 9
+ *  10.clamp(nil..9)    # => 9
+ *  0.clamp(nil..9)    # => 0
+ *  0.clamp(nil...9) # Raises ArgumentError: cannot clamp with an exclusive range.
+ *  ```
+ *
+ *  With [endless range][endless range] `range` given, returns:
+ *
+ *  - `range.begin`, if `self <= range.begin`.
+ *  - `self`, otherwise.
+ *
+ *  Examples:
+ *
+ *  ```ruby
+ *  0.clamp(0..nil)  # => 0
+ *  -1.clamp(0..nil) # => 0
+ *  1.clamp(0..nil)  # => 1
+ *  1.clamp(0...nil) # => 1
+ *  ```
+ *
+ *  With [unbounded range][unbounded range] `range` given, returns `self`:
+ *
+ *  ```ruby
+ *  0.clamp(nil..nil)  # => 0
+ *  0.clamp(nil...nil) # => 0
+ *  ```
+ *
+ *  [bounded range]: rdoc-ref:Range@Bounded+Ranges
+ *  [beginless range]: rdoc-ref:Range@Beginless+Ranges
+ *  [endless range]: rdoc-ref:Range@Endless+Ranges
+ *  [unbounded range]: rdoc-ref:Range@Unbounded+Ranges
+ *
  */
 
 static VALUE
@@ -231,7 +338,7 @@ cmp_clamp(int argc, VALUE *argv, VALUE x)
         }
     }
     if (!NIL_P(min) && !NIL_P(max) && cmpint(min, max) > 0) {
-	rb_raise(rb_eArgError, "min argument must be smaller than max argument");
+        rb_raise(rb_eArgError, "min argument must be less than or equal to max argument");
     }
 
     if (!NIL_P(min)) {
@@ -259,25 +366,28 @@ cmp_clamp(int argc, VALUE *argv, VALUE x)
  *  <code>==</code>, <code>>=</code>, and <code>></code>) and the
  *  method <code>between?</code>.
  *
- *     class SizeMatters
+ *     class StringSorter
  *       include Comparable
+ *
  *       attr :str
  *       def <=>(other)
  *         str.size <=> other.str.size
  *       end
+ *
  *       def initialize(str)
  *         @str = str
  *       end
+ *
  *       def inspect
  *         @str
  *       end
  *     end
  *
- *     s1 = SizeMatters.new("Z")
- *     s2 = SizeMatters.new("YY")
- *     s3 = SizeMatters.new("XXX")
- *     s4 = SizeMatters.new("WWWW")
- *     s5 = SizeMatters.new("VVVVV")
+ *     s1 = StringSorter.new("Z")
+ *     s2 = StringSorter.new("YY")
+ *     s3 = StringSorter.new("XXX")
+ *     s4 = StringSorter.new("WWWW")
+ *     s5 = StringSorter.new("VVVVV")
  *
  *     s1 < s2                       #=> true
  *     s4.between?(s1, s3)           #=> false
@@ -286,20 +396,20 @@ cmp_clamp(int argc, VALUE *argv, VALUE x)
  *
  *  == What's Here
  *
- *  \Module \Comparable provides these methods, all of which use method <tt><=></tt>:
+ *  Module \Comparable provides these methods, all of which use method <tt>#<=></tt>:
  *
- *  - {<}[#method-i-3C]:: Returns whether +self+ is less than the given object.
- *  - {<=}[#method-i-3C-3D]:: Returns whether +self+ is less than or equal to
- *                            the given object.
- *  - {==}[#method-i-3D-3D]:: Returns whether +self+ is equal to the given object.
- *  - {>}[#method-i-3E]:: Returns whether +self+ is greater than or equal to
- *                        the given object.
- *  - {>=}[#method-i-3E-3D]:: Returns whether +self+ is greater than the given object.
- *  - #between? Returns +true+ if +self+ is between two given objects.
- *  - #clamp:: For given objects +min+ and +max+, or range <tt>(min..max)</tt>, returns:
+ *  - #<: Returns whether +self+ is less than the given object.
+ *  - #<=: Returns whether +self+ is less than or equal to the given object.
+ *  - #==: Returns whether +self+ is equal to the given object.
+ *  - #>: Returns whether +self+ is greater than the given object.
+ *  - #>=: Returns whether +self+ is greater than or equal to the given object.
+ *  - #between?: Returns +true+ if +self+ is between two given objects.
+ *  - #clamp: For given objects +min+ and +max+, or range <tt>(min..max)</tt>, returns:
+ *
  *    - +min+ if <tt>(self <=> min) < 0</tt>.
  *    - +max+ if <tt>(self <=> max) > 0</tt>.
  *    - +self+ otherwise.
+ *
  */
 
 void

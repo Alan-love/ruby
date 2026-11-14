@@ -4,12 +4,20 @@
 # A collection of text-wrangling methods
 
 module Gem::Text
-
   ##
   # Remove any non-printable characters and make the text suitable for
   # printing.
   def clean_text(text)
-    text.gsub(/[\000-\b\v-\f\016-\037\177]/, ".".freeze)
+    text = text.gsub(/[\000-\b\v-\f\016-\037\177]/, ".")
+
+    # Match C1 control characters (U+0080-U+009F) as codepoints. This requires
+    # a valid UTF-8 string so the regexp does not split a multibyte sequence;
+    # strings in other encodings are left unchanged.
+    if text.encoding == Encoding::UTF_8 && text.valid_encoding?
+      text = text.gsub(/[\u0080-\u009f]/, ".")
+    end
+
+    text
   end
 
   def truncate_text(text, description, max_length = 100_000)
@@ -22,7 +30,7 @@ module Gem::Text
   # Wraps +text+ to +wrap+ characters and optionally indents by +indent+
   # characters
 
-  def format_text(text, wrap, indent=0)
+  def format_text(text, wrap, indent = 0)
     result = []
     work = clean_text(text)
 
@@ -51,7 +59,7 @@ module Gem::Text
 
   # Returns a value representing the "cost" of transforming str1 into str2
   # Vendored version of DidYouMean::Levenshtein.distance from the ruby/did_you_mean gem @ 1.4.0
-  # https://git.io/JJgZI
+  # https://github.com/ruby/did_you_mean/blob/2ddf39b874808685965dbc47d344cf6c7651807c/lib/did_you_mean/levenshtein.rb#L7-L37
   def levenshtein_distance(str1, str2)
     n = str1.length
     m = str2.length
@@ -67,7 +75,7 @@ module Gem::Text
     str1.each_codepoint.with_index(1) do |char1, i|
       j = 0
       while j < m
-        cost = (char1 == str2_codepoints[j]) ? 0 : 1
+        cost = char1 == str2_codepoints[j] ? 0 : 1
         x = min3(
           d[j + 1] + 1, # insertion
           i + 1,      # deletion

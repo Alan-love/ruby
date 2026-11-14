@@ -10,7 +10,7 @@
 #
 # = Licence
 # This program is licensed under the same licence as Ruby.
-# (See the file 'LICENCE'.)
+# (See the file 'COPYING'.)
 #++
 
 module OpenSSL
@@ -22,6 +22,14 @@ module OpenSSL
         q.text ' '
         q.text to_i.to_s
       }
+    end
+
+    def marshal_dump # :nodoc:
+      to_i
+    end
+
+    def marshal_load(integer) # :nodoc:
+      initialize(integer)
     end
   end # BN
 end # OpenSSL

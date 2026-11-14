@@ -20,23 +20,35 @@
 
 require_relative 'tables'
 
-
+# :stopdoc:
 module UnicodeNormalize  # :nodoc:
   ## Constant for max hash capacity to avoid DoS attack
   MAX_HASH_LENGTH = 18000 # enough for all test cases, otherwise tests get slow
 
-  ## Regular Expressions and Hash Constants
+  ## Regular Expressions and Memoization Caches
   REGEXP_D = Regexp.compile(REGEXP_D_STRING, Regexp::EXTENDED)
   REGEXP_C = Regexp.compile(REGEXP_C_STRING, Regexp::EXTENDED)
   REGEXP_K = Regexp.compile(REGEXP_K_STRING, Regexp::EXTENDED)
-  NF_HASH_D = Hash.new do |hash, key|
-                         hash.shift if hash.length>MAX_HASH_LENGTH # prevent DoS attack
-                         hash[key] = nfd_one(key)
-                       end
-  NF_HASH_C = Hash.new do |hash, key|
-                         hash.shift if hash.length>MAX_HASH_LENGTH # prevent DoS attack
-                         hash[key] = nfc_one(key)
-                       end
+
+  # Memoized per-pattern results, kept per Ractor: a shareable Hash could not be
+  # written to, and recomputing an entry always gives the same string.
+  def self.nf_hash_d
+    Ractor.store_if_absent(:__unicode_normalize_nf_hash_d__) do
+      Hash.new do |hash, key|
+        hash.shift if hash.length>MAX_HASH_LENGTH # prevent DoS attack
+        hash[key] = nfd_one(key)
+      end
+    end
+  end
+
+  def self.nf_hash_c
+    Ractor.store_if_absent(:__unicode_normalize_nf_hash_c__) do
+      Hash.new do |hash, key|
+        hash.shift if hash.length>MAX_HASH_LENGTH # prevent DoS attack
+        hash[key] = nfc_one(key)
+      end
+    end
+  end
 
   ## Constants For Hangul
   # for details such as the meaning of the identifiers below, please see
@@ -53,7 +65,7 @@ module UnicodeNormalize  # :nodoc:
 
   # Unicode-based encodings (except UTF-8)
   UNICODE_ENCODINGS = [Encoding::UTF_16BE, Encoding::UTF_16LE, Encoding::UTF_32BE, Encoding::UTF_32LE,
-                       Encoding::GB18030, Encoding::UCS_2BE, Encoding::UCS_4BE]
+                       Encoding::GB18030, Encoding::UCS_2BE, Encoding::UCS_4BE].freeze
 
   ## Hangul Algorithm
   def self.hangul_decomp_one(target)
@@ -82,16 +94,22 @@ module UnicodeNormalize  # :nodoc:
 
   ## Canonical Ordering
   def self.canonical_ordering_one(string)
-    sorting = string.each_char.collect { |c| [c, CLASS_TABLE[c]] }
-    (sorting.length-2).downto(0) do |i| # almost, but not exactly bubble sort
-      (0..i).each do |j|
-        later_class = sorting[j+1].last
-        if 0<later_class and later_class<sorting[j].last
-          sorting[j], sorting[j+1] = sorting[j+1], sorting[j]
-        end
+    result = ''
+    unordered = []
+    chars = string.chars
+    n = chars.size
+    chars.each_with_index do |char, i|
+      ccc = CLASS_TABLE[char]
+      if ccc == 0
+        unordered.sort!.each { result << chars[it % n] }
+        unordered.clear
+        result << char
+      else
+        unordered << ccc * n + i
       end
     end
-    return sorting.collect(&:first).join('')
+    unordered.sort!.each { result << chars[it % n] }
+    result
   end
 
   ## Normalization Forms for Patterns (not whole Strings)
@@ -105,16 +123,22 @@ module UnicodeNormalize  # :nodoc:
     start = nfd_string[0]
     last_class = CLASS_TABLE[start]-1
     accents = ''
+    result = ''
     nfd_string[1..-1].each_char do |accent|
       accent_class = CLASS_TABLE[accent]
       if last_class<accent_class and composite = COMPOSITION_TABLE[start+accent]
         start = composite
+      elsif accent_class == 0
+        result << start << accents
+        start = accent
+        accents = ''
+        last_class = -1
       else
         accents << accent
         last_class = accent_class
       end
     end
-    hangul_comp_one(start+accents)
+    hangul_comp_one(result+start+accents)
   end
 
   def self.normalize(string, form = :nfc)
@@ -123,13 +147,13 @@ module UnicodeNormalize  # :nodoc:
     when Encoding::UTF_8
       case form
       when :nfc then
-        string.gsub REGEXP_C, NF_HASH_C
+        string.gsub REGEXP_C, nf_hash_c
       when :nfd then
-        string.gsub REGEXP_D, NF_HASH_D
+        string.gsub REGEXP_D, nf_hash_d
       when :nfkc then
-        string.gsub(REGEXP_K, KOMPATIBLE_TABLE).gsub(REGEXP_C, NF_HASH_C)
+        string.gsub(REGEXP_K, KOMPATIBLE_TABLE).gsub(REGEXP_C, nf_hash_c)
       when :nfkd then
-        string.gsub(REGEXP_K, KOMPATIBLE_TABLE).gsub(REGEXP_D, NF_HASH_D)
+        string.gsub(REGEXP_K, KOMPATIBLE_TABLE).gsub(REGEXP_D, nf_hash_d)
       else
         raise ArgumentError, "Invalid normalization form #{form}."
       end
@@ -148,13 +172,17 @@ module UnicodeNormalize  # :nodoc:
     when Encoding::UTF_8
       case form
       when :nfc then
+        hash = nil # a string without a match never needs the cache
         string.scan REGEXP_C do |match|
-          return false  if NF_HASH_C[match] != match
+          hash ||= nf_hash_c
+          return false  if hash[match] != match
         end
         true
       when :nfd then
+        hash = nil
         string.scan REGEXP_D do |match|
-          return false  if NF_HASH_D[match] != match
+          hash ||= nf_hash_d
+          return false  if hash[match] != match
         end
         true
       when :nfkc then

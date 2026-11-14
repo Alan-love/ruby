@@ -10,12 +10,17 @@
 
 /* per-object */
 
-struct gen_ivtbl {
-    uint32_t numiv;
-    VALUE ivptr[FLEX_ARY_LEN];
-};
+#include "shape.h"
 
-int rb_ivar_generic_ivtbl_lookup(VALUE obj, struct gen_ivtbl **);
-VALUE rb_ivar_generic_lookup_with_index(VALUE obj, ID id, uint32_t index);
+VALUE rb_obj_fields(VALUE obj, ID field_name);
+
+static inline VALUE
+rb_obj_fields_no_ractor_check(VALUE obj)
+{
+    return rb_obj_fields(obj, 0);
+}
+
+void rb_free_rb_global_tbl(void);
+void rb_free_generic_fields_tbl_(void);
 
 #endif /* RUBY_TOPLEVEL_VARIABLE_H */

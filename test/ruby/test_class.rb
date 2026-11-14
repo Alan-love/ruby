@@ -83,12 +83,6 @@ class TestClass < Test::Unit::TestCase
     assert_nil(Class.new <=> 1)
   end
 
-  def test_class_initialize
-    assert_raise(TypeError) do
-      Class.new.instance_eval { initialize }
-    end
-  end
-
   def test_instantiate_singleton_class
     c = class << Object.new; self; end
     assert_raise(TypeError) { c.new }
@@ -96,6 +90,13 @@ class TestClass < Test::Unit::TestCase
 
   def test_superclass_of_basicobject
     assert_equal(nil, BasicObject.superclass)
+
+    assert_separately([], "#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      module Mod end
+      BasicObject.include(Mod)
+      assert_equal(nil, BasicObject.superclass)
+    end;
   end
 
   def test_module_function
@@ -252,6 +253,46 @@ class TestClass < Test::Unit::TestCase
     assert_raise(TypeError) { BasicObject.dup }
   end
 
+  def test_class_hierarchy_inside_initialize_dup_bug_21538
+    ancestors = sc_ancestors = nil
+    b = Class.new
+    b.define_singleton_method(:initialize_dup) do |x|
+      ancestors = self.ancestors
+      sc_ancestors = singleton_class.ancestors
+      super(x)
+    end
+
+    a = Class.new(b)
+
+    c = a.dup
+
+    expected_ancestors = [c, b, *Object.ancestors]
+    expected_sc_ancestors = [c.singleton_class, b.singleton_class, *Object.singleton_class.ancestors]
+    assert_equal expected_ancestors, ancestors
+    assert_equal expected_sc_ancestors, sc_ancestors
+    assert_equal expected_ancestors, c.ancestors
+    assert_equal expected_sc_ancestors, c.singleton_class.ancestors
+  end
+
+  def test_class_hierarchy_inside_initialize_clone_bug_21538
+    ancestors = sc_ancestors = nil
+    a = Class.new
+    a.define_singleton_method(:initialize_clone) do |x|
+      ancestors = self.ancestors
+      sc_ancestors = singleton_class.ancestors
+      super(x)
+    end
+
+    c = a.clone
+
+    expected_ancestors = [c,  *Object.ancestors]
+    expected_sc_ancestors = [c.singleton_class, *Object.singleton_class.ancestors]
+    assert_equal expected_ancestors, ancestors
+    assert_equal expected_sc_ancestors, sc_ancestors
+    assert_equal expected_ancestors, c.ancestors
+    assert_equal expected_sc_ancestors, c.singleton_class.ancestors
+  end
+
   def test_singleton_class
     assert_raise(TypeError) { 1.extend(Module.new) }
     assert_raise(TypeError) { 1.0.extend(Module.new) }
@@ -270,18 +311,18 @@ class TestClass < Test::Unit::TestCase
   end
 
   def test_uninitialized
-    assert_raise(TypeError) { Class.allocate.new }
-    assert_raise(TypeError) { Class.allocate.superclass }
-    bug6863 = '[ruby-core:47148]'
-    assert_raise(TypeError, bug6863) { Class.new(Class.allocate) }
+    assert_raise(TypeError) { Class.allocate }
 
     allocator = Class.instance_method(:allocate)
-    assert_raise_with_message(TypeError, /prohibited/) {
-      allocator.bind(Rational).call
-    }
-    assert_raise_with_message(TypeError, /prohibited/) {
-      allocator.bind_call(Rational)
-    }
+    assert_raise(TypeError) { allocator.bind_call(Class) }
+    assert_nothing_raised { allocator.bind(Rational).call }
+    assert_nothing_raised { allocator.bind_call(Rational) }
+  end
+
+  def test_singleton_class_new
+    assert_raise_with_message(TypeError, /singleton class/) { Integer.singleton_class.new }
+    assert_raise_with_message(TypeError, /singleton class/) { Class.new.singleton_class.new }
+    assert_raise_with_message(TypeError, /singleton class/) { Class.singleton_class.new }
   end
 
   def test_nonascii_name
@@ -309,6 +350,7 @@ class TestClass < Test::Unit::TestCase
 
   def test_invalid_return_from_class_definition
     assert_syntax_error("class C; return; end", /Invalid return/)
+    assert_syntax_error("class << Object; return; end", /Invalid return/)
   end
 
   def test_invalid_yield_from_class_definition
@@ -333,6 +375,33 @@ class TestClass < Test::Unit::TestCase
     assert_equal("mod#foo", copy.new.foo)
   end
 
+  def test_dup_of_frozen_class_is_not_frozen
+    original = Class.new
+    original.instance_variable_set(:@a, 1)
+    original.freeze
+
+    copy = original.dup
+    assert_not_predicate(copy, :frozen?)
+    copy.instance_variable_set(:@b, 2)
+    assert_equal([1, 2], [copy.instance_variable_get(:@a), copy.instance_variable_get(:@b)])
+
+    copy = original.clone(freeze: false)
+    assert_not_predicate(copy, :frozen?)
+    copy.instance_variable_set(:@b, 2)
+    assert_equal([1, 2], [copy.instance_variable_get(:@a), copy.instance_variable_get(:@b)])
+  end
+
+  def test_singleton_class_of_frozen_class_is_frozen
+    klass = Class.new.freeze
+    assert_predicate(klass.singleton_class, :frozen?)
+    assert_raise(FrozenError) {klass.singleton_class.instance_variable_set(:@a, 1)}
+
+    copy = Class.new.freeze.clone
+    assert_predicate(copy, :frozen?)
+    assert_predicate(copy.singleton_class, :frozen?)
+    assert_raise(FrozenError) {copy.instance_variable_set(:@a, 1)}
+  end
+
   def test_nested_class_removal
     assert_normal_exit('File.__send__(:remove_const, :Stat); at_exit{File.stat(".")}; GC.start')
   end
@@ -353,6 +422,17 @@ class TestClass < Test::Unit::TestCase
       end
     END
     assert_equal(42, PrivateClass.new.foo)
+  end
+
+  def test_private_const_access
+    assert_raise_with_message NameError, /uninitialized/ do
+      begin
+        eval('class ::TestClass::PrivateClass; end')
+      rescue NameError
+      end
+
+      Object.const_get "NOT_AVAILABLE_CONST_NAME_#{__LINE__}"
+    end
   end
 
   StrClone = String.clone
@@ -380,21 +460,24 @@ class TestClass < Test::Unit::TestCase
   end
 
   class CloneTest
+    TEST = :C0
     def foo; TEST; end
   end
 
   CloneTest1 = CloneTest.clone
   CloneTest2 = CloneTest.clone
   class CloneTest1
+    remove_const :TEST
     TEST = :C1
   end
   class CloneTest2
+    remove_const :TEST
     TEST = :C2
   end
 
   def test_constant_access_from_method_in_cloned_class
-    assert_equal :C1, CloneTest1.new.foo, '[Bug #15877]'
-    assert_equal :C2, CloneTest2.new.foo, '[Bug #15877]'
+    assert_equal :C0, CloneTest1.new.foo, 'originally [Bug #15877], but behaviour changed'
+    assert_equal :C0, CloneTest2.new.foo, 'originally [Bug #15877], but behaviour changed'
   end
 
   def test_invalid_superclass
@@ -546,7 +629,7 @@ class TestClass < Test::Unit::TestCase
     obj = Object.new
     c = obj.singleton_class
     obj.freeze
-    assert_raise_with_message(FrozenError, /frozen object/) {
+    assert_raise_with_message(FrozenError, /frozen Object/) {
       c.class_eval {def f; end}
     }
   end
@@ -678,12 +761,37 @@ class TestClass < Test::Unit::TestCase
     }
   end
 
+  def test_dynamic_module_cpath_constant_namespace # [Bug #20948]
+    assert_separately([], <<~'RUBY')
+      module M1
+        module Foo
+          X = 1
+        end
+      end
+
+      module M2
+        module Foo
+          X = 2
+        end
+      end
+
+      results = [M1, M2].map do
+        module it::Foo
+          X
+        end
+      end
+      assert_equal([1, 2], results)
+    RUBY
+  end
+
   def test_namescope_error_message
     m = Module.new
     o = m.module_eval "class A\u{3042}; self; end.new"
-    assert_raise_with_message(TypeError, /A\u{3042}/) {
-      o::Foo
-    }
+    EnvUtil.with_default_internal(Encoding::UTF_8) do
+      assert_raise_with_message(TypeError, /A\u{3042}/) {
+        o::Foo
+      }
+    end
   end
 
   def test_redefinition_mismatch
@@ -702,9 +810,13 @@ class TestClass < Test::Unit::TestCase
 
     assert_separately([], "#{<<~"begin;"}\n#{<<~"end;"}")
     begin;
-      Date = (class C\u{1f5ff}; self; end).new
+      module Bug
+        module Class
+          TestClassDefinedInC = (class C\u{1f5ff}; self; end).new
+        end
+      end
       assert_raise_with_message(TypeError, /C\u{1f5ff}/) {
-        require 'date'
+        require '-test-/class'
       }
     end;
   end
@@ -738,7 +850,7 @@ class TestClass < Test::Unit::TestCase
     assert_same(c, Module.new.const_set(:Foo, c))
   end
 
-  def test_descendants
+  def test_subclasses
     c = Class.new
     sc = Class.new(c)
     ssc = Class.new(sc)
@@ -746,36 +858,161 @@ class TestClass < Test::Unit::TestCase
       k.include Module.new
       k.new.define_singleton_method(:force_singleton_class){}
     end
-    assert_equal([sc, ssc], c.descendants)
-    assert_equal([ssc], sc.descendants)
-    assert_equal([], ssc.descendants)
+    assert_equal([sc], c.subclasses)
+    assert_equal([ssc], sc.subclasses)
+    assert_equal([], ssc.subclasses)
 
-    object_descendants = Object.descendants
-    assert_include(object_descendants, c)
-    assert_include(object_descendants, sc)
-    assert_include(object_descendants, ssc)
+    object_subclasses = Object.subclasses
+    assert_include(object_subclasses, c)
+    assert_not_include(object_subclasses, sc)
+    assert_not_include(object_subclasses, ssc)
+    object_subclasses.each do |subclass|
+      assert_equal Object, subclass.superclass, "Expected #{subclass}.superclass to be Object"
+    end
   end
 
-  def test_descendants_gc
+  def test_subclasses_includes_clone
     c = Class.new
-    100000.times { Class.new(c) }
-    assert(c.descendants.size <= 100000)
+    with_include = Class.new(c) { include Module.new }
+    with_prepend = Class.new(c) { prepend Module.new }
+    plain = Class.new(c)
+
+    bug22190 = '[ruby-core:126038] [Bug #22190]'
+    clones = [with_include, with_prepend, plain].flat_map {|k| [k.clone, k.dup]}
+    subclasses = c.subclasses
+    clones.each do |k|
+      assert_equal(1, subclasses.count(k), "#{bug22190} expected #{k.inspect} to appear in subclasses exactly once")
+    end
   end
 
-  def test_descendants_gc_stress
+  def test_attached_object
+    c = Class.new
+    sc = c.singleton_class
+    obj = c.new
+
+    assert_equal(obj, obj.singleton_class.attached_object)
+    assert_equal(c, sc.attached_object)
+
+    assert_raise_with_message(TypeError, /is not a singleton class/) do
+      c.attached_object
+    end
+
+    assert_raise_with_message(TypeError, /'NilClass' is not a singleton class/) do
+      nil.singleton_class.attached_object
+    end
+
+    assert_raise_with_message(TypeError, /'FalseClass' is not a singleton class/) do
+      false.singleton_class.attached_object
+    end
+
+    assert_raise_with_message(TypeError, /'TrueClass' is not a singleton class/) do
+      true.singleton_class.attached_object
+    end
+  end
+
+  def test_subclass_gc
+    c = Class.new
+    10_000.times do
+      cc = Class.new(c)
+      100.times { Class.new(cc) }
+    end
+    assert(c.subclasses.size <= 10_000)
+  end
+
+  def test_subclass_gc_stress
     10000.times do
       c = Class.new
       100.times { Class.new(c) }
-      assert(c.descendants.size <= 100)
+      assert(c.subclasses.size <= 100)
     end
   end
 
   def test_classext_memory_leak
-    assert_no_memory_leak([], <<-PREP, <<-CODE, rss: true)
-code = proc { Class.new }
-1_000.times(&code)
-PREP
-3_000_000.times(&code)
-CODE
+    assert_no_memory_leak([], "", "30_000.times {Class.new}", rss: true, samples: 2..100)
+  end
+
+  def test_instance_freeze_dont_freeze_the_class_bug_19164
+    klass = Class.new
+    klass.prepend(Module.new)
+
+    klass.new.freeze
+    klass.define_method(:bar) {}
+    assert_equal klass, klass.remove_method(:bar), '[Bug #19164]'
+  end
+
+  def test_method_table_assignment_just_after_class_init
+    assert_normal_exit "#{<<~"begin;"}\n#{<<~'end;'}", 'm_tbl assignment should be done only when Class object is not promoted'
+    begin;
+      GC.stress = true
+      class C; end
+    end;
+  end
+
+  def test_define_singleton_initialize
+    assert_normal_exit "#{<<~"begin;"}\n#{<<~'end;'}"
+    begin;
+      class C
+        def self.initialize
+        end
+      end
+    end;
+  end
+
+  def test_singleton_cc_invalidation
+    assert_separately([], "#{<<~"begin;"}\n#{<<~"end;"}")
+    begin;
+      class T
+        def hi
+          "hi"
+        end
+      end
+
+      t = T.new
+      t.singleton_class
+
+      def hello(t)
+        t.hi
+      end
+
+      5.times do
+        hello(t) # populate inline cache on `t.singleton_class`.
+      end
+
+      class T
+        remove_method :hi # invalidate `t.singleton_class` ccs for `hi`
+      end
+
+      assert_raise NoMethodError do
+        hello(t)
+      end
+    end;
+  end
+
+  def test_safe_multi_ractor_subclasses_list_mutation
+    assert_ractor "#{<<~"begin;"}\n#{<<~'end;'}", signal: :SEGV
+    begin;
+      4.times.map do
+        Ractor.new do
+          20_000.times do
+            Object.new.singleton_class
+          end
+        end
+      end.each(&:join)
+    end;
+  end
+
+  def test_safe_multi_ractor_singleton_class_access
+    assert_ractor "#{<<~"begin;"}\n#{<<~'end;'}"
+    begin;
+      class A; end
+      4.times.map do
+        Ractor.new do
+          a = A
+          100.times do
+            a = a.singleton_class
+          end
+        end
+      end.each(&:join)
+    end;
   end
 end

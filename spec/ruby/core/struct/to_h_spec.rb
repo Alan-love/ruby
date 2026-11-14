@@ -21,20 +21,32 @@ describe "Struct#to_h" do
       h.should == { "make" => "ford", "model" => "ranger", "year" => "" }
     end
 
+    it "passes to a block each pair's key and value as separate arguments" do
+      s = StructClasses::Ruby.new('3.2.4', 'macos')
+
+      ScratchPad.record []
+      s.to_h { |k, v| ScratchPad << [k, v]; [k, v] }
+      ScratchPad.recorded.sort.should == [[:platform, 'macos'], [:version, '3.2.4']]
+
+      ScratchPad.record []
+      s.to_h { |*args| ScratchPad << args; [args[0], args[1]] }
+      ScratchPad.recorded.sort.should == [[:platform, 'macos'], [:version, '3.2.4']]
+    end
+
     it "raises ArgumentError if block returns longer or shorter array" do
       -> do
         StructClasses::Car.new.to_h { |k, v| [k.to_s, "#{v}".downcase, 1] }
-      end.should raise_error(ArgumentError, /element has wrong array length/)
+      end.should.raise(ArgumentError, /element has wrong array length/)
 
       -> do
         StructClasses::Car.new.to_h { |k, v| [k] }
-      end.should raise_error(ArgumentError, /element has wrong array length/)
+      end.should.raise(ArgumentError, /element has wrong array length/)
     end
 
     it "raises TypeError if block returns something other than Array" do
       -> do
         StructClasses::Car.new.to_h { |k, v| "not-array" }
-      end.should raise_error(TypeError, /wrong element type String/)
+      end.should.raise(TypeError, /wrong element type String/)
     end
 
     it "coerces returned pair to Array with #to_ary" do
@@ -50,7 +62,7 @@ describe "Struct#to_h" do
 
       -> do
         StructClasses::Car.new.to_h { |k| x }
-      end.should raise_error(TypeError, /wrong element type MockObject/)
+      end.should.raise(TypeError, /wrong element type MockObject/)
     end
   end
 end

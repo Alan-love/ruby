@@ -1,268 +1,350 @@
 @echo off
-@setlocal disabledelayedexpansion
-set witharg=
+@setlocal EnableExtensions DisableDelayedExpansion || exit /b -1
+set PROMPT=$E[94m+$E[m$S
+goto :main
 
-for %%I in (%0) do if /%%~dpI/ == /%CD%\/ (
+:set
+set %*
+exit /b
+
+:shift
+call %~dp0shellsplit.cmd
+set "argv1=%argv2%"
+set "argv2=%argv%"
+if not defined argv1 if defined argv2 goto :shift
+exit /b
+
+:take_arg
+if defined arg exit /b
+if not defined argv2 exit /b
+if not "%argv2:~0,1%"=="-" (set "arg=%argv2%" & call :shift)
+exit /b
+
+:main
+if "%~dp0" == "%CD%\" (
     echo don't run in win32 directory.
     exit /b 999
+) else if "%~0" == "%~nx0" (
+    set "WIN32DIR=%~$PATH:0"
+) else if "%~0" == "%~n0" (
+    set "WIN32DIR=%~$PATH:0"
+) else (
+    set "WIN32DIR=%~0"
 )
 
-echo> ~tmp~.mak ####
-echo>> ~tmp~.mak conf = %0
-echo>> ~tmp~.mak $(conf): nul
-echo>> ~tmp~.mak 	@del ~setup~.mak
-echo>> ~tmp~.mak 	@$(MAKE) -l$(MAKEFLAGS) -f $(@D)/setup.mak \
-if exist pathlist.tmp del pathlist.tmp
-echo>confargs.tmp #define CONFIGURE_ARGS \
+set "WIN32DIR=%WIN32DIR:\=/%:/:"
+call :set "WIN32DIR=%%WIN32DIR:%~x0:/:=:/:%%"
+call :set "WIN32DIR=%%WIN32DIR:/%~n0:/:=:/:%%"
+set "WIN32DIR=%WIN32DIR:~0,-3%"
+
+set configure=%~0
+set args=%*
+set target=
+set optdirs=
+set pathlist=
+set config_make=confargs~%RANDOM%.mak
+set confargs=%config_make:.mak=.sub%
+set debug_configure=
+set MAKEFILE=Makefile
+set make_command=nmake
+set cc_arg=
+echo>%config_make% # CONFIGURE
+type nul > %confargs%
 :loop
-set opt=%1
-if "%1" == "" goto :end
-if "%1" == "--prefix" goto :prefix
-if "%1" == "--srcdir" goto :srcdir
-if "%1" == "srcdir" goto :srcdir
-if "%1" == "--target" goto :target
-if "%1" == "target" goto :target
-if "%1" == "--with-static-linked-ext" goto :extstatic
-if "%1" == "--program-prefix" goto :pprefix
-if "%1" == "--program-suffix" goto :suffix
-if "%1" == "--program-name" goto :installname
-if "%1" == "--install-name" goto :installname
-if "%1" == "--so-name" goto :soname
-if "%1" == "--enable-install-doc" goto :enable-rdoc
-if "%1" == "--disable-install-doc" goto :disable-rdoc
-if "%1" == "--enable-install-static-library" goto :enable-lib
-if "%1" == "--disable-install-static-library" goto :disable-lib
-if "%1" == "--enable-debug-env" goto :enable-debug-env
-if "%1" == "--disable-debug-env" goto :disable-debug-env
-if "%1" == "--enable-rubygems" goto :enable-rubygems
-if "%1" == "--disable-rubygems" goto :disable-rubygems
-if "%1" == "--enable-mjit-support" goto :enable-mjit-support
-if "%1" == "--disable-mjit-support" goto :disable-mjit-support
-if "%1" == "--extout" goto :extout
-if "%1" == "--path" goto :path
-if "%1" == "--with-baseruby" goto :baseruby
-if "%1" == "--without-baseruby" goto :baseruby
-if "%1" == "--with-ntver" goto :ntver
-if "%1" == "--with-libdir" goto :libdir
-if "%1" == "--with-git" goto :git
-if "%1" == "--without-git" goto :nogit
-if "%1" == "--without-ext" goto :witharg
-if "%1" == "--without-extensions" goto :witharg
-if "%opt:~0,10%" == "--without-" goto :withoutarg
-if "%opt:~0,7%" == "--with-" goto :witharg
-if "%1" == "-h" goto :help
-if "%1" == "--help" goto :help
-  if "%opt:~0,1%" == "-" (
-    echo>>confargs.tmp  %1 \
-    set witharg=
-  ) else if "%witharg" == "" (
-    echo>>confargs.tmp  %1 \
+call :shift
+if not defined argv1 goto :end
+for /f "delims== tokens=1,*" %%I in (" %argv1% ") do ((set "opt=%%I") && (set "arg=%%J"))
+  set "opt=%opt:~1%"
+  if defined arg (
+    set "eq=="
+    set "arg=%arg:~0,-1%"
   ) else (
-    echo>>confargs.tmp ,%1\
+    set "eq="
+    set "opt=%opt:~0,-1%"
   )
-  shift
-goto :loop ;
-:srcdir
-  echo>> ~tmp~.mak 	"srcdir=%~2" \
-  echo>>confargs.tmp --srcdir=%2 \
-  shift
-  shift
-goto :loop ;
-:prefix
-  echo>> ~tmp~.mak 	"prefix=%~2" \
-  echo>>confargs.tmp  %1=%2 \
-  shift
-  shift
-goto :loop ;
-:pprefix
-  echo>> ~tmp~.mak 	"PROGRAM_PREFIX=%~2" \
-  echo>>confargs.tmp  %1=%2 \
-  shift
-  shift
-goto :loop ;
-:suffix
-  echo>> ~tmp~.mak 	"PROGRAM_SUFFIX=%~2" \
-  echo>>confargs.tmp  %1=%2 \
-  shift
-  shift
-goto :loop ;
-:installname
-  echo>> ~tmp~.mak 	"RUBY_INSTALL_NAME=%~2" \
-  echo>>confargs.tmp  %1=%2 \
-  shift
-  shift
-goto :loop ;
-:soname
-  echo>> ~tmp~.mak 	"RUBY_SO_NAME=%~2" \
-  echo>>confargs.tmp  %1=%2 \
-  shift
-  shift
+  if "%opt%"=="" (
+    echo 1>&2 %configure%: assignment for empty variable name %argv1%
+    exit /b 1
+  )
+  if "%opt%" == "--debug-configure" (
+    echo on
+    set "debug_configure=yes"
+    goto :loop ;
+  )
+  if "%opt%" == "--no-debug-configure" (
+    echo off
+    set "debug_configure="
+    goto :loop ;
+  )
+  if "%opt%" == "--prefix" goto :dir
+  if "%opt%" == "srcdir" set "opt=--srcdir"
+  if "%opt%" == "--srcdir" goto :dir
+  if "%opt%" == "--target" goto :target
+  if "%opt%" == "target" goto :target
+  if "%opt:~0,10%" == "--program-" goto :program_name
+  if "%opt%" == "--install-name" (set "var=RUBY_INSTALL_NAME" & goto :name)
+  if "%opt%" == "--so-name" (set "var=RUBY_SO_NAME" & goto :name)
+  if "%opt%" == "--extout" goto :extout
+  if "%opt%" == "--path" goto :path
+  if "%opt:~0,9%" == "--enable-" (set "enable=yes" & goto :enable)
+  if "%opt:~0,10%" == "--disable-" (set "enable=no" & goto :enable)
+  if "%opt:~0,10%" == "--without-" goto :withoutarg
+  if "%opt:~0,7%" == "--with-" goto :witharg
+  if "%opt%" == "-h" goto :help
+  if "%opt%" == "--help" goto :help
+  if "%opt:~0,1%" == "-" (
+    goto :unknown_opt
+  )
+  if "%eq%" == "=" (
+    set "var=%opt%"
+    goto :name
+  )
+  set "arg=%opt%"
+  set "eq=="
+  set "opt=--target"
+  set "target=%arg%"
+:loopend
+  if not "%arg%" == "" (
+    echo>>%confargs%  "%opt%=%arg:$=$$%" \
+  ) else (
+    echo>>%confargs%  "%opt%%eq%" \
+  )
 goto :loop ;
 :target
-  echo>> ~tmp~.mak 	"%~2" \
-  echo>>confargs.tmp --target=%2 \
-  if NOT "%~2" == "x64-mswin64" goto target3
-:target2
-  echo>> ~tmp~.mak 	"TARGET_OS=mswin64" \
-:target3
-  shift
-  shift
+  if "%eq%" == "" call :take_arg
+  if "%arg%" == "" (
+    echo 1>&2 %configure%: missing argument for %opt%
+    exit /b 1
+  )
+  set "target=%arg%"
+  set "opt=--target"
+  echo>>%confargs%  "--target=%arg:$=$$%" \
 goto :loop ;
-:extstatic
-  echo>> ~tmp~.mak 	"EXTSTATIC=static" \
-  echo>>confargs.tmp  %1 \
-  shift
-goto :loop ;
-:enable-rdoc
-  echo>> ~tmp~.mak 	"RDOCTARGET=rdoc" \
-  echo>>confargs.tmp  %1 \
-  shift
-goto :loop ;
-:disable-rdoc
-  echo>> ~tmp~.mak 	"RDOCTARGET=nodoc" \
-  echo>>confargs.tmp  %1 \
-  shift
-goto :loop ;
-:enable-lib
-  echo>> ~tmp~.mak 	"INSTALL_STATIC_LIBRARY=yes" \
-  echo>>confargs.tmp  %1 \
-  shift
-goto :loop ;
-:disable-lib
-  echo>> ~tmp~.mak 	"INSTALL_STATIC_LIBRARY=no" \
-  echo>>confargs.tmp  %1 \
-  shift
-goto :loop ;
-:enable-debug-env
-  echo>> ~tmp~.mak 	"ENABLE_DEBUG_ENV=yes" \
-  echo>>confargs.tmp  %1 \
-  shift
-goto :loop ;
-:disable-debug-env
-  echo>> ~tmp~.mak 	"ENABLE_DEBUG_ENV=no" \
-  echo>>confargs.tmp  %1 \
-  shift
-goto :loop ;
-:enable-rubygems
-  echo>> ~tmp~.mak 	"USE_RUBYGEMS=yes" \
-  echo>>confargs.tmp  %1 \
-  shift
-goto :loop ;
-:disable-rubygems
-  echo>> ~tmp~.mak 	"USE_RUBYGEMS=no" \
-  echo>>confargs.tmp  %1 \
-  shift
-goto :loop ;
-:enable-mjit-support
-  echo>> ~tmp~.mak 	"MJIT_SUPPORT=yes" \
-  echo>>confargs.tmp  %1 \
-  shift
-goto :loop ;
-:disable-mjit-support
-  echo>> ~tmp~.mak 	"MJIT_SUPPORT=no" \
-  echo>>confargs.tmp  %1 \
-  shift
-goto :loop ;
-:ntver
-  echo>> ~tmp~.mak 	"NTVER=%~2" \
-  echo>>confargs.tmp  %1=%2 \
-  shift
-  shift
-goto :loop ;
-:extout
-  echo>> ~tmp~.mak 	"EXTOUT=%~2" \
-  echo>>confargs.tmp  %1=%2 \
-  shift
-  shift
-goto :loop ;
-:path
-  echo>>pathlist.tmp %~2;\
-  echo>>confargs.tmp  %1=%2 \
-  shift
-  shift
-goto :loop ;
-:baseruby
-  echo>> ~tmp~.mak 	"BASERUBY=%~2" \
-  echo>>confargs.tmp  %1=%2 \
-  shift
-  shift
-goto :loop ;
-:nobaseruby
-  echo>> ~tmp~.mak 	"HAVE_BASERUBY=no" \
-  echo>>confargs.tmp  %1=%2 \
-  shift
-goto :loop ;
-:libdir
-  echo>> ~tmp~.mak 	"libdir_basename=%~2" \
-  echo>>confargs.tmp  %1=%2 \
-  shift
-  shift
-goto :loop ;
-:git
-  echo>> ~tmp~.mak 	"GIT=%~2" \
-  echo>>confargs.tmp  %1=%2 \
-  shift
-  shift
-goto :loop ;
-:nogit
-  echo>> ~tmp~.mak 	"GIT=never-use" \
-  echo>> ~tmp~.mak 	"HAVE_GIT=no" \
-  echo>>confargs.tmp  %1 \
-  shift
+:program_name
+  for /f "delims=- tokens=1,*" %%I in ("%opt%") do set "var=%%J"
+  if "%var%" == "prefix" (set "var=PROGRAM_PREFIX" & goto :name)
+  if "%var%" == "suffix" (set "var=PROGRAM_SUFFIX" & goto :name)
+  if "%var%" == "name" (set "var=RUBY_INSTALL_NAME" & goto :name)
+  if "%var%" == "transform-name" (
+    echo.1>&2 %configure%: --program-transform-name option is not supported
+    exit /b 1
+  )
+goto :unknown_opt
+:name
+  if "%eq%" == "" call :take_arg
+  if "%var%" == "CC" set "cc_arg=yes"
+  echo>> %config_make% %var% = %arg%
+goto :loopend ;
+:dir
+  if "%eq%" == "" call :take_arg
+  if defined arg set "arg=%arg:\=/%"
+  echo>> %config_make% %opt:~2% = %arg%
+goto :loopend ;
+:enable
+  if %enable% == yes (
+    if "%eq%" == "" call :take_arg
+    set "feature=%opt:~9%"
+  ) else (
+    set "feature=%opt:~10%"
+  )
+  if %enable% == yes if defined arg (set "enable=%arg%")
+  if "%feature%" == "install-doc" (
+    echo>> %config_make% RDOCTARGET = %enable:yes=r%doc
+  )
+  if "%feature%" == "install-static-library" (
+    echo>> %config_make% INSTALL_STATIC_LIBRARY = %enable%
+  )
+  if "%feature%" == "debug-env" (
+    echo>> %config_make% ENABLE_DEBUG_ENV = %enable%
+  )
+  if "%feature%" == "devel" (
+    echo>> %config_make% RUBY_DEVEL = %enable%
+  )
+  if "%feature%" == "rubygems" (
+     echo>> %config_make% USE_RUBYGEMS = %enable%
+  )
+  if "%feature%" == "yjit" if not "%enable%" == "yes" if not "%enable%" == "no" (
+    echo 1>&2 %configure%: --enable-yjit accepts only yes or no, not %enable%
+    exit /b 1
+  )
+  if "%feature%" == "yjit" (
+     echo>> %config_make% YJIT_SUPPORT = %enable%
+  )
+goto :loopend ;
+:withoutarg
+  ::- These take an argument and are recorded in :witharg.  Recording
+  ::- them here too would duplicate them at each reconfiguration.
+  if "%opt%" == "--without-ext" goto :witharg
+  if "%opt%" == "--without-extensions" goto :witharg
+  if "%opt%" == "--without-mimalloc" echo>> %config_make% WITH_MIMALLOC = no
+  echo>>%confargs%  "%opt%" \
+  if "%opt%" == "--without-baseruby" goto :nobaseruby
+  if "%opt%" == "--without-git" goto :nogit
 goto :loop ;
 :witharg
-  echo>>confargs.tmp  %1=%2\
-  set witharg=1
-  shift
-  shift
+  if "%opt%" == "--with-static-linked-ext" goto :extstatic
+  if "%opt%" == "--with-mimalloc" goto :mimalloc
+  if "%eq%" == "" call :take_arg
+  if not "%arg%" == "" (
+    echo>>%confargs%  "%opt%=%arg:$=$$%" \
+  ) else (
+    echo>>%confargs%  "%opt%%eq%" \
+  )
+  if "%opt%" == "--with-baseruby" goto :baseruby
+  if "%opt%" == "--with-ntver" goto :ntver
+  if "%opt%" == "--with-libdir" goto :libdir
+  if "%opt%" == "--with-git" goto :git
+  if "%opt%" == "--with-opt-dir" goto :opt-dir
+  if "%opt%" == "--with-gmp-dir" goto :opt-dir
+  if "%opt%" == "--with-gmp" goto :gmp
+  if "%opt%" == "--with-destdir" goto :destdir
+  if "%opt%" == "--with-dump-ast" goto :dump-ast
+  if "%opt%" == "--with-gnu-make" goto :gnu-make
+  if "%opt%" == "--with-gnumake" goto :gnu-make
+  if "%opt%" == "--with-gmake" goto :gnu-make
 goto :loop ;
-:withoutarg
-  echo>>confargs.tmp  %1 \
-  shift
+:ntver
+  ::- For version constants, see
+  ::- https://learn.microsoft.com/en-us/cpp/porting/modifying-winver-and-win32-winnt#remarks
+  set "NTVER=%arg%"
+  if /i not "%NTVER:~0,2%" == "0x" if /i not "%NTVER:~0,13%" == "_WIN32_WINNT_" (
+    for %%i in (A B C D E F G H I J K L M N O P Q R S T U V W X Y Z) do (
+      call :set NTVER=%%NTVER:%%i=%%i%%
+    )
+    call :set NTVER=_WIN32_WINNT_%%NTVER%%
+  )
+  echo>> %config_make% NTVER = %NTVER%
+goto :loopend ;
+:extout
+  if "%eq%" == "" call :take_arg
+  if not "%arg%" == ".ext" (echo>> %config_make% EXTOUT = %arg%)
+goto :loopend ;
+:path
+  if "%eq%" == "" call :take_arg
+  set "pathlist=%pathlist%%arg:\=/%;"
+goto :loopend ;
+:extstatic
+  if "%eq%" == "" (set "arg=static")
+  echo>> %config_make% EXTSTATIC = %arg%
+goto :loopend ;
+:baseruby
+  echo>> %config_make% HAVE_BASERUBY = yes
+  echo>> %config_make% BASERUBY = %arg%
+goto :loop ;
+:nobaseruby
+  echo>> %config_make% HAVE_BASERUBY = no
+  echo>> %config_make% BASERUBY =
+goto :loop ;
+:libdir
+  echo>> %config_make% libdir_basename = %arg%
+goto :loop ;
+:git
+  echo>> %config_make% GIT = %arg%
+goto :loop ;
+:nogit
+  echo>> %config_make% GIT = never-use
+  echo>> %config_make% HAVE_GIT = no
+goto :loop ;
+:gmp
+  echo>> %config_make% WITH_GMP = yes
+goto :loop ;
+:mimalloc
+  if "%eq%" == "" (set "arg=yes")
+  echo>> %config_make% WITH_MIMALLOC = %arg%
+goto :loopend ;
+:destdir
+  echo>> %config_make% DESTDIR = %arg%
+goto :loop ;
+:dump-ast
+  echo>> %config_make% DUMP_AST = %arg%
+goto :loop ;
+:gnu-make
+  set "MAKEFILE=GNUmakefile"
+  if defined arg (set "make_command=%arg%") else (set "make_command=make")
+goto :loop ;
+:opt-dir
+  if "%arg%" == "" (
+    echo 1>&2 %configure%: missing argument for %opt%
+    exit /b 1
+  )
+  :optdir-loop
+  for /f "delims=; tokens=1,*" %%I in ("%arg%") do (set "d=%%I" & set "arg=%%J")
+    pushd %d:/=\% 2> nul && (
+      call :set "optdirs=%optdirs%;%%CD:\=/%%"
+      popd
+    ) || (
+      set "optdirs=%optdirs%;%d:\=/%"
+    )
+  if not "%arg%" == "" goto :optdir-loop
 goto :loop ;
 :help
   echo Configuration:
   echo   --help                  display this help
-  echo   --srcdir=DIR            find the sources in DIR [configure dir or `..']
+  echo   --srcdir=DIR            find the sources in DIR [configure dir or '..']
   echo Installation directories:
   echo   --prefix=PREFIX         install files in PREFIX [/usr]
   echo System types:
   echo   --target=TARGET         configure for TARGET [i386-mswin32]
   echo Optional Package:
   echo   --with-baseruby=RUBY    use RUBY as baseruby [ruby]
+  echo   --with-gnu-make[=MAKE]  generate GNUmakefile for GNU make [make]
   echo   --with-static-linked-ext link external modules statically
   echo   --with-ext="a,b,..."    use extensions a, b, ...
   echo   --without-ext="a,b,..." ignore extensions a, b, ...
-  echo   --with-opt-dir=DIR-LIST add optional headers and libraries directories separated by `;'
+  echo   --with-opt-dir="DIR-LIST" add optional headers and libraries directories separated by ';'
+  echo   --with-mimalloc         allocate memory for the GC with mimalloc
   echo   --disable-install-doc   do not install rdoc indexes during install
+  echo   --enable-yjit           enable in-process JIT compiler that requires rustc (x64 and arm64)
   echo   --with-ntver=0xXXXX     target NT version (shouldn't use with old SDK)
-  del *.tmp
-  del ~tmp~.mak
-goto :exit
+  echo   --with-ntver=_WIN32_WINNT_XXXX
+  echo   --with-ntver=XXXX       same as --with-ntver=_WIN32_WINNT_XXXX
+  echo Note that parameters containing spaces must be enclosed within double quotes.
+  del %confargs% %config_make%
+goto :EOF
+:unknown_opt
+  (
+    echo %configure%: unknown option %opt%
+    echo Try --help option.
+  ) 1>&2
+  exit /b 1
 :end
-echo>> ~tmp~.mak 	WIN32DIR=$(@D:\=/)
-echo.>>confargs.tmp
-echo>confargs.c #define $ $$ //
-echo>>confargs.c !ifndef CONFIGURE_ARGS
-type>>confargs.c confargs.tmp
-echo>>confargs.c configure_args = CONFIGURE_ARGS
-echo>>confargs.c !endif
-echo>>confargs.c #undef $
-if exist pathlist.tmp echo>>confargs.c #define PATH_LIST \
-if exist pathlist.tmp type>>confargs.c pathlist.tmp
-if exist pathlist.tmp echo.>>confargs.c
-if exist pathlist.tmp echo>>confargs.c pathlist = PATH_LIST
-cl -EP confargs.c > ~setup~.mak 2>nul
-if exist pathlist.tmp echo>>~setup~.mak PATH = $(pathlist:;=/bin;)$(PATH)
-if exist pathlist.tmp echo>>~setup~.mak INCLUDE = $(pathlist:;=/include;)
-if exist pathlist.tmp echo>>~setup~.mak LIB = $(pathlist:;=/lib;)
-type>>~setup~.mak ~tmp~.mak
-del *.tmp > nul
-del ~tmp~.mak > nul
-echo>>~setup~.mak 	@if exist Makefile.old del Makefile.old
-echo>>~setup~.mak 	@if exist Makefile ren Makefile Makefile.old
-echo>>~setup~.mak 	@ren Makefile.new Makefile
-nmake -alf ~setup~.mak MAKEFILE=Makefile.new
-exit /b %ERRORLEVEL%
-:exit
-@endlocal
+::- Record CC from the environment as if given as an argument, so that
+::- the reconfiguration by make keeps it even from a shell without CC.
+if not defined cc_arg if defined CC echo>> %config_make% CC = %CC%
+if not defined cc_arg if defined CC echo>>%confargs%  "CC=%CC:$=$$%" \
+if "%debug_configure%" == "yes" (type %confargs%)
+if defined optdirs (echo>>%config_make% optdirs = %optdirs:~1%)
+(
+  echo.
+  echo configure_args = \
+  type %confargs%
+  echo # configure_args
+
+  if not "%MAKEFILE%" == "GNUmakefile" (
+    echo.
+    echo !if "$(optdirs)" != ""
+    for %%I in ("$(optdirs:\=/)" "$(optdirs:/;=;)") do @echo optdirs = %%~I
+    echo XINCFLAGS = -I"$(optdirs:;=/include" -I")/include"
+    echo XLDFLAGS = -libpath:"$(optdirs:;=/lib" -libpath:")/lib"
+    echo !endif
+  )
+
+  if not "%pathlist%" == "" (
+    echo.
+    call echo PATH = %%pathlist:;=/bin;%%$^(PATH^)
+    call echo INCLUDE = %%pathlist:;=/include;%%$^(INCLUDE^)
+    call echo LIB = %%pathlist:;=/lib;%%$^(LIB^)
+  )
+) >> %config_make%
+
+del %confargs%
+if "%debug_configure%" == "yes" (type %config_make%)
+
+nmake -al -f %WIN32DIR%/setup.mak "WIN32DIR=%WIN32DIR%" ^
+    config_make=%config_make% ^
+    MAKEFILE=%MAKEFILE%.new MAKEFILE_BACK=%MAKEFILE%.old MAKEFILE_NEW=%MAKEFILE% ^
+    make_command=%make_command% ^
+    %target%
+set error=%ERRORLEVEL%
+if exist %config_make% del /q %config_make%
+exit /b %error%

@@ -1,5 +1,5 @@
 # frozen_string_literal: true
 class ERB
-  VERSION = '2.2.3'
-  private_constant :VERSION
+  # The string \ERB version.
+  VERSION = '6.1.0'
 end

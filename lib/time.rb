@@ -24,7 +24,11 @@ require 'date'
 
 # :startdoc:
 
+# #
 class Time
+
+  VERSION = "0.5.0"             # :nodoc:
+
   class << Time
 
     #
@@ -76,7 +80,7 @@ class Time
     #
     # You must require 'time' to use this method.
     #
-    def zone_offset(zone, year=self.now.year)
+    def zone_offset(zone, year=nil)
       off = nil
       zone = zone.upcase
       if /\A([+-])(\d\d)(:?)(\d\d)(?:\3(\d\d))?\z/ =~ zone
@@ -85,10 +89,13 @@ class Time
         off = zone.to_i * 3600
       elsif ZoneOffset.include?(zone)
         off = ZoneOffset[zone] * 3600
-      elsif ((t = self.local(year, 1, 1)).zone.upcase == zone rescue false)
-        off = t.utc_offset
-      elsif ((t = self.local(year, 7, 1)).zone.upcase == zone rescue false)
-        off = t.utc_offset
+      else
+        year ||= self.now.year
+        if ((t = self.local(year, 1, 1)).zone.upcase == zone rescue false)
+          off = t.utc_offset
+        elsif ((t = self.local(year, 7, 1)).zone.upcase == zone rescue false)
+          off = t.utc_offset
+        end
       end
       off
     end
@@ -277,7 +284,7 @@ class Time
     #
     # This method **does not** function as a validator.  If the input
     # string does not match valid formats strictly, you may get a
-    # cryptic result.  Should consider to use `Time.strptime` instead
+    # cryptic result.  Should consider to use Time.strptime instead
     # of this method as possible.
     #
     #     require 'time'
@@ -362,6 +369,9 @@ class Time
     # If the extracted time zone abbreviation does not match any of them,
     # it is ignored and the given time is regarded as a local time.
     #
+    # A +zone+ argument can be provided to specify the zone for the given
+    # +date+, if the +date+ does not include a time zone or offset.
+    #
     # ArgumentError is raised if Date._parse cannot extract information from
     # +date+ or if the Time class cannot represent specified date.
     #
@@ -375,18 +385,20 @@ class Time
     #
     # You must require 'time' to use this method.
     #
-    def parse(date, now=self.now)
+    def parse(date, now=self.now, zone: nil)
       comp = !block_given?
       d = Date._parse(date, comp)
       year = d[:year]
       year = yield(year) if year && !comp
-      make_time(date, year, d[:yday], d[:mon], d[:mday], d[:hour], d[:min], d[:sec], d[:sec_fraction], d[:zone], now)
+      make_time(date, year, d[:yday], d[:mon], d[:mday], d[:hour], d[:min], d[:sec], d[:sec_fraction], d[:zone] || zone, now)
     end
 
     #
     # Works similar to +parse+ except that instead of using a
     # heuristic to detect the format of the input string, you provide
     # a second argument that describes the format of the string.
+    #
+    # Raises ArgumentError if the date or format is invalid.
     #
     # If a block is given, the year described in +date+ is converted by the
     # block.  For example:
@@ -402,7 +414,7 @@ class Time
     # %c :: The preferred local date and time representation
     # %C :: Century (20 in 2009)
     # %d :: Day of the month (01..31)
-    # %D :: Date (%m/%d/%y)
+    # %D :: \Date (%m/%d/%y)
     # %e :: Day of the month, blank-padded ( 1..31)
     # %F :: Equivalent to %Y-%m-%d (the ISO 8601 date format)
     # %g :: The last two digits of the commercial year
@@ -439,8 +451,8 @@ class Time
     # %X :: Preferred representation for the time alone, no date
     # %y :: Year without a century (00..99)
     # %Y :: Year which may include century, if provided
-    # %z :: Time zone as  hour offset from UTC (e.g. +0900)
-    # %Z :: Time zone name
+    # %z :: \Time zone as hour offset from UTC (e.g. +0900)
+    # %Z :: \Time zone name
     # %% :: Literal "%" character
     # %+ :: date(1) (%a %b %e %H:%M:%S %Z %Y)
     #
@@ -452,7 +464,7 @@ class Time
     #
     def strptime(date, format, now=self.now)
       d = Date._strptime(date, format)
-      raise ArgumentError, "invalid date or strptime format - `#{date}' `#{format}'" unless d
+      raise ArgumentError, "invalid date or strptime format - '#{date}' '#{format}'" unless d
       if seconds = d[:seconds]
         if sec_fraction = d[:sec_fraction]
           usec = sec_fraction * 1000000
@@ -498,7 +510,7 @@ class Time
     #     require 'time'
     #
     #     Time.rfc2822("Wed, 05 Oct 2011 22:26:12 -0400")
-    #     #=> 2010-10-05 22:26:12 -0400
+    #     #=> 2011-10-05 22:26:12 -0400
     #
     # You must require 'time' to use this method.
     #
@@ -509,8 +521,8 @@ class Time
           (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+
           (\d{2,})\s+
           (\d{2})\s*
-          :\s*(\d{2})\s*
-          (?::\s*(\d{2}))?\s+
+          :\s*(\d{2})
+          (?:\s*:\s*(\d\d))?\s+
           ([+-]\d{4}|
            UT|GMT|EST|EDT|CST|CDT|MST|MDT|PST|PDT|[A-IK-Z])/ix =~ date
         # Since RFC 2822 permit comments, the regexp has no right anchor.
@@ -615,13 +627,58 @@ class Time
     # You must require 'time' to use this method.
     #
     def xmlschema(time)
-      if /\A\s*
+      pattern = /\A\s*
           (-?\d+)-(\d\d)-(\d\d)
           T
           (\d\d):(\d\d):(\d\d)
           (\.\d+)?
           (Z|[+-]\d\d(?::?\d\d)?)?
-          \s*\z/ix =~ time
+          \s*\z/ix
+      _xmlschema(pattern, time) or
+        raise ArgumentError.new("invalid xmlschema format: #{time.inspect}")
+    end
+    alias iso8601 xmlschema
+
+    #
+    # Parses +time+ as a dateTime defined by RFC3339 and converts it to
+    # a Time object.
+    #
+    # ArgumentError is raised if +time+ is not compliant with the format or if
+    # the Time class cannot represent the specified time.
+    #
+    # See #xmlschema for more information on this format.
+    #
+    #     require 'time'
+    #
+    #     Time.rfc3339("2011-10-05T22:26:12-04:00")
+    #     #=> 2011-10-05 22:26:12-04:00
+    #
+    # You must require 'time' to use this method.
+    #
+    def rfc3339(time)
+      pattern = /\A\s*
+          (-?\d{4})-(\d\d)-(\d\d)
+          [T ]
+          (\d\d):(\d\d):(\d\d)
+          (\.\d+)?
+          (Z|[+-]\d\d:\d\d)
+          \s*\z/ix
+      _xmlschema(pattern, time) or
+        raise ArgumentError.new("invalid rfc3339 format: #{time.inspect}")
+    end
+
+    private
+
+    if RUBY_VERSION >= "3.2"
+      def _xmlschema(pattern, time) # :nodoc:
+        return unless pattern.match?(time)
+        time = time.strip
+        time.upcase!
+        new(time)
+      end
+    else
+      def _xmlschema(pattern, time) # :nodoc:
+        return unless pattern =~ time
         year = $1.to_i
         mon = $2.to_i
         day = $3.to_i
@@ -643,11 +700,9 @@ class Time
         else
           self.local(year, mon, day, hour, min, sec, usec)
         end
-      else
-        raise ArgumentError.new("invalid xmlschema format: #{time.inspect}")
       end
     end
-    alias iso8601 xmlschema
+
   end # class << self
 
   #
@@ -690,35 +745,37 @@ class Time
     getutc.strftime('%a, %d %b %Y %T GMT')
   end
 
-  #
-  # Returns a string which represents the time as a dateTime defined by XML
-  # Schema:
-  #
-  #   CCYY-MM-DDThh:mm:ssTZD
-  #   CCYY-MM-DDThh:mm:ss.sssTZD
-  #
-  # where TZD is Z or [+-]hh:mm.
-  #
-  # If self is a UTC time, Z is used as TZD.  [+-]hh:mm is used otherwise.
-  #
-  # +fractional_digits+ specifies a number of digits to use for fractional
-  # seconds.  Its default value is 0.
-  #
-  #     require 'time'
-  #
-  #     t = Time.now
-  #     t.iso8601  # => "2011-10-05T22:26:12-04:00"
-  #
-  # You must require 'time' to use this method.
-  #
-  def xmlschema(fraction_digits=0)
-    fraction_digits = fraction_digits.to_i
-    s = strftime("%FT%T")
-    if fraction_digits > 0
-      s << strftime(".%#{fraction_digits}N")
+  unless method_defined?(:xmlschema)
+    #
+    # Returns a string which represents the time as a dateTime defined by XML
+    # Schema:
+    #
+    #   CCYY-MM-DDThh:mm:ssTZD
+    #   CCYY-MM-DDThh:mm:ss.sssTZD
+    #
+    # where TZD is Z or [+-]hh:mm.
+    #
+    # If self is a UTC time, Z is used as TZD.  [+-]hh:mm is used otherwise.
+    #
+    # +fraction_digits+ specifies a number of digits to use for fractional
+    # seconds.  Its default value is 0.
+    #
+    #     require 'time'
+    #
+    #     t = Time.now
+    #     t.iso8601  # => "2011-10-05T22:26:12-04:00"
+    #
+    # You must require 'time' to use this method.
+    #
+    def xmlschema(fraction_digits=0)
+      fraction_digits = fraction_digits.to_i
+      s = strftime("%FT%T")
+      if fraction_digits > 0
+        s << strftime(".%#{fraction_digits}N")
+      end
+      s << (utc? ? 'Z' : strftime("%:z"))
     end
-    s << (utc? ? 'Z' : strftime("%:z"))
   end
-  alias iso8601 xmlschema
+  alias iso8601 xmlschema unless method_defined?(:iso8601)
+  alias rfc3339 xmlschema
 end
-

@@ -3,7 +3,7 @@ require_relative 'fixtures/caller_locations'
 
 describe 'Kernel#caller_locations' do
   it 'is a private method' do
-    Kernel.should have_private_instance_method(:caller_locations)
+    Kernel.private_instance_methods(false).should.include?(:caller_locations)
   end
 
   it 'returns an Array of caller locations' do
@@ -22,6 +22,18 @@ describe 'Kernel#caller_locations' do
     locations.length.should == 1
   end
 
+  it "raises for negative start" do
+    -> { caller_locations(-1) }.should.raise(ArgumentError, "negative level (-1)")
+  end
+
+  it "raises for negative length" do
+    -> { caller_locations(0, -1) }.should.raise(ArgumentError, "negative size (-1)")
+  end
+
+  it "can be called with `nil` length" do
+    caller_locations(0, nil).map(&:to_s).should == caller_locations(0).map(&:to_s)
+  end
+
   it "can be called with a range" do
     locations1 = caller_locations(0)
     locations2 = caller_locations(2..4)
@@ -34,12 +46,10 @@ describe 'Kernel#caller_locations' do
     locations2.map(&:to_s).should == locations1[2..-1].map(&:to_s)
   end
 
-  ruby_version_is "2.7" do
-    it "works with beginless ranges" do
-      locations1 = caller_locations(0)
-      locations2 = caller_locations(eval("(...5)"))
-      locations2.map(&:to_s)[eval("(2..)")].should == locations1[eval("(...5)")].map(&:to_s)[eval("(2..)")]
-    end
+  it "works with beginless ranges" do
+    locations1 = caller_locations(0)
+    locations2 = caller_locations((...5))
+    locations2.map(&:to_s)[eval("(2..)")].should == locations1[(...5)].map(&:to_s)[eval("(2..)")]
   end
 
   it "can be called with a range whose end is negative" do
@@ -72,15 +82,55 @@ describe 'Kernel#caller_locations' do
     caller_locations.map(&:to_s).should == caller_locations(1..-1).map(&:to_s)
   end
 
-  guard -> { Kernel.instance_method(:tap).source_location } do
-    it "includes core library methods defined in Ruby" do
-      file, line = Kernel.instance_method(:tap).source_location
-      file.should.start_with?('<internal:')
+  it "coerces the arguments to integers" do
+    caller_locations(1.1, 1.1).map(&:to_s).should == caller(1, 1).map(&:to_s)
+    caller_locations(1.1..1.1).map(&:to_s).should == caller(1..1).map(&:to_s)
+  end
 
-      loc = nil
-      tap { loc = caller_locations(1, 1)[0] }
-      loc.label.should == "tap"
-      loc.path.should.start_with? "<internal:"
+  guard -> { Kernel.instance_method(:tap).source_location } do
+    ruby_version_is ""..."3.4" do
+      it "includes core library methods defined in Ruby" do
+        file, line = Kernel.instance_method(:tap).source_location
+        file.should.start_with?('<internal:')
+
+        loc = nil
+        tap { loc = caller_locations(1, 1)[0] }
+        loc.label.should == "tap"
+        loc.path.should.start_with? "<internal:"
+      end
     end
+
+    ruby_version_is "3.4"..."4.0" do
+      it "includes core library methods defined in Ruby" do
+        file, line = Kernel.instance_method(:tap).source_location
+        file.should.start_with?('<internal:')
+
+        loc = nil
+        tap { loc = caller_locations(1, 1)[0] }
+        loc.label.should == "Kernel#tap"
+        loc.path.should.start_with? "<internal:"
+      end
+    end
+
+    ruby_version_is "4.0" do
+      it "does not include core library methods defined in Ruby" do
+        file, line = Kernel.instance_method(:tap).source_location
+        file.should.start_with?('<internal:')
+
+        loc = nil
+        tap { loc = caller_locations(1, 1)[0] }
+        loc.label.should == "Kernel#tap"
+        # CRuby hides the file which defines the method: https://bugs.ruby-lang.org/issues/20968
+        unless loc.path == __FILE__
+          loc.path.should.start_with? "<internal:"
+        end
+      end
+    end
+  end
+end
+
+describe "Kernel.caller_locations" do
+  it "is a public method" do
+    Kernel.public_methods(false).should.include?(:caller_locations)
   end
 end

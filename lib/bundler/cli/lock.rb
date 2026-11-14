@@ -14,54 +14,115 @@ module Bundler
         exit 1
       end
 
+      check_for_conflicting_options
+
+      Bundler::CLI::Common.configure_cooldown(options)
+
       print = options[:print]
-      ui = Bundler.ui
-      Bundler.ui = UI::Silent.new if print
+      previous_output_stream = Bundler.ui.output_stream
+      Bundler.ui.output_stream = :stderr if print
 
       Bundler::Fetcher.disable_endpoint = options["full-index"]
 
       update = options[:update]
+      # --update is repeatable, so it parses as an array with one entry per
+      # occurrence, where a bare `--update` produces a `true` entry
+      update = update.include?(true) ? true : update.flatten if update.is_a?(Array)
       conservative = options[:conservative]
+      bundler = options[:bundler]
 
       if update.is_a?(Array) # unlocking specific gems
         Bundler::CLI::Common.ensure_all_gems_in_lockfile!(update)
-        update = { :gems => update, :conservative => conservative }
-      elsif update
-        update = { :conservative => conservative } if conservative
-      end
-      definition = Bundler.definition(update)
-
-      Bundler::CLI::Common.configure_gem_version_promoter(Bundler.definition, options) if options[:update]
-
-      options["remove-platform"].each do |platform|
-        definition.remove_platform(platform)
+        update = { gems: update, conservative: conservative }
+      elsif update && conservative
+        update = { conservative: conservative }
+      elsif update && bundler
+        update = { bundler: bundler }
       end
 
-      options["add-platform"].each do |platform_string|
-        platform = Gem::Platform.new(platform_string)
-        if platform.to_s == "unknown"
-          Bundler.ui.warn "The platform `#{platform_string}` is unknown to RubyGems " \
-            "and adding it will likely lead to resolution errors"
+      Bundler.settings.temporary(frozen: false) do
+        definition = Bundler.definition(update, Bundler.default_lockfile)
+
+        Bundler::CLI::Common.configure_gem_version_promoter(definition, options) if options[:update]
+
+        options["remove-platform"].flatten.each do |platform_string|
+          platform = Gem::Platform.new(platform_string)
+          definition.remove_platform(platform)
         end
-        definition.add_platform(platform)
+
+        options["add-platform"].flatten.each do |platform_string|
+          platform = Gem::Platform.new(platform_string)
+          if platform.to_s == "unknown"
+            Bundler.ui.error "The platform `#{platform_string}` is unknown to RubyGems and can't be added to the lockfile."
+            exit 1
+          end
+          definition.add_platform(platform)
+        end
+
+        if definition.platforms.empty?
+          raise InvalidOption, "Removing all platforms from the bundle is not allowed"
+        end
+
+        options["remove-ruby-abi"].flatten.each do |ruby_abi|
+          definition.remove_ruby_abi(ruby_abi)
+        end
+
+        options["add-ruby-abi"].flatten.each do |ruby_abi|
+          raise InvalidOption, "Expected `--add-ruby-abi` to be a Ruby ABI like `X.Y`, got #{ruby_abi.inspect}" unless Gem::ContentAddress.valid_ruby_abi?(ruby_abi)
+
+          definition.add_ruby_abi(ruby_abi)
+        end
+
+        # Adding checksums resolves the bundle to fetch them, so it has to
+        # run after every platform change above has been recorded, or the
+        # new platforms are listed in the lockfile without their specs.
+        definition.add_checksums if options["add-checksums"]
+
+        # Adding a Ruby ABI offline takes its content-addressed gems from the installed ones.
+        definition.with_cache! if options[:local] && options["add-ruby-abi"].any?
+        definition.remotely! unless options[:local]
+
+        if options["normalize-platforms"]
+          definition.normalize_platforms
+        end
+
+        if print
+          puts definition.to_lock
+        else
+          file = options[:lockfile]
+          file = if file
+            Pathname.new(file).expand_path
+          elsif ENV["BUNDLE_LOCKFILE"].to_s.empty?
+            definition.lockfile
+          else
+            # BUNDLE_LOCKFILE outranks the lockfile method in the Gemfile, see gemfile(5)
+            Bundler.default_lockfile
+          end
+
+          if file
+            puts "Writing lockfile to #{file}"
+            definition.write_lock(file, false)
+          else
+            Bundler.ui.warn "Not writing a lockfile because the Gemfile sets `lockfile false`"
+          end
+        end
+
+        Bundler::CLI::Common.output_cooldown_skipped_summary(definition)
       end
 
-      if definition.platforms.empty?
-        raise InvalidOption, "Removing all platforms from the bundle is not allowed"
+      Bundler.ui.output_stream = previous_output_stream
+    end
+
+    private
+
+    def check_for_conflicting_options
+      if options["normalize-platforms"] && options["add-platform"].any?
+        raise InvalidOption, "--normalize-platforms can't be used with --add-platform"
       end
 
-      definition.resolve_remotely! unless options[:local]
-
-      if print
-        puts definition.to_lock
-      else
-        file = options[:lockfile]
-        file = file ? File.expand_path(file) : Bundler.default_lockfile
-        puts "Writing lockfile to #{file}"
-        definition.lock(file)
+      if options["normalize-platforms"] && options["remove-platform"].any?
+        raise InvalidOption, "--normalize-platforms can't be used with --remove-platform"
       end
-
-      Bundler.ui = ui
     end
   end
 end

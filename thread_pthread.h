@@ -8,6 +8,9 @@
 
   Copyright (C) 2004-2007 Koichi Sasada
 
+  This platform runs the common scheduler; see thread_sched.h for its data
+  structures and thread_sched.c for the implementation.
+
 **********************************************************************/
 
 #ifdef HAVE_PTHREAD_NP_H
@@ -17,76 +20,26 @@
 #define RB_NATIVETHREAD_LOCK_INIT PTHREAD_MUTEX_INITIALIZER
 #define RB_NATIVETHREAD_COND_INIT PTHREAD_COND_INITIALIZER
 
-typedef struct native_thread_data_struct {
-    union {
-        struct list_node ubf;
-        struct list_node gvl;
-    } node;
-#if defined(__GLIBC__) || defined(__FreeBSD__)
-    union
+#include "thread_sched.h"
+
+#ifdef RB_THREAD_LOCAL_SPECIFIER
+  NOINLINE(void rb_current_ec_set(struct rb_execution_context_struct *));
+
+  // Under M:N threads, a thread may move to another native thread in the middle of
+  // a C function, so the compiler must not cache the TLS address of ruby_current_ec.
+  NOINLINE(struct rb_execution_context_struct *rb_current_ec(void));
+
+  // for RUBY_DEBUG_LOG()
+  RUBY_EXTERN RB_THREAD_LOCAL_SPECIFIER rb_atomic_t ruby_nt_serial;
+  #define RUBY_NT_SERIAL 1
 #else
-    /*
-     * assume the platform condvars are badly implemented and have a
-     * "memory" of which mutex they're associated with
-     */
-    struct
-#endif
-    {
-        rb_nativethread_cond_t intr; /* th->interrupt_lock */
-        rb_nativethread_cond_t gvlq; /* vm->gvl.lock */
-    } cond;
-} native_thread_data_t;
-
-#undef except
-#undef try
-#undef leave
-#undef finally
-
-typedef struct rb_global_vm_lock_struct {
-    /* fast path */
-    const struct rb_thread_struct *owner;
-    rb_nativethread_lock_t lock; /* AKA vm->gvl.lock */
-
-    /*
-     * slow path, protected by vm->gvl.lock
-     * - @waitq - FIFO queue of threads waiting for GVL
-     * - @timer - it handles timeslices for @owner.  It is any one thread
-     *   in @waitq, there is no @timer if @waitq is empty, but always
-     *   a @timer if @waitq has entries
-     * - @timer_err tracks timeslice limit, the timeslice only resets
-     *   when pthread_cond_timedwait returns ETIMEDOUT, so frequent
-     *   switching between contended/uncontended GVL won't reset the
-     *   timer.
-     */
-    struct list_head waitq; /* <=> native_thread_data_t.node.ubf */
-    const struct rb_thread_struct *timer;
-    int timer_err;
-
-    /* yield */
-    rb_nativethread_cond_t switch_cond;
-    rb_nativethread_cond_t switch_wait_cond;
-    int need_yield;
-    int wait_yield;
-} rb_global_vm_lock_t;
-
-
-#if __STDC_VERSION__ >= 201112
-  #define RB_THREAD_LOCAL_SPECIFIER _Thread_local
-#elif defined(__GNUC__)
-  /* note that ICC (linux) and Clang are covered by __GNUC__ */
-  #define RB_THREAD_LOCAL_SPECIFIER __thread
-#else
-
 typedef pthread_key_t native_tls_key_t;
 
 static inline void *
 native_tls_get(native_tls_key_t key)
 {
-    void *ptr = pthread_getspecific(key);
-    if (UNLIKELY(ptr == NULL)) {
-        rb_bug("pthread_getspecific returns NULL");
-    }
-    return ptr;
+    // return value should be checked by caller
+    return pthread_getspecific(key);
 }
 
 static inline void
@@ -96,20 +49,8 @@ native_tls_set(native_tls_key_t key, void *ptr)
         rb_bug("pthread_setspecific error");
     }
 }
-#endif
 
-RUBY_SYMBOL_EXPORT_BEGIN
-#ifdef RB_THREAD_LOCAL_SPECIFIER
-  #ifdef __APPLE__
-    // on Darwin, TLS can not be accessed across .so
-    struct rb_execution_context_struct *rb_current_ec(void);
-    void rb_current_ec_set(struct rb_execution_context_struct *);
-  #else
-    RUBY_EXTERN RB_THREAD_LOCAL_SPECIFIER struct rb_execution_context_struct *ruby_current_ec;
-  #endif
-#else
-  RUBY_EXTERN native_tls_key_t ruby_current_ec_key;
+RUBY_EXTERN native_tls_key_t ruby_current_ec_key;
 #endif
-RUBY_SYMBOL_EXPORT_END
 
 #endif /* RUBY_THREAD_PTHREAD_H */

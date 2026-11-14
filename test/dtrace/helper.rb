@@ -65,11 +65,7 @@ module DTrace
   class TestCase < Test::Unit::TestCase
     INCLUDE = File.expand_path('..', File.dirname(__FILE__))
 
-    case RUBY_PLATFORM
-    when /solaris/i
-      # increase bufsize to 8m (default 4m on Solaris)
-      DTRACE_CMD = %w[dtrace -b 8m]
-    when /darwin/i
+    if RUBY_PLATFORM =~ /darwin/i
       READ_PROBES = proc do |cmd|
         lines = nil
         PTY.spawn(*cmd) do |io, _, pid|
@@ -119,10 +115,10 @@ module DTrace
       IO.popen(cmd, err: [:child, :out], &:readlines)
     end
 
-    def trap_probe d_program, ruby_program
+    def trap_probe d_program, ruby_program, env: {}
       if Hash === d_program
         d_program = d_program[IMPL] or
-          skip "#{d_program} not implemented for #{IMPL}"
+          omit "#{d_program} not implemented for #{IMPL}"
       elsif String === d_program && IMPL == :stap
         d_program = dtrace2systemtap(d_program)
       end
@@ -136,15 +132,17 @@ module DTrace
 
       d_path  = d.path
       rb_path = rb.path
-      cmd = "#{RUBYBIN} --disable=gems -I#{INCLUDE} #{rb_path}"
+      ruby_env = env
+      env_prefix = ruby_env.map {|key, val| "#{key}=#{val}" }
+      cmd = [*env_prefix, "#{RUBYBIN} --disable=gems -I#{INCLUDE} #{rb_path}"].join(" ")
       if IMPL == :stap
         cmd = %W(stap #{d_path} -c #{cmd})
       else
         cmd = [*DTRACE_CMD, "-q", "-s", d_path, "-c", cmd ]
       end
       if sudo = @@sudo
-        NEEDED_ENVS.each do |name|
-          if val = ENV[name]
+        (NEEDED_ENVS + ruby_env.keys).uniq.each do |name|
+          if val = ruby_env[name] || ENV[name]
             cmd.unshift("#{name}=#{val}")
           end
         end

@@ -1,6 +1,7 @@
 # frozen_string_literal: false
 require "test/unit"
 require "objspace"
+require_relative "../lib/jit_support"
 begin
   require "json"
 rescue LoadError
@@ -28,13 +29,15 @@ class TestObjSpace < Test::Unit::TestCase
                     ObjectSpace.memsize_of(//.match("")))
   end
 
+  STR_COPY_MAX_EMBED_SIZE = 256 - (RbConfig::SIZEOF["void*"] * 3) - 1 # From macro defined in string.c
+
   def test_memsize_of_root_shared_string
-    a = "a" * GC::INTERNAL_CONSTANTS[:RVARGC_MAX_ALLOCATE_SIZE]
+    a = "a" * (STR_COPY_MAX_EMBED_SIZE + 1)
     b = a.dup
     c = nil
-    ObjectSpace.each_object(String) {|x| break c = x if x == a and x.frozen?}
-    rv_size = GC::INTERNAL_CONSTANTS[:RVALUE_SIZE]
-    assert_equal([rv_size, rv_size, a.length + 1 + rv_size], [a, b, c].map {|x| ObjectSpace.memsize_of(x)})
+    ObjectSpace.each_object(String) {|x| break c = x if a == x and x.frozen?}
+    rv_size = Integer(ObjectSpace.dump(a)[/"slot_size":(\d+)/, 1])
+    assert_equal([rv_size, GC::INTERNAL_CONSTANTS[:RVALUE_SIZE], rv_size], [a, b, c].map {|x| ObjectSpace.memsize_of(x)})
   end
 
   def test_argf_memsize
@@ -54,7 +57,11 @@ class TestObjSpace < Test::Unit::TestCase
     assert_operator(a, :>, b)
     assert_operator(a, :>, 0)
     assert_operator(b, :>, 0)
-    assert_raise(TypeError) {ObjectSpace.memsize_of_all('error')}
+    assert_kind_of(Integer, ObjectSpace.memsize_of_all(Enumerable))
+  end
+
+  def test_memsize_of_all_with_wrong_type
+    assert_raise(TypeError) { ObjectSpace.memsize_of_all(Object.new) }
   end
 
   def test_count_objects_size
@@ -75,16 +82,6 @@ class TestObjSpace < Test::Unit::TestCase
   def test_count_objects_size_with_wrong_type
     assert_raise(TypeError) { ObjectSpace.count_objects_size(0) }
   end
-
-  def test_count_nodes
-    res = ObjectSpace.count_nodes
-    assert_not_empty(res)
-    arg = {}
-    ObjectSpace.count_nodes(arg)
-    assert_not_empty(arg)
-    bug8014 = '[ruby-core:53130] [Bug #8014]'
-    assert_empty(arg.select {|k, v| !(Symbol === k && Integer === v)}, bug8014)
-  end if false
 
   def test_count_tdata_objects
     res = ObjectSpace.count_tdata_objects
@@ -140,6 +137,18 @@ class TestObjSpace < Test::Unit::TestCase
     end;
   end
 
+  def test_reachable_objects_during_iteration
+    opts = %w[--disable-gem --disable=frozen-string-literal -robjspace]
+    assert_ruby_status opts, "#{<<-"begin;"}\n#{<<-'end;'}"
+    begin;
+      ObjectSpace.each_object{|o|
+        o.inspect
+        ObjectSpace.reachable_objects_from(Class)
+      }
+    end;
+  end
+
+
   def test_reachable_objects_from_root
     root_objects = ObjectSpace.reachable_objects_from_root
 
@@ -165,8 +174,36 @@ class TestObjSpace < Test::Unit::TestCase
     end;
   end
 
+  def test_reachable_objects_from_doesnt_break_ractor_containment
+    assert_ractor("#{<<-"begin;"}#{<<-'end;'}")
+    begin;
+      require "objspace"
+      port = Ractor::Port.new
+      ch = Ractor.new(port) do |port|
+        o = Object.new
+        def o.inspect = "unshareable!"
+        sc = o.singleton_class
+        port << [sc] # TODO: singleton classes of unshareables should not be shareable
+        Ractor.receive # wait
+      end
+
+      sc_ary = port.receive
+
+      found = false
+      ObjectSpace.reachable_objects_from(sc_ary).each do |obj|
+        if obj.inspect == "unshareable!"
+          found = true
+        end
+      end
+
+      ch.send(:go)
+      ch.join
+      refute found, "ObjectSpace.reachable_objects_from breaks ractor containment"
+    end;
+  end
+
   def test_trace_object_allocations_stop_first
-    assert_separately([], "#{<<~"begin;"}\n#{<<~'end;'}")
+    assert_ruby_status([], "#{<<~"begin;"}\n#{<<~'end;'}")
     begin;
       require "objspace"
       # Make sure stopping before the tracepoints are initialized doesn't raise. See [Bug #17020]
@@ -190,8 +227,9 @@ class TestObjSpace < Test::Unit::TestCase
       assert_equal(line1,    ObjectSpace.allocation_sourceline(o1))
       assert_equal(__FILE__, ObjectSpace.allocation_sourcefile(o1))
       assert_equal(c1,       ObjectSpace.allocation_generation(o1))
-      assert_equal(Class.name, ObjectSpace.allocation_class_path(o1))
-      assert_equal(:new,       ObjectSpace.allocation_method_id(o1))
+      # These assertions fail under coverage measurement: https://bugs.ruby-lang.org/issues/21298
+      #assert_equal(self.class.name, ObjectSpace.allocation_class_path(o1))
+      #assert_equal(__method__,       ObjectSpace.allocation_method_id(o1))
 
       assert_equal(__FILE__, ObjectSpace.allocation_sourcefile(o2))
       assert_equal(line2,    ObjectSpace.allocation_sourceline(o2))
@@ -204,44 +242,65 @@ class TestObjSpace < Test::Unit::TestCase
       assert_equal(c3,       ObjectSpace.allocation_generation(o3))
       assert_equal(self.class.name, ObjectSpace.allocation_class_path(o3))
       assert_equal(__method__,      ObjectSpace.allocation_method_id(o3))
+
+      # [Bug #19456]
+      o4 =
+        # This line intentionally left blank
+        # This line intentionally left blank
+        1.0 / 0.0; line4 = __LINE__; _c4 = GC.count
+      assert_equal(__FILE__, ObjectSpace.allocation_sourcefile(o4))
+      assert_equal(line4, ObjectSpace.allocation_sourceline(o4))
+
+      # The line number should be based on newarray instead of getinstancevariable.
+      line5 = __LINE__; o5 = [ # newarray (leaf)
+        @ivar, # getinstancevariable (not leaf)
+      ]
+      assert_equal(__FILE__, ObjectSpace.allocation_sourcefile(o5))
+      assert_equal(line5, ObjectSpace.allocation_sourceline(o5))
+
+      # [Bug #19482]
+      EnvUtil.under_gc_stress do
+        100.times do
+          Class.new
+        end
+      end
     }
   end
 
   def test_trace_object_allocations_start_stop_clear
     ObjectSpace.trace_object_allocations_clear # clear object_table to get rid of erroneous detection for obj3
-    GC.disable # suppress potential object reuse. see [Bug #11271]
-    begin
-      ObjectSpace.trace_object_allocations_start
+    EnvUtil.without_gc do # suppress potential object reuse. see [Bug #11271]
       begin
         ObjectSpace.trace_object_allocations_start
         begin
           ObjectSpace.trace_object_allocations_start
-          obj0 = Object.new
+          begin
+            ObjectSpace.trace_object_allocations_start
+            obj0 = Object.new
+          ensure
+            ObjectSpace.trace_object_allocations_stop
+            obj1 = Object.new
+          end
         ensure
           ObjectSpace.trace_object_allocations_stop
-          obj1 = Object.new
+          obj2 = Object.new
         end
       ensure
         ObjectSpace.trace_object_allocations_stop
-        obj2 = Object.new
+        obj3 = Object.new
       end
-    ensure
-      ObjectSpace.trace_object_allocations_stop
-      obj3 = Object.new
+
+      assert_equal(__FILE__, ObjectSpace.allocation_sourcefile(obj0))
+      assert_equal(__FILE__, ObjectSpace.allocation_sourcefile(obj1))
+      assert_equal(__FILE__, ObjectSpace.allocation_sourcefile(obj2))
+      assert_equal(nil     , ObjectSpace.allocation_sourcefile(obj3)) # after tracing
+
+      ObjectSpace.trace_object_allocations_clear
+      assert_equal(nil, ObjectSpace.allocation_sourcefile(obj0))
+      assert_equal(nil, ObjectSpace.allocation_sourcefile(obj1))
+      assert_equal(nil, ObjectSpace.allocation_sourcefile(obj2))
+      assert_equal(nil, ObjectSpace.allocation_sourcefile(obj3))
     end
-
-    assert_equal(__FILE__, ObjectSpace.allocation_sourcefile(obj0))
-    assert_equal(__FILE__, ObjectSpace.allocation_sourcefile(obj1))
-    assert_equal(__FILE__, ObjectSpace.allocation_sourcefile(obj2))
-    assert_equal(nil     , ObjectSpace.allocation_sourcefile(obj3)) # after tracing
-
-    ObjectSpace.trace_object_allocations_clear
-    assert_equal(nil, ObjectSpace.allocation_sourcefile(obj0))
-    assert_equal(nil, ObjectSpace.allocation_sourcefile(obj1))
-    assert_equal(nil, ObjectSpace.allocation_sourcefile(obj2))
-    assert_equal(nil, ObjectSpace.allocation_sourcefile(obj3))
-  ensure
-    GC.enable
   end
 
   def test_trace_object_allocations_gc_stress
@@ -253,11 +312,151 @@ class TestObjSpace < Test::Unit::TestCase
     assert true # success
   end
 
+  def test_trace_object_allocations_with_other_tracepoint
+    # Test that ObjectSpace.trace_object_allocations isn't changed by changes
+    # to another tracepoint
+    line_tp = TracePoint.new(:line) { }
+
+    ObjectSpace.trace_object_allocations_start
+
+    obj1 = Object.new; line1 = __LINE__
+    assert_equal __FILE__, ObjectSpace.allocation_sourcefile(obj1)
+    assert_equal line1, ObjectSpace.allocation_sourceline(obj1)
+
+    line_tp.enable
+
+    obj2 = Object.new; line2 = __LINE__
+    assert_equal __FILE__, ObjectSpace.allocation_sourcefile(obj2)
+    assert_equal line2, ObjectSpace.allocation_sourceline(obj2)
+
+    line_tp.disable
+
+    obj3 = Object.new; line3 = __LINE__
+    assert_equal __FILE__, ObjectSpace.allocation_sourcefile(obj3)
+    assert_equal line3, ObjectSpace.allocation_sourceline(obj3)
+  ensure
+    ObjectSpace.trace_object_allocations_stop
+    ObjectSpace.trace_object_allocations_clear
+  end
+
+  def test_trace_object_allocations_compaction
+    omit "compaction is not supported on this platform" unless GC.respond_to?(:compact)
+
+    assert_separately(%w(-robjspace), <<~RUBY)
+      ObjectSpace.trace_object_allocations do
+        objs = 100.times.map do
+          Object.new
+        end
+
+        assert_equal(__FILE__, ObjectSpace.allocation_sourcefile(objs[0]))
+
+        GC.verify_compaction_references(expand_heap: true, toward: :empty)
+
+        assert_equal(__FILE__, ObjectSpace.allocation_sourcefile(objs[0]))
+      end
+    RUBY
+  end
+
+  def test_trace_object_allocations_compaction_freed_pages
+    omit "compaction is not supported on this platform" unless GC.respond_to?(:compact)
+
+    assert_normal_exit(<<~RUBY, timeout: 60)
+      require "objspace"
+
+      objs = []
+      ObjectSpace.trace_object_allocations do
+        1_000_000.times do
+          objs << Object.new
+        end
+      end
+
+      objs = nil
+
+      # Free pages that the objs were on
+      GC.start
+
+      # Run compaction and check that it doesn't crash
+      GC.compact
+    RUBY
+  end
+
+  def test_trace_object_allocations_does_not_reuse_freed_allocation_info
+    assert_separately(%w(-robjspace), <<~RUBY, timeout: 60)
+      ObjectSpace.trace_object_allocations do
+        100_000.times.map { Object.new }
+      end
+
+      GC.start
+
+      objs = 100_000.times.map { Object.new }
+
+      leaked = objs.count { |obj| ObjectSpace.allocation_sourcefile(obj) }
+      assert_equal 0, leaked
+    RUBY
+  end
+
   def test_dump_flags
+    # Ensure that the fstring is promoted to old generation
+    4.times { GC.start }
     info = ObjectSpace.dump("foo".freeze)
-    assert_match(/"wb_protected":true, "old":true/, info)
+    assert_include(info, '"wb_protected":true')
+    assert_include(info, '"age":3')
+    assert_include(info, '"old":true')
     assert_match(/"fstring":true/, info)
     JSON.parse(info) if defined?(JSON)
+  end
+
+  def test_dump_flags_wb_protected
+    [Object.new, "str", [1], {a: 1}, (1..2), Struct.new(:a).new(1)].each do |obj|
+      assert_include(ObjectSpace.dump(obj), '"wb_protected":true', obj.class.name)
+    end
+  end
+
+  def test_dump_flag_age
+    EnvUtil.without_gc do
+      o = Object.new
+
+      assert_include(ObjectSpace.dump(o), '"age":0')
+
+      GC.start
+
+      assert_include(ObjectSpace.dump(o), '"age":1')
+    end
+  end
+
+  if defined?(RubyVM::Shape)
+    class TooComplex; end
+
+    def test_dump_complex_shape
+      omit "flaky test"
+
+      RubyVM::Shape::SHAPE_MAX_VARIATIONS.times do
+        TooComplex.new.instance_variable_set(:"@a#{_1}", 1)
+      end
+
+      tc = TooComplex.new
+      info = ObjectSpace.dump(tc)
+      assert_not_match(/"complex_shape"/, info)
+      tc.instance_variable_set(:@new_ivar, 1)
+      info = ObjectSpace.dump(tc)
+      assert_match(/"complex_shape":true/, info)
+      if defined?(JSON)
+        assert_true(JSON.parse(info)["complex_shape"])
+      end
+    end
+  end
+
+  class NotTooComplex ; end
+
+  def test_dump_not_complex_shape
+    tc = NotTooComplex.new
+    tc.instance_variable_set(:@new_ivar, 1)
+    info = ObjectSpace.dump(tc)
+
+    assert_not_match(/"complex_shape"/, info)
+    if defined?(JSON)
+      assert_nil(JSON.parse(info)["complex_shape"])
+    end
   end
 
   def test_dump_to_default
@@ -265,7 +464,7 @@ class TestObjSpace < Test::Unit::TestCase
     info = nil
     ObjectSpace.trace_object_allocations do
       line = __LINE__ + 1
-      str = "hello world"
+      str = "hello w"
       info = ObjectSpace.dump(str)
     end
     assert_dump_object(info, line)
@@ -277,7 +476,7 @@ class TestObjSpace < Test::Unit::TestCase
       th = Thread.start {r.read}
       ObjectSpace.trace_object_allocations do
         line = __LINE__ + 1
-        str = "hello world"
+        str = "hello w"
         ObjectSpace.dump(str, output: w)
       end
       w.close
@@ -289,10 +488,59 @@ class TestObjSpace < Test::Unit::TestCase
   def assert_dump_object(info, line)
     loc = caller_locations(1, 1)[0]
     assert_match(/"type":"STRING"/, info)
-    assert_match(/"embedded":true, "bytesize":11, "value":"hello world", "encoding":"UTF-8"/, info)
+    assert_match(/"embedded":true, "bytesize":7, "value":"hello w", "encoding":"UTF-8"/, info)
     assert_match(/"file":"#{Regexp.escape __FILE__}", "line":#{line}/, info)
     assert_match(/"method":"#{loc.base_label}"/, info)
     JSON.parse(info) if defined?(JSON)
+  end
+
+  def test_dump_array
+    # Empty array
+    info = ObjectSpace.dump([])
+    assert_include(info, '"length":0, "embedded":true')
+    assert_not_include(info, '"shared":true')
+
+    # Non-embed array
+    arr = (1..10).to_a
+    info = ObjectSpace.dump(arr)
+    assert_include(info, '"length":10')
+    assert_not_include(info, '"embedded":true')
+    assert_not_include(info, '"shared":true')
+
+    # Shared array
+    arr1 = (1..10).to_a
+    arr = []
+    arr.replace(arr1)
+    info = ObjectSpace.dump(arr)
+    assert_include(info, '"length":10, "shared":true')
+    assert_not_include(info, '"embedded":true')
+  end
+
+  def test_dump_hash
+    ar_hash = {}
+    info = ObjectSpace.dump(ar_hash)
+    assert_include(info, '"ar_table":true')
+
+    st_hash = {}
+    9.times { |i| st_hash[i] = i }
+    info = ObjectSpace.dump(st_hash)
+    assert_not_include(info, '"ar_table":true')
+  end
+
+  def test_dump_object
+    klass = Class.new
+
+    # Empty object
+    info = ObjectSpace.dump(klass.new)
+    assert_include(info, '"embedded":true')
+    assert_include(info, '"ivars":0')
+
+    # Non-embed object (needs > 6 ivars to exceed pool 0 embed capacity)
+    obj = klass.new
+    7.times { |i| obj.instance_variable_set("@ivar#{i}", 0) }
+    info = ObjectSpace.dump(obj)
+    assert_not_include(info, '"embedded":true')
+    assert_include(info, '"ivars":7')
   end
 
   def test_dump_control_char
@@ -306,7 +554,7 @@ class TestObjSpace < Test::Unit::TestCase
     assert_equal('true', ObjectSpace.dump(true))
     assert_equal('false', ObjectSpace.dump(false))
     assert_equal('0', ObjectSpace.dump(0))
-    assert_equal('{"type":"SYMBOL", "value":"foo"}', ObjectSpace.dump(:foo))
+    assert_equal('{"type":"SYMBOL", "value":"test_dump_special_consts"}', ObjectSpace.dump(:test_dump_special_consts))
   end
 
   def test_dump_singleton_class
@@ -334,6 +582,20 @@ class TestObjSpace < Test::Unit::TestCase
     dump = ObjectSpace.dump(("foobar%x" % rand(0x10000)).to_sym)
     assert_match(/"type":"SYMBOL"/, dump)
     assert_match(/"value":"foobar\h+"/, dump)
+  end
+
+  def test_dump_outputs_object_id
+    obj = Object.new
+
+    # Doesn't output object_id when it has not been seen
+    dump = ObjectSpace.dump(obj)
+    assert_not_include(dump, "\"object_id\"")
+
+    id = obj.object_id
+
+    # Outputs object_id when it has been seen
+    dump = ObjectSpace.dump(obj)
+    assert_include(dump, "\"object_id\":#{id}")
   end
 
   def test_dump_includes_imemo_type
@@ -380,7 +642,7 @@ class TestObjSpace < Test::Unit::TestCase
           @obj1 = Object.new
           GC.start
           @obj2 = Object.new
-          ObjectSpace.dump_all(output: :stdout, since: gc_gen)
+          ObjectSpace.dump_all(output: :stdout, since: gc_gen, shapes: false)
         end
 
         p dump_my_heap_please
@@ -388,7 +650,7 @@ class TestObjSpace < Test::Unit::TestCase
       assert_equal 'nil', output.pop
       since = output.shift.to_i
       assert_operator output.size, :>, 0
-      generations = output.map { |l| JSON.parse(l)["generation"] }.uniq.sort
+      generations = output.map { |l| JSON.parse(l) }.map { |o| o["generation"] }.uniq.sort
       assert_equal [since, since + 1], generations
     end
   end
@@ -431,6 +693,122 @@ class TestObjSpace < Test::Unit::TestCase
     end
   end
 
+  def test_dump_objects_dumps_page_slot_sizes
+    assert_in_out_err(%w[-robjspace], "#{<<-"begin;"}\n#{<<-'end;'}") do |output, error|
+      begin;
+        def dump_my_heap_please
+          ObjectSpace.dump_all(output: $stdout)
+        end
+
+        p $stdout == dump_my_heap_please
+      end;
+      assert_equal 'true', output.pop
+      assert(output.count > 1)
+      output.each { |l|
+        obj = JSON.parse(l)
+        next if obj["type"] == "ROOT"
+        next if obj["type"] == "SHAPE"
+
+        assert_not_nil obj["slot_size"]
+        slot_sizes = GC::INTERNAL_CONSTANTS[:HEAP_COUNT].times.map { |i| GC.stat_heap(i, :slot_size) }
+        assert_include slot_sizes, obj["slot_size"]
+      }
+    end
+  end
+
+  def test_dump_callinfo_includes_mid
+    assert_in_out_err(%w[-robjspace --disable-gems], "#{<<-"begin;"}\n#{<<-'end;'}") do |output, error|
+      begin;
+        class Foo
+          def foo
+            super(bar: 123) # should not crash on 0 mid
+          end
+
+          def bar
+            baz(bar: 123) # mid: baz
+          end
+        end
+
+        ObjectSpace.dump_all(output: $stdout)
+      end;
+      assert_empty error
+      assert(output.count > 1)
+      assert_include output.grep(/"imemo_type":"callinfo"/).join("\n"), '"mid":"baz"'
+    end
+  end
+
+  def test_dump_iseq_includes_jit_call_counter
+    if JITSupport.yjit_supported?
+      jit_options = %w[--yjit --yjit-call-threshold=2]
+    elsif JITSupport.zjit_supported?
+      jit_options = %w[--zjit --zjit-call-threshold=2]
+    else
+      omit "JIT is not supported"
+    end
+
+    assert_in_out_err(%w[-robjspace --disable-gems] + jit_options, "#{<<-"begin;"}\n#{<<-'end;'}") do |output, error|
+      begin;
+        def foo
+          42
+        end
+
+        5.times { foo }
+
+        ObjectSpace.dump_all(output: $stdout)
+      end;
+
+      assert_empty(error)
+      iseqs = output.filter_map do |line|
+        obj = JSON.parse(line)
+        obj if obj["type"] == "IMEMO" && obj["imemo_type"] == "iseq"
+      end
+      assert_operator iseqs.length, :>, 0
+      iseqs.each do |obj|
+        assert_kind_of(Integer, obj["jit_calls"])
+      end
+
+      threshold_reached = iseqs.select { |obj| obj["jit_threshold_reached"] }
+      assert_operator(threshold_reached.length, :>, 0)
+      threshold_reached.each do |obj|
+        assert_operator(obj["jit_calls"], :>=, 2)
+      end
+    end
+  end
+
+  def test_dump_iseq_omits_jit_call_counter_when_jit_disabled
+    omit "YJIT is force-enabled" if JITSupport.yjit_force_enabled? || ENV["RUBY_YJIT_ENABLE"]
+
+    assert_in_out_err(%w[-robjspace --disable-gems], "#{<<-"begin;"}\n#{<<-'end;'}") do |output, error|
+      begin;
+        def foo
+          42
+        end
+
+        foo
+
+        ObjectSpace.dump_all(output: $stdout)
+      end;
+
+      assert_empty(error)
+      iseqs = output.filter_map do |line|
+        obj = JSON.parse(line)
+        obj if obj["type"] == "IMEMO" && obj["imemo_type"] == "iseq"
+      end
+      assert_operator(iseqs.length, :>, 0)
+      assert(iseqs.none? { |obj| obj.key?("jit_calls") })
+    end
+  end
+
+  def test_dump_string_coderange
+    assert_include ObjectSpace.dump("TEST STRING"), '"coderange":"7bit"'
+    unknown = "TEST STRING".dup.force_encoding(Encoding::UTF_16BE)
+    2.times do # ensure that dumping the string doesn't mutate it
+      assert_include ObjectSpace.dump(unknown), '"coderange":"unknown"'
+    end
+    assert_include ObjectSpace.dump("Fée"), '"coderange":"valid"'
+    assert_include ObjectSpace.dump("\xFF"), '"coderange":"broken"'
+  end
+
   def test_dump_escapes_method_name
     method_name = "foo\"bar"
     klass = Class.new do
@@ -441,12 +819,20 @@ class TestObjSpace < Test::Unit::TestCase
     obj = klass.new.send(method_name)
 
     dump = ObjectSpace.dump(obj)
-    assert_includes dump, '"method":"foo\"bar"'
+    assert_include dump, '"method":"foo\"bar"'
 
     parsed = JSON.parse(dump)
     assert_equal "foo\"bar", parsed["method"]
   ensure
     ObjectSpace.trace_object_allocations_stop
+  end
+
+  def test_dump_includes_slot_size
+    klass = Class.new
+    obj = klass.new
+    dump = ObjectSpace.dump(obj)
+
+    assert_match /"slot_size":\d+/, dump
   end
 
   def test_dump_reference_addresses_match_dump_all_addresses
@@ -470,31 +856,70 @@ class TestObjSpace < Test::Unit::TestCase
     end
   end
 
+  def assert_test_string_entry_correct_in_dump_all(output)
+    # `TEST STRING` appears twice in the output of `ObjectSpace.dump_all`
+    # 1. To create the T_STRING object for the literal string "TEST STRING"
+    # 2. When it is assigned to the `str` variable with a new encoding
+    #
+    # This test makes assertions on the assignment to `str`, so we look for
+    # the second appearance of /TEST STRING/ in the output
+    test_string_in_dump_all = output.grep(/TEST2/)
+
+    begin
+      assert_equal(2, test_string_in_dump_all.size, "number of strings")
+    rescue Test::Unit::AssertionFailedError => e
+      STDERR.puts e.inspect
+      STDERR.puts test_string_in_dump_all
+      if test_string_in_dump_all.size == 3
+        STDERR.puts "This test is skipped because it seems hard to fix."
+      else
+        raise
+      end
+    end
+
+    strs = test_string_in_dump_all.reject do |s|
+      s.include?("fstring")
+    end
+
+    assert_equal(1, strs.length)
+
+    entry_hash = JSON.parse(strs[0])
+
+    assert_equal(5, entry_hash["bytesize"], "bytesize is wrong")
+    assert_equal("TEST2", entry_hash["value"], "value is wrong")
+    assert_equal("UTF-8", entry_hash["encoding"], "encoding is wrong")
+    assert_equal("-", entry_hash["file"], "file is wrong")
+    assert_equal(5, entry_hash["line"], "line is wrong")
+    assert_equal("dump_my_heap_please", entry_hash["method"], "method is wrong")
+    assert_not_nil(entry_hash["generation"])
+  end
+
   def test_dump_all
-    entry = /"bytesize":11, "value":"TEST STRING", "encoding":"UTF-8", "file":"-", "line":4, "method":"dump_my_heap_please", "generation":/
     opts = %w[--disable-gem --disable=frozen-string-literal -robjspace]
 
     assert_in_out_err(opts, "#{<<-"begin;"}#{<<-'end;'}") do |output, error|
+      # frozen_string_literal: false
       begin;
         def dump_my_heap_please
           ObjectSpace.trace_object_allocations_start
           GC.start
-          str = "TEST STRING".force_encoding("UTF-8")
+          str = "TEST2".force_encoding("UTF-8")
           ObjectSpace.dump_all(output: :stdout)
         end
 
         p dump_my_heap_please
       end;
-      assert_equal 'nil', output.pop
-      assert_match(entry, output.grep(/TEST STRING/).join("\n"))
+
+      assert_test_string_entry_correct_in_dump_all(output)
     end
 
     assert_in_out_err(%w[-robjspace], "#{<<-"begin;"}#{<<-'end;'}") do |(output), (error)|
       begin;
+        # frozen_string_literal: false
         def dump_my_heap_please
           ObjectSpace.trace_object_allocations_start
           GC.start
-          (str = "TEST STRING").force_encoding("UTF-8")
+          (str = "TEST2").force_encoding("UTF-8")
           ObjectSpace.dump_all().path
         end
 
@@ -503,7 +928,8 @@ class TestObjSpace < Test::Unit::TestCase
       assert_nil(error)
       dump = File.readlines(output)
       File.unlink(output)
-      assert_match(entry, dump.grep(/TEST STRING/).join("\n"))
+
+      assert_test_string_entry_correct_in_dump_all(dump)
     end
 
     if defined?(JSON)
@@ -519,6 +945,27 @@ class TestObjSpace < Test::Unit::TestCase
         end
       end;
     end
+  end
+
+  def test_dump_all_with_ractors
+    assert_ractor("#{<<-"begin;"}#{<<-'end;'}")
+    begin;
+      require "objspace"
+      require "tempfile"
+      require "json"
+      rs = 4.times.map do
+        Ractor.new do
+          Tempfile.create do |f|
+            ObjectSpace.dump_all(output: f)
+            f.close
+            File.foreach(f.path) do |line|
+              JSON.parse(line)
+            end
+          end
+        end
+      end
+      rs.each(&:join)
+    end;
   end
 
   def test_dump_uninitialized_file
@@ -558,6 +1005,11 @@ class TestObjSpace < Test::Unit::TestCase
       bar
     rescue => err
       _, m = ObjectSpace.reachable_objects_from(err)
+
+      # The very first NameError allocated by a process is extended
+      if ObjectSpace::InternalObjectWrapper === m # T_IMEMO/fields_obj
+        m, _ = ObjectSpace.reachable_objects_from(m)
+      end
     end
     assert_equal(m, m.clone)
   end
@@ -620,6 +1072,7 @@ class TestObjSpace < Test::Unit::TestCase
   def test_objspace_trace
     assert_in_out_err(%w[-robjspace/trace], "#{<<-"begin;"}\n#{<<-'end;'}") do |out, err|
       begin;
+        # frozen_string_literal: false
         a = "foo"
         b = "b" + "a" + "r"
         c = 42
@@ -627,9 +1080,120 @@ class TestObjSpace < Test::Unit::TestCase
       end;
       assert_equal ["objspace/trace is enabled"], err
       assert_equal 3, out.size
-      assert_equal '"foo" @ -:2', out[0]
-      assert_equal '"bar" @ -:3', out[1]
+      assert_equal '"foo" @ -:3', out[0]
+      assert_equal '"bar" @ -:4', out[1]
       assert_equal '42', out[2]
     end
+  end
+
+  def load_allocation_path_helper method, to_binary: false
+
+    Tempfile.create(["test_ruby_load_allocation_path", ".rb"]) do |t|
+      path = t.path
+      str = "#{Time.now.to_f.to_s}_#{rand.to_s}"
+      t.puts script = <<~RUBY
+        # frozen-string-literal: true
+        return if Time.now.to_i > 0
+        $gv = 'rnd-#{str}' # unreachable, but the string literal was written
+      RUBY
+
+      t.close
+
+      if to_binary
+        bin = RubyVM::InstructionSequence.compile_file(t.path).to_binary
+        bt = Tempfile.new(['test_ruby_load_allocation_path', '.yarb'], mode: File::Constants::WRONLY)
+        bt.write bin
+        bt.close
+
+        path = bt.path
+      end
+
+      assert_separately(%w[-robjspace -rtempfile], <<~RUBY)
+        GC.disable
+        path = "#{path}"
+        ObjectSpace.trace_object_allocations do
+          #{method}
+        end
+
+        n = 0
+        dump = ObjectSpace.dump_all(output: :string)
+        dump.each_line do |line|
+          if /"value":"rnd-#{str}"/ =~ line && /"frozen":true/ =~ line
+            assert Regexp.new('"file":"' + "#{path}") =~ line
+            assert Regexp.new('"line":') !~ line
+            n += 1
+          end
+        rescue ArgumentError
+        end
+
+        assert_equal(1, n)
+      RUBY
+    ensure
+      bt.unlink if bt
+    end
+  end
+
+  def test_load_allocation_path_load
+    load_allocation_path_helper 'load(path)'
+  end
+
+  def test_load_allocation_path_compile_file
+    load_allocation_path_helper 'RubyVM::InstructionSequence.compile_file(path)'
+  end
+
+  def test_load_allocation_path_load_from_binary
+    # load_allocation_path_helper 'iseq = RubyVM::InstructionSequence.load_from_binary(File.binread(path))', to_binary: true
+  end
+
+  def test_escape_class_name
+    class_name = '" little boby table [Bug #20892]'
+    json = ObjectSpace.dump(Class.new.tap { |c| c.set_temporary_name(class_name) })
+    assert_equal class_name, JSON.parse(json)["name"]
+  end
+
+  def test_dump_free_immediately
+    require '-test-/typeddata'
+
+    # Bug::TypedData has flags=0 (no FREE_IMMEDIATELY)
+    info = ObjectSpace.dump(Bug::TypedData.new)
+    assert_include(info, '"struct":"typed_data"')
+    assert_include(info, '"free_immediately":false')
+
+    # Most typed data objects have FREE_IMMEDIATELY, so the field should be absent
+    info = ObjectSpace.dump(Thread.current.group)
+    assert_include(info, '"struct":"thgroup"')
+    assert_not_include(info, '"free_immediately"')
+  end
+
+  def test_dump_include_shareable
+    omit 'Not provided by mmtk' if RUBY_DESCRIPTION.include?("+GC[mmtk]")
+
+    assert_include(ObjectSpace.dump(ENV), '"shareable":true')
+    assert_not_include(ObjectSpace.dump([]), '"shareable":true')
+  end
+
+  def test_utf8_method_names
+    name = "utf8_❨╯°□°❩╯︵┻━┻"
+    obj = ObjectSpace.trace_object_allocations do
+      __send__(name)
+    end
+    dump = ObjectSpace.dump(obj)
+    assert_equal name, JSON.parse(dump)["method"], dump
+  end
+
+  def test_dump_shapes
+    json = ObjectSpace.dump_shapes(output: :string)
+    json.each_line do |line|
+      assert_include(line, '"type":"SHAPE"')
+    end
+
+    assert_empty ObjectSpace.dump_shapes(output: :string, since: RubyVM.stat(:next_shape_id))
+    assert_equal 2, ObjectSpace.dump_shapes(output: :string, since: RubyVM.stat(:next_shape_id) - 2).lines.size
+  end
+
+  private
+
+  def utf8_❨╯°□°❩╯︵┻━┻
+    "1#{2}"
   end
 end

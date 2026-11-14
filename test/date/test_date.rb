@@ -122,6 +122,12 @@ class TestDate < Test::Unit::TestCase
 
     assert_equal(d, dt)
     assert_equal(d2, dt2)
+
+    dt = DateTime.new(2001,2,3,9,0,0,'+09:00')
+    dt2 = DateTime.new(2001,2,3,0,0,0,'+00:00')
+    assert_equal(dt, dt2)
+    assert_equal(true, dt.eql?(dt2))
+    assert_equal(dt.hash, dt2.hash)
   end
 
   def test_hash
@@ -135,6 +141,10 @@ class TestDate < Test::Unit::TestCase
     assert_equal(9, h[DateTime.new(1999,5,25)])
 
     h = {}
+    h[Date.new(3171505571716611468830131104691,2,19)] = 0
+    assert_equal(true, h.key?(Date.new(3171505571716611468830131104691,2,19)))
+
+    h = {}
     h[DateTime.new(1999,5,23)] = 0
     h[DateTime.new(1999,5,24)] = 1
     h[DateTime.new(1999,5,25)] = 2
@@ -144,6 +154,10 @@ class TestDate < Test::Unit::TestCase
     assert_equal(9, h[DateTime.new(1999,5,25)])
 
     assert_instance_of(String, Date.new(1999,5,25).hash.to_s)
+
+    h = {}
+    h[Date.new(2001,2,3)] = 0
+    assert_equal(0, h[Date.new(2001,2,3,Date::GREGORIAN)])
   end
 
   def test_freeze
@@ -152,6 +166,9 @@ class TestDate < Test::Unit::TestCase
     assert_equal(true, d.frozen?)
     assert_instance_of(Integer, d.yday)
     assert_instance_of(String, d.to_s)
+
+    d = Date.jd(2451944).clone(freeze: true)
+    assert_equal([2001, 2, 3], [d.year, d.mon, d.mday])
   end
 
   def test_submillisecond_comparison
@@ -174,5 +191,34 @@ class TestDate < Test::Unit::TestCase
 
     assert_equal(-1, -Float::INFINITY <=> Date::Infinity.new)
     assert_equal(-1, -Date::Infinity.new <=> Float::INFINITY)
+  end
+
+  def test_deconstruct_keys
+    d = Date.new(1999,5,23)
+    assert_equal({year: 1999, month: 5, day: 23, wday: 0, yday: 143}, d.deconstruct_keys(nil))
+    assert_equal({year: 1999}, d.deconstruct_keys([:year, :century]))
+    assert_equal(
+      {year: 1999, month: 5, day: 23, wday: 0, yday: 143},
+      d.deconstruct_keys([:year, :month, :day, :wday, :yday])
+    )
+
+    dt = DateTime.new(1999, 5, 23, 4, 20, Rational(1, 10000))
+
+    assert_equal(
+      {year: 1999, month: 5, day: 23, wday: 0, yday: 143,
+       hour: 4, min: 20, sec: 0, sec_fraction: Rational(1, 10000), zone: "+00:00"},
+      dt.deconstruct_keys(nil)
+    )
+
+    assert_equal({year: 1999}, dt.deconstruct_keys([:year, :century]))
+
+    assert_equal(
+      {year: 1999, month: 5, day: 23, wday: 0, yday: 143,
+       hour: 4, min: 20, sec: 0, sec_fraction: Rational(1, 10000), zone: "+00:00"},
+      dt.deconstruct_keys([:year, :month, :day, :wday, :yday, :hour, :min, :sec, :sec_fraction, :zone])
+    )
+
+    dtz = DateTime.parse('3rd Feb 2001 04:05:06+03:30')
+    assert_equal({zone: '+03:30'}, dtz.deconstruct_keys([:zone]))
   end
 end

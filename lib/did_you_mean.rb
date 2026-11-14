@@ -47,9 +47,9 @@ require_relative 'did_you_mean/tree_spell_checker'
 #   #    Did you mean?  :foo
 #
 #
-# == Disabling +did_you_mean+
+# == Disabling \DidYouMean
 #
-# Occasionally, you may want to disable the +did_you_mean+ gem for e.g.
+# Occasionally, you may want to disable the \DidYouMean gem for e.g.
 # debugging issues in the error object itself. You can disable it entirely by
 # specifying +--disable-did_you_mean+ option to the +ruby+ command:
 #
@@ -86,12 +86,25 @@ require_relative 'did_you_mean/tree_spell_checker'
 #
 module DidYouMean
   # Map of error types and spell checker objects.
-  SPELL_CHECKERS = Hash.new(NullChecker)
+  @spell_checkers = Hash.new(NullChecker)
+
+  # Returns a sharable hash map of error types and spell checker objects.
+  def self.spell_checkers
+    @spell_checkers
+  end
 
   # Adds +DidYouMean+ functionality to an error using a given spell checker
   def self.correct_error(error_class, spell_checker)
-    SPELL_CHECKERS[error_class.name] = spell_checker
-    error_class.prepend(Correctable) unless error_class < Correctable
+    if defined?(Ractor)
+      new_mapping = { **@spell_checkers, error_class.to_s => spell_checker }
+      new_mapping.default = NullChecker
+
+      @spell_checkers = Ractor.make_shareable(new_mapping)
+    else
+      spell_checkers[error_class.to_s] = spell_checker
+    end
+
+    error_class.prepend(Correctable) if error_class.is_a?(Class) && !(error_class < Correctable)
   end
 
   correct_error NameError, NameErrorCheckers
@@ -102,13 +115,17 @@ module DidYouMean
 
   # Returns the currently set formatter. By default, it is set to +DidYouMean::Formatter+.
   def self.formatter
-    @formatter
+    if defined?(Ractor)
+      Ractor.current[:__did_you_mean_formatter__] || Formatter
+    else
+      Formatter
+    end
   end
 
   # Updates the primary formatter used to format the suggestions.
   def self.formatter=(formatter)
-    @formatter = formatter
+    if defined?(Ractor)
+      Ractor.current[:__did_you_mean_formatter__] = formatter
+    end
   end
-
-  @formatter = Formatter.new
 end

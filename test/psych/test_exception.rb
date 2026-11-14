@@ -82,6 +82,19 @@ module Psych
       assert_equal 'omg!', ex.file
     end
 
+    def test_safe_load_stream_takes_file
+      ex = assert_raise(Psych::SyntaxError) do
+        Psych.safe_load_stream '--- `'
+      end
+      assert_nil ex.file
+      assert_match '(<unknown>)', ex.message
+
+      ex = assert_raise(Psych::SyntaxError) do
+        Psych.safe_load_stream '--- `', filename: 'omg!'
+      end
+      assert_equal 'omg!', ex.file
+    end
+
     def test_parse_file_exception
       Tempfile.create(['parsefile', 'yml']) {|t|
         t.binmode
@@ -143,7 +156,8 @@ module Psych
       # assert_equal 5, e.offset
 
       assert e.problem
-      assert e.context
+      # libfyaml's diagnostics do not carry libyaml's separate "context" text.
+      assert e.context unless libfyaml?
     end
 
     def test_convert

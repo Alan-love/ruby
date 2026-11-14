@@ -171,7 +171,7 @@ class TestMiniTestUnit < MetaMetaMetaTestCase
   def test_passed_eh_teardown_skipped
     test_class = Class.new Test::Unit::TestCase do
       def teardown; assert true; end
-      def test_omg; skip "bork"; end
+      def test_omg; omit "bork"; end
     end
 
     test = test_class.new :test_omg
@@ -646,7 +646,7 @@ class TestMiniTestUnitTestCase < Test::Unit::TestCase
 
   def test_assert_in_delta_triggered
     x = "1.0e-06"
-    util_assert_triggered "Expected |0.0 - 0.001| (0.001) to be <= #{x}." do
+    util_assert_triggered "Expected |0.0 - 0.001| (0.001) to be <= #{x}.", strip: /\s+\(\/proc\/loadavg=.*\)/ do
       @tc.assert_in_delta 0.0, 1.0 / 1000, 0.000001
     end
   end
@@ -678,7 +678,7 @@ class TestMiniTestUnitTestCase < Test::Unit::TestCase
   end
 
   def test_assert_in_epsilon_triggered
-    util_assert_triggered 'Expected |10000 - 9990| (10) to be <= 9.99.' do
+    util_assert_triggered 'Expected |10000 - 9990| (10) to be <= 9.99.', strip: /\s+\(\/proc\/loadavg=.*\)/ do
       @tc.assert_in_epsilon 10000, 9990
     end
   end
@@ -686,7 +686,7 @@ class TestMiniTestUnitTestCase < Test::Unit::TestCase
   def test_assert_in_epsilon_triggered_negative_case
     x = "0.100000xxx"
     y = "0.1"
-    util_assert_triggered "Expected |-1.1 - -1| (#{x}) to be <= #{y}." do
+    util_assert_triggered "Expected |-1.1 - -1| (#{x}) to be <= #{y}.", strip: /\s+\(\/proc\/loadavg=.*\)/ do
       @tc.assert_in_epsilon(-1.1, -1, 0.1)
     end
   end
@@ -896,7 +896,7 @@ class TestMiniTestUnitTestCase < Test::Unit::TestCase
         begin
           raise "blah"
         rescue
-          skip "skipped"
+          omit "skipped"
         end
       end
     end
@@ -1323,11 +1323,19 @@ class TestMiniTestUnitTestCase < Test::Unit::TestCase
     end
   end
 
-  def test_skip
+  def test_omit
     @assertion_count = 0
 
     util_assert_triggered "haha!", Test::Unit::PendedError do
-      @tc.skip "haha!"
+      @tc.omit "haha!"
+    end
+  end
+
+  def test_pend
+    @assertion_count = 0
+
+    util_assert_triggered "haha!", Test::Unit::PendedError do
+      @tc.pend "haha!"
     end
   end
 
@@ -1344,7 +1352,7 @@ class TestMiniTestUnitTestCase < Test::Unit::TestCase
     assert_equal expected, sample_test_case.test_methods.sort
   end
 
-  def assert_triggered expected, klass = Test::Unit::AssertionFailedError
+  def assert_triggered expected, klass = Test::Unit::AssertionFailedError, strip: nil
     e = assert_raise klass do
       yield
     end
@@ -1352,6 +1360,7 @@ class TestMiniTestUnitTestCase < Test::Unit::TestCase
     msg = e.message.sub(/(---Backtrace---).*/m, '\1')
     msg.gsub!(/\(oid=[-0-9]+\)/, '(oid=N)')
     msg.gsub!(/(\d\.\d{6})\d+/, '\1xxx') # normalize: ruby version, impl, platform
+    msg.gsub!(strip, '') if strip
 
     assert_equal expected, msg
   end
@@ -1467,7 +1476,13 @@ class TestMiniTestUnitRecording < MetaMetaMetaTestCase
   def test_record_skip
     assert_run_record Test::Unit::PendedError do
       def test_method
-        skip "not yet"
+        omit "not yet"
+      end
+    end
+
+    assert_run_record Test::Unit::PendedError do
+      def test_method
+        pend "not yet"
       end
     end
   end

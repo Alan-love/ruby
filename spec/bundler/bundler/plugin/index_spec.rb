@@ -5,7 +5,7 @@ RSpec.describe Bundler::Plugin::Index do
 
   before do
     allow(Bundler::SharedHelpers).to receive(:find_gemfile).and_return(bundled_app_gemfile)
-    gemfile "source \"#{file_uri_for(gem_repo1)}\""
+    gemfile "source 'https://gem.repo1'"
     path = lib_path(plugin_name)
     index.register_plugin("new-plugin", path.to_s, [path.join("lib").to_s], commands, sources, hooks)
   end
@@ -99,9 +99,9 @@ RSpec.describe Bundler::Plugin::Index do
     end
 
     it "is gone after unregistration" do
-      expect(index.index_file.read).to include("after-bar:\n  - \"new-plugin\"\n")
+      expect(index.index_file.read).to include("after-bar:\n    - new-plugin\n")
       index.unregister_plugin(plugin_name)
-      expect(index.index_file.read).to_not include("after-bar:\n  - \n")
+      expect(index.index_file.read).to_not include("after-bar")
     end
 
     context "that are not registered" do
@@ -140,7 +140,7 @@ RSpec.describe Bundler::Plugin::Index do
   describe "after conflict" do
     let(:commands) { ["foo"] }
     let(:sources) { ["bar"] }
-    let(:hooks) { ["hoook"] }
+    let(:hooks) { ["thehook"] }
 
     shared_examples "it cleans up" do
       it "the path" do
@@ -156,7 +156,7 @@ RSpec.describe Bundler::Plugin::Index do
       end
 
       it "the hook" do
-        expect(index.hook_plugins("xhoook")).to be_empty
+        expect(index.hook_plugins("xthehook")).to be_empty
       end
     end
 
@@ -164,7 +164,7 @@ RSpec.describe Bundler::Plugin::Index do
       before do
         expect do
           path = lib_path("cplugin")
-          index.register_plugin("cplugin", path.to_s, [path.join("lib").to_s], ["foo"], ["xbar"], ["xhoook"])
+          index.register_plugin("cplugin", path.to_s, [path.join("lib").to_s], ["foo"], ["xbar"], ["xthehook"])
         end.to raise_error(Index::CommandConflict)
       end
 
@@ -175,7 +175,7 @@ RSpec.describe Bundler::Plugin::Index do
       before do
         expect do
           path = lib_path("cplugin")
-          index.register_plugin("cplugin", path.to_s, [path.join("lib").to_s], ["xfoo"], ["bar"], ["xhoook"])
+          index.register_plugin("cplugin", path.to_s, [path.join("lib").to_s], ["xfoo"], ["bar"], ["xthehook"])
         end.to raise_error(Index::SourceConflict)
       end
 
@@ -186,7 +186,7 @@ RSpec.describe Bundler::Plugin::Index do
       before do
         expect do
           path = lib_path("cplugin")
-          index.register_plugin("cplugin", path.to_s, [path.join("lib").to_s], ["foo"], ["bar"], ["xhoook"])
+          index.register_plugin("cplugin", path.to_s, [path.join("lib").to_s], ["foo"], ["bar"], ["xthehook"])
         end.to raise_error(Index::CommandConflict)
       end
 
@@ -194,11 +194,194 @@ RSpec.describe Bundler::Plugin::Index do
     end
   end
 
-  describe "readonly disk without home" do
-    it "ignores being unable to create temp home dir" do
-      expect_any_instance_of(Bundler::Plugin::Index).to receive(:global_index_file).
-        and_raise(Bundler::GenericSystemCallError.new("foo", "bar"))
-      Bundler::Plugin::Index.new
+  describe "relative plugin paths" do
+    let(:plugin_name) { "relative-plugin" }
+
+    before do
+      Bundler::Plugin.reset!
+      allow(Bundler::SharedHelpers).to receive(:find_gemfile).and_return(bundled_app_gemfile)
+
+      plugin_root = Bundler::Plugin.root
+      FileUtils.mkdir_p(plugin_root)
+
+      path = plugin_root.join(plugin_name)
+      FileUtils.mkdir_p(path.join("lib"))
+
+      index.register_plugin(plugin_name, path.to_s, [path.join("lib").to_s], [], [], [])
+    end
+
+    it "stores plugin paths relative to the plugin root" do
+      require "yaml"
+      data = YAML.load_file(index.index_file)
+
+      expect(data["plugin_paths"][plugin_name]).to eq(plugin_name)
+      expect(data["load_paths"][plugin_name]).to eq([File.join(plugin_name, "lib")])
+    end
+
+    it "expands relative paths to absolute on load" do
+      require "rubygems/yaml_serializer"
+
+      plugin_root = Bundler::Plugin.root
+
+      relative_index = {
+        "commands" => {},
+        "hooks" => {},
+        "load_paths" => { plugin_name => [File.join(plugin_name, "lib")] },
+        "plugin_paths" => { plugin_name => plugin_name },
+        "sources" => {},
+      }
+
+      File.open(index.index_file, "w") {|f| f.puts Gem::YAMLSerializer.dump(relative_index) }
+
+      new_index = Index.new
+      expect(new_index.plugin_path(plugin_name)).to eq(plugin_root.join(plugin_name))
+      expect(new_index.load_paths(plugin_name)).to eq([plugin_root.join(plugin_name, "lib").to_s])
+    end
+
+    it "ignores entries that climb out only after an interior parent reference" do
+      require "rubygems/yaml_serializer"
+
+      escaping_index = {
+        "commands" => {},
+        "hooks" => {},
+        "load_paths" => { "escaping-plugin" => [File.join("escaping-plugin", "..", "..", "elsewhere", "lib")] },
+        "plugin_paths" => { "escaping-plugin" => File.join("escaping-plugin", "..", "..", "elsewhere") },
+        "sources" => {},
+      }
+
+      File.open(index.index_file, "w") {|f| f.puts Gem::YAMLSerializer.dump(escaping_index) }
+
+      new_index = Index.new
+
+      expect(new_index.installed?("escaping-plugin")).to be_nil
+      expect(new_index.load_paths("escaping-plugin")).to be_nil
+    end
+
+    it "reads a leading tilde in a relative path literally" do
+      require "rubygems/yaml_serializer"
+
+      plugin_root = Bundler::Plugin.root
+
+      tilde_index = {
+        "commands" => {},
+        "hooks" => {},
+        "load_paths" => { plugin_name => [File.join("~nosuchuser", "lib")] },
+        "plugin_paths" => { plugin_name => "~nosuchuser" },
+        "sources" => {},
+      }
+
+      File.open(index.index_file, "w") {|f| f.puts Gem::YAMLSerializer.dump(tilde_index) }
+
+      new_index = Index.new
+      expect(new_index.plugin_path(plugin_name)).to eq(plugin_root.join("~nosuchuser"))
+      expect(new_index.load_paths(plugin_name)).to eq([plugin_root.join("~nosuchuser", "lib").to_s])
+    end
+
+    it "keeps an absolute path that only looks like it is under the plugin root" do
+      escaping_path = File.join(Bundler::Plugin.root.to_s, "..", "..", "escaping-plugin")
+
+      index.register_plugin("escaping-plugin", escaping_path, [File.join(escaping_path, "lib")], [], [], [])
+
+      new_index = Index.new
+      expect(new_index.installed?("escaping-plugin")).to eq(escaping_path)
+    end
+
+    it "keeps paths outside the plugin root as absolute" do
+      outside_path = tmp.join("outside", "external-plugin")
+      FileUtils.mkdir_p(outside_path.join("lib"))
+
+      index.register_plugin("external-plugin", outside_path.to_s, [outside_path.join("lib").to_s], [], [], [])
+
+      require "yaml"
+      data = YAML.load_file(index.index_file)
+
+      expect(data["plugin_paths"]["external-plugin"]).to eq(outside_path.to_s)
+      expect(data["load_paths"]["external-plugin"]).to eq([outside_path.join("lib").to_s])
+    end
+
+    it "ignores entries whose relative paths climb out of the plugin root" do
+      require "rubygems/yaml_serializer"
+
+      escaping_index = {
+        "commands" => { "escape" => "escaping-plugin" },
+        "hooks" => { "before-eval" => ["escaping-plugin", plugin_name] },
+        "load_paths" => {
+          "escaping-plugin" => ["../../elsewhere/lib"],
+          plugin_name => [File.join(plugin_name, "lib")],
+        },
+        "plugin_paths" => { "escaping-plugin" => "../../elsewhere", plugin_name => plugin_name },
+        "sources" => { "escape" => "escaping-plugin" },
+      }
+
+      File.open(index.index_file, "w") {|f| f.puts Gem::YAMLSerializer.dump(escaping_index) }
+
+      new_index = Index.new
+
+      expect(new_index.installed?("escaping-plugin")).to be_nil
+      expect(new_index.load_paths("escaping-plugin")).to be_nil
+      expect(new_index.command_plugin("escape")).to be_nil
+      expect(new_index.source_plugin("escape")).to be_nil
+      expect(new_index.hook_plugins("before-eval")).to eq([plugin_name])
+      expect(new_index.installed?(plugin_name)).to eq(Bundler::Plugin.root.join(plugin_name).to_s)
+    end
+
+    it "ignores entries whose load paths alone climb out of the plugin root" do
+      require "rubygems/yaml_serializer"
+
+      escaping_index = {
+        "commands" => {},
+        "hooks" => {},
+        "load_paths" => { "escaping-plugin" => ["../../elsewhere/lib"] },
+        "plugin_paths" => { "escaping-plugin" => "escaping-plugin" },
+        "sources" => {},
+      }
+
+      File.open(index.index_file, "w") {|f| f.puts Gem::YAMLSerializer.dump(escaping_index) }
+
+      new_index = Index.new
+
+      expect(new_index.installed?("escaping-plugin")).to be_nil
+      expect(new_index.load_paths("escaping-plugin")).to be_nil
+    end
+
+    it "drops hook events whose plugins all climb out of the plugin root" do
+      require "rubygems/yaml_serializer"
+
+      escaping_index = {
+        "commands" => {},
+        "hooks" => { "before-eval" => ["escaping-plugin"] },
+        "load_paths" => { "escaping-plugin" => ["../../elsewhere/lib"] },
+        "plugin_paths" => { "escaping-plugin" => "../../elsewhere" },
+        "sources" => {},
+      }
+
+      File.open(index.index_file, "w") {|f| f.puts Gem::YAMLSerializer.dump(escaping_index) }
+
+      new_index = Index.new
+      new_index.register_plugin("aplugin", lib_path("aplugin").to_s, [lib_path("aplugin").join("lib").to_s], [], [], [])
+
+      expect(new_index.index_file.read).to_not include("before-eval")
+    end
+
+    it "reads legacy index files with absolute paths" do
+      require "rubygems/yaml_serializer"
+
+      plugin_root = Bundler::Plugin.root
+      absolute_path = plugin_root.join(plugin_name).to_s
+
+      legacy_index = {
+        "commands" => {},
+        "hooks" => {},
+        "load_paths" => { plugin_name => [File.join(absolute_path, "lib")] },
+        "plugin_paths" => { plugin_name => absolute_path },
+        "sources" => {},
+      }
+
+      File.open(index.index_file, "w") {|f| f.puts Gem::YAMLSerializer.dump(legacy_index) }
+
+      new_index = Index.new
+      expect(new_index.plugin_path(plugin_name)).to eq(Pathname.new(absolute_path))
+      expect(new_index.load_paths(plugin_name)).to eq([File.join(absolute_path, "lib")])
     end
   end
 end

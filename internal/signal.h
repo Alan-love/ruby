@@ -13,9 +13,13 @@
 extern int ruby_enable_coredump;
 int rb_get_next_signal(void);
 
+#ifdef POSIX_SIGNAL
+void (*ruby_posix_signal(int, void (*)(int)))(int);
+#endif
+
 RUBY_SYMBOL_EXPORT_BEGIN
 /* signal.c (export) */
-int rb_grantpt(int fd);
+void rb_signal_atfork(void);
 RUBY_SYMBOL_EXPORT_END
 
 #endif /* INTERNAL_SIGNAL_H */

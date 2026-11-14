@@ -13,7 +13,7 @@ class TestIOWaitUncommon < Test::Unit::TestCase
   end
 
   def test_fifo_wait
-    skip 'no mkfifo' unless File.respond_to?(:mkfifo) && IO.const_defined?(:NONBLOCK)
+    omit 'no mkfifo' unless File.respond_to?(:mkfifo) && IO.const_defined?(:NONBLOCK)
     require 'tmpdir'
     Dir.mktmpdir('rubytest-fifo') do |dir|
       fifo = "#{dir}/fifo"
@@ -74,5 +74,19 @@ class TestIOWaitUncommon < Test::Unit::TestCase
 
   def test_wait_writable_null
     check_dev(IO::NULL, :wait_writable)
+  end
+
+  def test_after_ungetc_wait_readable
+    check_dev(IO::NULL, mode: "r") {|fp|
+      fp.ungetc(?a)
+      assert_predicate fp, :wait_readable
+    }
+  end
+
+  def test_after_ungetc_in_text_wait_readable
+    check_dev(IO::NULL, mode: "rt") {|fp|
+      fp.ungetc(?a)
+      assert_predicate fp, :wait_readable
+    }
   end
 end

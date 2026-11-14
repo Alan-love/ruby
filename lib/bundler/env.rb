@@ -17,9 +17,11 @@ module Bundler
       append_formatted_table("Environment", environment, out)
       append_formatted_table("Bundler Build Metadata", BuildMetadata.to_h, out)
 
-      unless Bundler.settings.all.empty?
+      settings = Bundler.settings.all_including_stored_credentials
+
+      unless settings.empty?
         out << "\n## Bundler settings\n\n```\n"
-        Bundler.settings.all.each do |setting|
+        settings.each do |setting|
           out << setting << "\n"
           Bundler.settings.pretty_values_for(setting).each do |line|
             out << "  " << line << "\n"
@@ -40,11 +42,11 @@ module Bundler
 
         out << "\n## Gemfile\n"
         gemfiles.each do |gemfile|
-          out << "\n### #{Pathname.new(gemfile).relative_path_from(SharedHelpers.pwd)}\n\n"
+          out << "\n### #{SharedHelpers.relative_path_to(gemfile)}\n\n"
           out << "```ruby\n" << read_file(gemfile).chomp << "\n```\n"
         end
 
-        out << "\n### #{Bundler.default_lockfile.relative_path_from(SharedHelpers.pwd)}\n\n"
+        out << "\n### #{SharedHelpers.relative_path_to(Bundler.default_lockfile)}\n\n"
         out << "```\n" << read_file(Bundler.default_lockfile).chomp << "\n```\n"
       end
 
@@ -69,26 +71,13 @@ module Bundler
     end
 
     def self.ruby_version
-      str = String.new(RUBY_VERSION)
-      str << "p#{RUBY_PATCHLEVEL}" if defined? RUBY_PATCHLEVEL
-      str << " (#{RUBY_RELEASE_DATE} revision #{RUBY_REVISION}) [#{RUBY_PLATFORM}]"
+      "#{RUBY_VERSION}p#{RUBY_PATCHLEVEL} (#{RUBY_RELEASE_DATE} revision #{RUBY_REVISION}) [#{Gem::Platform.local}]"
     end
 
     def self.git_version
-      Bundler::Source::Git::GitProxy.new(nil, nil, nil).full_version
+      Bundler::Source::Git::GitProxy.new(nil, nil).full_version
     rescue Bundler::Source::Git::GitNotInstalledError
       "not installed"
-    end
-
-    def self.version_of(script)
-      return "not installed" unless Bundler.which(script)
-      `#{script} --version`.chomp
-    end
-
-    def self.chruby_version
-      return "not installed" unless Bundler.which("chruby-exec")
-      `chruby-exec -- chruby --version`.
-        sub(/.*^chruby: (#{Gem::Version::VERSION_PATTERN}).*/m, '\1')
     end
 
     def self.environment
@@ -112,17 +101,9 @@ module Bundler
         out << ["  Cert File", OpenSSL::X509::DEFAULT_CERT_FILE] if defined?(OpenSSL::X509::DEFAULT_CERT_FILE)
         out << ["  Cert Dir", OpenSSL::X509::DEFAULT_CERT_DIR] if defined?(OpenSSL::X509::DEFAULT_CERT_DIR)
       end
-      out << ["Tools"]
-      out << ["  Git", git_version]
-      out << ["  RVM", ENV.fetch("rvm_version") { version_of("rvm") }]
-      out << ["  rbenv", version_of("rbenv")]
-      out << ["  chruby", chruby_version]
+      out << ["Git", git_version]
 
-      %w[rubygems-bundler open_gem].each do |name|
-        specs = Bundler.rubygems.find_name(name)
-        out << ["  #{name}", "(#{specs.map(&:version).join(",")})"] unless specs.empty?
-      end
-      if (exe = caller.last.split(":").first) && exe =~ %r{(exe|bin)/bundler?\z}
+      if (exe = caller_locations.last.absolute_path)&.match? %r{(exe|bin)/bundler?\z}
         shebang = File.read(exe).lines.first
         shebang.sub!(/^#!\s*/, "")
         unless shebang.start_with?(Gem.ruby, "/usr/bin/env ruby")
@@ -145,6 +126,6 @@ module Bundler
       out << "```\n"
     end
 
-    private_class_method :read_file, :ruby_version, :git_version, :append_formatted_table, :version_of, :chruby_version
+    private_class_method :read_file, :ruby_version, :git_version, :append_formatted_table
   end
 end

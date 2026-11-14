@@ -14,17 +14,20 @@
 *.inc
 *.log
 *.o
+*.o.tmp
 *.obj
 *.old
 *.orig
 *.pch
 *.pdb
 *.rbinc
+*.rbbin
 *.rej
 *.s
 *.sav
 *.sl
 *.so
+*.so.*
 *.swp
 *.yarb
 *~
@@ -40,6 +43,8 @@
 .time
 .ruby-version
 Makefile
+/.deps/
+/.gnumake/
 cygruby*.def
 extconf.h
 y.output
@@ -48,12 +53,14 @@ y.tab.c
 *.gcno
 *.gcov
 *.vscode
+!misc/.vscode
 lcov*.info
 
 # /
 /*-fake.rb
 /*.dll
 /*.exe
+/*.ilk
 /*.res
 /*.pc
 /*.rc
@@ -65,7 +72,6 @@ lcov*.info
 /ChangeLog
 /Doxyfile
 /GNUmakefile
-/README.atheos
 /README.fat-patch
 /README.v6
 /TAGS
@@ -73,7 +79,6 @@ lcov*.info
 /autom4te*.cache
 /automake
 /benchmark/benchmark-driver
-/beos
 /bmlog-*
 /breakpoints.gdb
 /config.cache
@@ -82,17 +87,16 @@ lcov*.info
 /config.status
 /config.status.lineno
 /configure
-/coverage/simplecov
-/coverage/simplecov-html
-/coverage/doclie
 /coverage/.last_run.json
+/coverage/.report_stamp
 /coverage/.resultset.json*
-/coverage/assets
+/coverage/coverage.json
 /coverage/index.html
 /doc/capi
 /enc.mk
 /encdb.h
 /exts.mk
+/gc/*/exts.mk
 /goruby
 /id.[ch]
 /largefile.h
@@ -121,29 +125,32 @@ lcov*.info
 /repack
 /revision.h
 /revision.tmp
-/riscos
+/ripper.tmp.y
 /rubicon
 /ruby
 /ruby-runner
 /ruby-runner.h
 /ruby-man.rd.gz
+/rubyspec_temp
 /run.gdb
 /sizes.c
 /static-ruby
 /test.rb
 /test-coverage.dat
 /tmp
+/vcpkg_installed
 /transdb.h
 /uncommon.mk
 /verconf.h
 /verconf.mk
 /web
-/yasmdata.rb
 
 # /bin/
 
 /bin/*.exe
 /bin/*.dll
+/bin/goruby
+/bin/ruby
 
 # /benchmark/
 /benchmark/bm_require.data
@@ -159,6 +166,11 @@ lcov*.info
 
 # /coroutine/
 !/coroutine/**/*.s
+!/coroutine/**/*.S
+
+# /coroutine/test/
+/coroutine/test/run
+/coroutine/test/run.exe
 
 # /enc/trans/
 /enc/trans/*.c
@@ -198,8 +210,10 @@ lcov*.info
 
 # /ext/ripper/
 /ext/ripper/eventids1.c
+/ext/ripper/eventids1.h
 /ext/ripper/.eventids2-check
 /ext/ripper/eventids2table.c
+/ext/ripper/ripper_init.c
 /ext/ripper/ripper.*
 /ext/ripper/ids1
 /ext/ripper/ids2
@@ -218,7 +232,10 @@ lcov*.info
 /lib/ruby/[1-9]*.*
 /lib/ruby/vendor_ruby
 
-# /spec/bundler
+# /misc/
+/misc/**/__pycache__
+
+# for `make test-bundler`
 /.rspec_status
 
 # /tool/
@@ -228,7 +245,49 @@ lcov*.info
 # /win32/
 /win32/*.ico
 
-# MJIT
-/rb_mjit_header.h
-/mjit_config.h
-/include/ruby-*/*/rb_mjit_min_header-*.h
+
+# YJIT
+/yjit-bench
+/yjit_exit_locations.dump
+
+# Rust
+/target
+
+# /wasm/
+/wasm/tests/*.wasm
+
+# prism
+/lib/ruby/prism/compiler.rb
+/lib/ruby/prism/dispatcher.rb
+/lib/ruby/prism/dot_visitor.rb
+/lib/ruby/prism/dsl.rb
+/lib/ruby/prism/inspect_visitor.rb
+/lib/ruby/prism/mutation_compiler.rb
+/lib/ruby/prism/node.rb
+/lib/ruby/prism/reflection.rb
+/lib/ruby/prism/serialize.rb
+/lib/ruby/prism/visitor.rb
+/prism/internal/diagnostic.h
+/prism/api_node.c
+/prism/ast.h
+/prism/diagnostic.c
+/prism/json.c
+/prism/node.c
+/prism/prettyprint.c
+/prism/serialize.c
+/prism/tokens.c
+/prism/srcs.mk
+/dump_ast
+
+# prism (old file)
+/prism/token_type.c
+
+# tool/update-NEWS-gemlist.rb
+/bundled_gems.json
+/default_gems.json
+/gems/default_gems
+
+# AI agents
+/.claude
+/AGENTS.md
+/CLAUDE.md

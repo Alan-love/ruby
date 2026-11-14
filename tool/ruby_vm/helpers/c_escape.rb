@@ -1,4 +1,3 @@
-#! /your/favourite/path/to/ruby
 # -*- Ruby -*-
 # -*- frozen_string_literal: true; -*-
 # -*- warn_indent: true; -*-
@@ -10,19 +9,15 @@
 # conditions  mentioned in  the file  COPYING are  met.  Consult  the file  for
 # details.
 
-require 'securerandom'
-
 module RubyVM::CEscape
   module_function
 
   # generate comment, with escaps.
   def commentify str
-    return "/* #{str.b.gsub('*/', '*\\/').gsub('/*', '/\\*')} */"
-  end
-
-  # Mimic gensym of CL.
-  def gensym prefix = 'gensym_'
-    return as_tr_cpp "#{prefix}#{SecureRandom.uuid}"
+    unless str = str.dump[/\A"\K.*(?="\z)/]
+      raise Encoding::CompatibilityError, "must be ASCII-compatible (#{str.encoding})"
+    end
+    return "/* #{str.gsub('*/', '*\\/').gsub('/*', '/\\*')} */"
   end
 
   # Mimic AS_TR_CPP() of autoconf.

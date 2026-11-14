@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+
 ##
 # Used Internally. Wraps a Dependency object to also track which spec
 # contained the Dependency.
@@ -79,14 +80,6 @@ class Gem::Resolver::DependencyRequest
   end
 
   ##
-  # Indicate that the request is for a gem requested as a dependency of
-  # another gem
-
-  def implicit?
-    !explicit?
-  end
-
-  ##
   # Return a String indicating who caused this request to be added (only
   # valid for implicit requests)
 
@@ -95,12 +88,12 @@ class Gem::Resolver::DependencyRequest
   end
 
   def pretty_print(q) # :nodoc:
-    q.group 2, '[Dependency request ', ']' do
+    q.group 2, "[Dependency request ", "]" do
       q.breakable
       q.text @dependency.to_s
 
       q.breakable
-      q.text ' requested by '
+      q.text " requested by "
       q.pp @requester
     end
   end

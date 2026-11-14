@@ -8,50 +8,39 @@ describe "StringIO#reopen when passed [Object, Integer]" do
 
   it "reopens self with the passed Object in the passed mode" do
     @io.reopen("reopened", IO::RDONLY)
-    @io.closed_read?.should be_false
-    @io.closed_write?.should be_true
+    @io.closed_read?.should == false
+    @io.closed_write?.should == true
     @io.string.should == "reopened"
 
-    @io.reopen("reopened, twice", IO::WRONLY)
-    @io.closed_read?.should be_true
-    @io.closed_write?.should be_false
+    @io.reopen(+"reopened, twice", IO::WRONLY)
+    @io.closed_read?.should == true
+    @io.closed_write?.should == false
     @io.string.should == "reopened, twice"
 
-    @io.reopen("reopened, another time", IO::RDWR)
-    @io.closed_read?.should be_false
-    @io.closed_write?.should be_false
+    @io.reopen(+"reopened, another time", IO::RDWR)
+    @io.closed_read?.should == false
+    @io.closed_write?.should == false
     @io.string.should == "reopened, another time"
-  end
-
-  ruby_version_is ""..."3.0" do
-    # NOTE: WEIRD!
-    it "does not taint self when the passed Object was tainted" do
-      @io.reopen("reopened".taint, IO::RDONLY)
-      @io.tainted?.should be_false
-
-      @io.reopen("reopened".taint, IO::WRONLY)
-      @io.tainted?.should be_false
-    end
   end
 
   it "tries to convert the passed Object to a String using #to_str" do
     obj = mock("to_str")
-    obj.should_receive(:to_str).and_return("to_str")
+    obj.should_receive(:to_str).and_return(+"to_str")
     @io.reopen(obj, IO::RDWR)
     @io.string.should == "to_str"
   end
 
   it "raises a TypeError when the passed Object can't be converted to a String" do
-    -> { @io.reopen(Object.new, IO::RDWR) }.should raise_error(TypeError)
+    -> { @io.reopen(Object.new, IO::RDWR) }.should.raise(TypeError)
   end
 
   it "raises an Errno::EACCES when trying to reopen self with a frozen String in write-mode" do
-    -> { @io.reopen("burn".freeze, IO::WRONLY) }.should raise_error(Errno::EACCES)
-    -> { @io.reopen("burn".freeze, IO::WRONLY | IO::APPEND) }.should raise_error(Errno::EACCES)
+    -> { @io.reopen("burn".freeze, IO::WRONLY) }.should.raise(Errno::EACCES)
+    -> { @io.reopen("burn".freeze, IO::WRONLY | IO::APPEND) }.should.raise(Errno::EACCES)
   end
 
   it "raises a FrozenError when trying to reopen self with a frozen String in truncate-mode" do
-    -> { @io.reopen("burn".freeze, IO::RDONLY | IO::TRUNC) }.should raise_error(FrozenError)
+    -> { @io.reopen("burn".freeze, IO::RDONLY | IO::TRUNC) }.should.raise(FrozenError)
   end
 
   it "does not raise IOError when passed a frozen String in read-mode" do
@@ -67,40 +56,29 @@ describe "StringIO#reopen when passed [Object, Object]" do
 
   it "reopens self with the passed Object in the passed mode" do
     @io.reopen("reopened", "r")
-    @io.closed_read?.should be_false
-    @io.closed_write?.should be_true
+    @io.closed_read?.should == false
+    @io.closed_write?.should == true
     @io.string.should == "reopened"
 
-    @io.reopen("reopened, twice", "r+")
-    @io.closed_read?.should be_false
-    @io.closed_write?.should be_false
+    @io.reopen(+"reopened, twice", "r+")
+    @io.closed_read?.should == false
+    @io.closed_write?.should == false
     @io.string.should == "reopened, twice"
 
-    @io.reopen("reopened, another", "w+")
-    @io.closed_read?.should be_false
-    @io.closed_write?.should be_false
+    @io.reopen(+"reopened, another", "w+")
+    @io.closed_read?.should == false
+    @io.closed_write?.should == false
     @io.string.should == ""
 
-    @io.reopen("reopened, another time", "r+")
-    @io.closed_read?.should be_false
-    @io.closed_write?.should be_false
+    @io.reopen(+"reopened, another time", "r+")
+    @io.closed_read?.should == false
+    @io.closed_write?.should == false
     @io.string.should == "reopened, another time"
   end
 
   it "truncates the passed String when opened in truncate mode" do
-    @io.reopen(str = "reopened", "w")
+    @io.reopen(str = +"reopened", "w")
     str.should == ""
-  end
-
-  ruby_version_is ""..."3.0" do
-    # NOTE: WEIRD!
-    it "does not taint self when the passed Object was tainted" do
-      @io.reopen("reopened".taint, "r")
-      @io.tainted?.should be_false
-
-      @io.reopen("reopened".taint, "w")
-      @io.tainted?.should be_false
-    end
   end
 
   it "tries to convert the passed Object to a String using #to_str" do
@@ -111,35 +89,35 @@ describe "StringIO#reopen when passed [Object, Object]" do
   end
 
   it "raises a TypeError when the passed Object can't be converted to a String using #to_str" do
-    -> { @io.reopen(Object.new, "r") }.should raise_error(TypeError)
+    -> { @io.reopen(Object.new, "r") }.should.raise(TypeError)
   end
 
   it "resets self's position to 0" do
     @io.read(5)
-    @io.reopen("reopened")
-    @io.pos.should eql(0)
+    @io.reopen(+"reopened")
+    @io.pos.should.eql?(0)
   end
 
   it "resets self's line number to 0" do
     @io.gets
-    @io.reopen("reopened")
-    @io.lineno.should eql(0)
+    @io.reopen(+"reopened")
+    @io.lineno.should.eql?(0)
   end
 
   it "tries to convert the passed mode Object to an Integer using #to_str" do
     obj = mock("to_str")
     obj.should_receive(:to_str).and_return("r")
     @io.reopen("reopened", obj)
-    @io.closed_read?.should be_false
-    @io.closed_write?.should be_true
+    @io.closed_read?.should == false
+    @io.closed_write?.should == true
     @io.string.should == "reopened"
   end
 
   it "raises an Errno::EACCES error when trying to reopen self with a frozen String in write-mode" do
-    -> { @io.reopen("burn".freeze, 'w') }.should raise_error(Errno::EACCES)
-    -> { @io.reopen("burn".freeze, 'w+') }.should raise_error(Errno::EACCES)
-    -> { @io.reopen("burn".freeze, 'a') }.should raise_error(Errno::EACCES)
-    -> { @io.reopen("burn".freeze, "r+") }.should raise_error(Errno::EACCES)
+    -> { @io.reopen("burn".freeze, 'w') }.should.raise(Errno::EACCES)
+    -> { @io.reopen("burn".freeze, 'w+') }.should.raise(Errno::EACCES)
+    -> { @io.reopen("burn".freeze, 'a') }.should.raise(Errno::EACCES)
+    -> { @io.reopen("burn".freeze, "r+") }.should.raise(Errno::EACCES)
   end
 
   it "does not raise IOError if a frozen string is passed in read mode" do
@@ -156,32 +134,24 @@ describe "StringIO#reopen when passed [String]" do
   it "reopens self with the passed String in read-write mode" do
     @io.close
 
-    @io.reopen("reopened")
+    @io.reopen(+"reopened")
 
-    @io.closed_write?.should be_false
-    @io.closed_read?.should be_false
+    @io.closed_write?.should == false
+    @io.closed_read?.should == false
 
     @io.string.should == "reopened"
   end
 
-  ruby_version_is ""..."3.0" do
-    # NOTE: WEIRD!
-    it "does not taint self when the passed Object was tainted" do
-      @io.reopen("reopened".taint)
-      @io.tainted?.should be_false
-    end
-  end
-
   it "resets self's position to 0" do
     @io.read(5)
-    @io.reopen("reopened")
-    @io.pos.should eql(0)
+    @io.reopen(+"reopened")
+    @io.pos.should.eql?(0)
   end
 
   it "resets self's line number to 0" do
     @io.gets
-    @io.reopen("reopened")
-    @io.lineno.should eql(0)
+    @io.reopen(+"reopened")
+    @io.lineno.should.eql?(0)
   end
 end
 
@@ -191,28 +161,20 @@ describe "StringIO#reopen when passed [Object]" do
   end
 
   it "raises a TypeError when passed an Object that can't be converted to a StringIO" do
-    -> { @io.reopen(Object.new) }.should raise_error(TypeError)
+    -> { @io.reopen(Object.new) }.should.raise(TypeError)
   end
 
   it "does not try to convert the passed Object to a String using #to_str" do
     obj = mock("not to_str")
     obj.should_not_receive(:to_str)
-    -> { @io.reopen(obj) }.should raise_error(TypeError)
+    -> { @io.reopen(obj) }.should.raise(TypeError)
   end
 
   it "tries to convert the passed Object to a StringIO using #to_strio" do
     obj = mock("to_strio")
-    obj.should_receive(:to_strio).and_return(StringIO.new("to_strio"))
+    obj.should_receive(:to_strio).and_return(StringIO.new(+"to_strio"))
     @io.reopen(obj)
     @io.string.should == "to_strio"
-  end
-
-  # NOTE: WEIRD!
-  ruby_version_is ""..."2.7" do
-    it "taints self when the passed Object was tainted" do
-      @io.reopen(StringIO.new("reopened").taint)
-      @io.tainted?.should be_true
-    end
   end
 end
 
@@ -224,20 +186,20 @@ describe "StringIO#reopen when passed no arguments" do
   it "resets self's mode to read-write" do
     @io.close
     @io.reopen
-    @io.closed_read?.should be_false
-    @io.closed_write?.should be_false
+    @io.closed_read?.should == false
+    @io.closed_write?.should == false
   end
 
   it "resets self's position to 0" do
     @io.read(5)
     @io.reopen
-    @io.pos.should eql(0)
+    @io.pos.should.eql?(0)
   end
 
   it "resets self's line number to 0" do
     @io.gets
     @io.reopen
-    @io.lineno.should eql(0)
+    @io.lineno.should.eql?(0)
   end
 end
 
@@ -246,49 +208,40 @@ end
 # for details.
 describe "StringIO#reopen" do
   before :each do
-    @io = StringIO.new('hello','a')
+    @io = StringIO.new(+'hello', 'a')
   end
 
   # TODO: find out if this is really a bug
   it "reopens a stream when given a String argument" do
-    @io.reopen('goodbye').should == @io
+    @io.reopen(+'goodbye').should == @io
     @io.string.should == 'goodbye'
     @io << 'x'
     @io.string.should == 'xoodbye'
   end
 
   it "reopens a stream in append mode when flagged as such" do
-    @io.reopen('goodbye', 'a').should == @io
+    @io.reopen(+'goodbye', 'a').should == @io
     @io.string.should == 'goodbye'
     @io << 'x'
     @io.string.should == 'goodbyex'
   end
 
   it "reopens and truncate when reopened in write mode" do
-    @io.reopen('goodbye', 'wb').should == @io
+    @io.reopen(+'goodbye', 'wb').should == @io
     @io.string.should == ''
     @io << 'x'
     @io.string.should == 'x'
   end
 
   it "truncates the given string, not a copy" do
-    str = 'goodbye'
+    str = +'goodbye'
     @io.reopen(str, 'w')
     @io.string.should == ''
     str.should == ''
   end
 
-  ruby_version_is ""..."2.7" do
-    it "taints self if the provided StringIO argument is tainted" do
-      new_io = StringIO.new("tainted")
-      new_io.taint
-      @io.reopen(new_io)
-      @io.should.tainted?
-    end
-  end
-
   it "does not truncate the content even when the StringIO argument is in the truncate mode" do
-    orig_io = StringIO.new("Original StringIO", IO::RDWR|IO::TRUNC)
+    orig_io = StringIO.new(+"Original StringIO", IO::RDWR|IO::TRUNC)
     orig_io.write("BLAH") # make sure the content is not empty
 
     @io.reopen(orig_io)

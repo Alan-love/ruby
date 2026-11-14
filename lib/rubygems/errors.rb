@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+
 #--
 # This file contains all the various exceptions and other errors that are used
 # inside of RubyGems.
@@ -25,10 +26,11 @@ module Gem
   # system.  Instead of rescuing from this class, make sure to rescue from the
   # superclass Gem::LoadError to catch all types of load errors.
   class MissingSpecError < Gem::LoadError
-    def initialize(name, requirement, extra_message=nil)
+    def initialize(name, requirement, extra_message = nil)
       @name        = name
       @requirement = requirement
       @extra_message = extra_message
+      super(message)
     end
 
     def message # :nodoc:
@@ -52,18 +54,15 @@ module Gem
     attr_reader :specs
 
     def initialize(name, requirement, specs)
-      super(name, requirement)
       @specs = specs
+      super(name, requirement)
     end
 
     private
 
     def build_message
-      if name == "bundler" && message = Gem::BundlerVersionFinder.missing_version_message
-        return message
-      end
       names = specs.map(&:full_name)
-      "Could not find '#{name}' (#{requirement}) - did find: [#{names.join ','}]\n"
+      "Could not find '#{name}' (#{requirement}) - did find: [#{names.join ","}]\n"
     end
   end
 
@@ -136,11 +135,7 @@ module Gem
     ##
     # A wordy description of the error.
     def wordy
-      "Found %s (%s), but was for platform%s %s" %
-        [@name,
-         @version,
-         @platforms.size == 1 ? '' : 's',
-         @platforms.join(' ,')]
+      format("Found %s (%s), but was for platform%s %s", @name, @version, @platforms.size == 1 ? "" : "s", @platforms.join(" ,"))
     end
   end
 
@@ -171,12 +166,12 @@ module Gem
     # An English description of the error.
 
     def wordy
-      "Unable to download data from #{Gem::Uri.new(@source.uri).redacted} - #{@error.message}"
+      "Unable to download data from #{Gem::Uri.redact(@source.uri)} - #{@error.message}"
     end
 
     ##
     # The "exception" alias allows you to call raise on a SourceFetchProblem.
 
-    alias exception error
+    alias_method :exception, :error
   end
 end

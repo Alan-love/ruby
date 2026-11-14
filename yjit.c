@@ -1,186 +1,683 @@
-// YJIT combined compilation unit. This setup allows spreading functions
-// across different files without having to worry about putting things
-// in headers and prefixing function names.
+// This part of YJIT helps interfacing with the rest of CRuby and with the OS.
+// Sometimes our FFI binding generation tool gives undesirable outputs when it
+// sees C features that Rust doesn't support well. We mitigate that by binding
+// functions which have simple parameter types. The boilerplate C functions for
+// that purpose are in this file.
+// Similarly, we wrap OS facilities we need in simple functions to help with
+// FFI and to avoid the need to use external crates.io Rust libraries.
+
 #include "internal.h"
+#include "internal/sanitizers.h"
+#include "internal/string.h"
+#include "internal/hash.h"
+#include "internal/variable.h"
+#include "internal/compile.h"
+#include "internal/class.h"
+#include "internal/fixnum.h"
+#include "internal/numeric.h"
+#include "internal/gc.h"
 #include "vm_core.h"
 #include "vm_callinfo.h"
 #include "builtin.h"
 #include "insns.inc"
 #include "insns_info.inc"
-#include "vm_sync.h"
 #include "yjit.h"
+#include "zjit.h"
+#include "vm_insnhelper.h"
+#include "probes.h"
+#include "probes_helper.h"
+#include "iseq.h"
+#include "ruby/debug.h"
+#include "internal/cont.h"
+#include "internal/jit.h"
 
-#ifndef YJIT_CHECK_MODE
-# define YJIT_CHECK_MODE 0
+// For mmapp(), sysconf()
+#ifndef _WIN32
+#include <unistd.h>
+#include <sys/mman.h>
 #endif
 
-// >= 1: print when output code invalidation happens
-// >= 2: dump list of instructions when regions compile
-#ifndef YJIT_DUMP_MODE
-# define YJIT_DUMP_MODE 0
-#endif
+#include <errno.h>
 
-#if defined(__x86_64__) && !defined(_WIN32)
-# define PLATFORM_SUPPORTED_P 1
-#else
-# define PLATFORM_SUPPORTED_P 0
-#endif
+// We need size_t to have a known size to simplify code generation and FFI.
+// TODO(alan): check this in configure.ac to fail fast on 32 bit platforms.
+STATIC_ASSERT(64b_size_t, SIZE_MAX == UINT64_MAX);
+// I don't know any C implementation that has uint64_t and puts padding bits
+// into size_t but the standard seems to allow it.
+STATIC_ASSERT(size_t_no_padding_bits, sizeof(size_t) == sizeof(uint64_t));
 
-// USE_MJIT comes from configure options
-#define JIT_ENABLED USE_MJIT
+// This build config impacts the pointer tagging scheme and we only want to
+// support one scheme for simplicity.
+STATIC_ASSERT(pointer_tagging_scheme, USE_FLONUM);
 
-// Check if we need to include YJIT in the build
-#if JIT_ENABLED && PLATFORM_SUPPORTED_P
+// The bindings declare rb_len_t as i64, and codegen reads String and Array
+// lengths at that width.
+STATIC_ASSERT(rb_len_t_matches_bindings, sizeof(rb_len_t) == sizeof(int64_t));
 
-#include "yjit_asm.c"
-
-// Code block into which we write machine code
-static codeblock_t block;
-static codeblock_t *cb = NULL;
-
-// Code block into which we write out-of-line machine code
-static codeblock_t outline_block;
-static codeblock_t *ocb = NULL;
-
-#if YJIT_STATS
-// Comments for generated code
-struct yjit_comment {
-    uint32_t offset;
-    const char *comment;
+enum yjit_bindgen_constants {
+    // ISEQ_TRANSLATED expands to an enum value through a chain of macros,
+    // which bindgen cannot evaluate, so it needs to be re-exposed here.
+    YJIT_ISEQ_TRANSLATED = ISEQ_TRANSLATED,
 };
 
-typedef rb_darray(struct yjit_comment) yjit_comment_array_t;
-static yjit_comment_array_t yjit_code_comments;
+// NOTE: We can trust that uint8_t has no "padding bits" since the C spec
+// guarantees it. Wording about padding bits is more explicit in C11 compared
+// to C99. See C11 7.20.1.1p2. All this is to say we have _some_ standards backing to
+// use a Rust `*mut u8` to represent a C `uint8_t *`.
+//
+// If we don't want to trust that we can interpreter the C standard correctly, we
+// could outsource that work to the Rust standard library by sticking to fundamental
+// types in C such as int, long, etc. and use `std::os::raw::c_long` and friends on
+// the Rust side.
+//
+// What's up with the long prefix? Even though we build with `-fvisibility=hidden`
+// we are sometimes a static library where the option doesn't prevent name collision.
+// The "_yjit_" part is for trying to be informative. We might want different
+// suffixes for symbols meant for Rust and symbols meant for broader CRuby.
 
-// Counters for generated code
-#define YJIT_DECLARE_COUNTERS(...) struct rb_yjit_runtime_counters { \
-    int64_t __VA_ARGS__; \
-}; \
-static char yjit_counter_names[] = #__VA_ARGS__;
+// For a given raw_sample (frame), set the hash with the caller's
+// name, file, and line number. Return the  hash with collected frame_info.
+static void
+rb_yjit_add_frame(VALUE hash, VALUE frame)
+{
+    VALUE frame_id = PTR2NUM(frame);
 
-YJIT_DECLARE_COUNTERS(
-    exec_instruction,
+    if (RTEST(rb_hash_aref(hash, frame_id))) {
+        return;
+    }
+    else {
+        VALUE frame_info = rb_hash_new();
+        // Full label for the frame
+        VALUE name = rb_profile_frame_full_label(frame);
+        // Absolute path of the frame from rb_iseq_realpath
+        VALUE file = rb_profile_frame_absolute_path(frame);
+        // Line number of the frame
+        VALUE line = rb_profile_frame_first_lineno(frame);
 
-    send_keywords,
-    send_kw_splat,
-    send_args_splat,
-    send_block_arg,
-    send_ivar_set_method,
-    send_zsuper_method,
-    send_undef_method,
-    send_optimized_method,
-    send_missing_method,
-    send_bmethod,
-    send_refined_method,
-    send_cfunc_ruby_array_varg,
-    send_cfunc_argc_mismatch,
-    send_cfunc_toomany_args,
-    send_cfunc_tracing,
-    send_cfunc_kwargs,
-    send_attrset_kwargs,
-    send_iseq_tailcall,
-    send_iseq_arity_error,
-    send_iseq_only_keywords,
-    send_iseq_kwargs_req_and_opt_missing,
-    send_iseq_kwargs_mismatch,
-    send_iseq_complex_callee,
-    send_not_implemented_method,
-    send_getter_arity,
-    send_se_cf_overflow,
-    send_se_protected_check_failed,
+        // If absolute path isn't available use the rb_iseq_path
+        if (NIL_P(file)) {
+            file = rb_profile_frame_path(frame);
+        }
 
-    traced_cfunc_return,
+        rb_hash_aset(frame_info, ID2SYM(rb_intern("name")), name);
+        rb_hash_aset(frame_info, ID2SYM(rb_intern("file")), file);
+        rb_hash_aset(frame_info, ID2SYM(rb_intern("samples")), INT2NUM(0));
+        rb_hash_aset(frame_info, ID2SYM(rb_intern("total_samples")), INT2NUM(0));
+        rb_hash_aset(frame_info, ID2SYM(rb_intern("edges")), rb_hash_new());
+        rb_hash_aset(frame_info, ID2SYM(rb_intern("lines")), rb_hash_new());
 
-    invokesuper_me_changed,
-    invokesuper_block,
+        if (line != INT2FIX(0)) {
+            rb_hash_aset(frame_info, ID2SYM(rb_intern("line")), line);
+        }
 
-    leave_se_interrupt,
-    leave_interp_return,
-    leave_start_pc_non_zero,
+       rb_hash_aset(hash, frame_id, frame_info);
+    }
+}
 
-    getivar_se_self_not_heap,
-    getivar_idx_out_of_range,
+// Parses the YjitExitLocations raw_samples and line_samples collected by
+// rb_yjit_record_exit_stack and turns them into 3 hashes (raw, lines, and frames) to
+// be used by RubyVM::YJIT.exit_locations. yjit_raw_samples represents the raw frames information
+// (without name, file, and line), and yjit_line_samples represents the line information
+// of the iseq caller.
+VALUE
+rb_yjit_exit_locations_dict(VALUE *yjit_raw_samples, int *yjit_line_samples, int samples_len)
+{
+    VALUE result = rb_hash_new();
+    VALUE raw_samples = rb_ary_new_capa(samples_len);
+    VALUE line_samples = rb_ary_new_capa(samples_len);
+    VALUE frames = rb_hash_new();
+    int idx = 0;
 
-    setivar_se_self_not_heap,
-    setivar_idx_out_of_range,
-    setivar_val_heapobject,
-    setivar_name_not_mapped,
-    setivar_not_object,
-    setivar_frozen,
+    // While the index is less than samples_len, parse yjit_raw_samples and
+    // yjit_line_samples, then add casted values to raw_samples and line_samples array.
+    while (idx < samples_len) {
+        int num = (int)yjit_raw_samples[idx];
+        int line_num = (int)yjit_line_samples[idx];
+        idx++;
 
-    oaref_argc_not_one,
-    oaref_arg_not_fixnum,
+        // + 1 as we append an additional sample for the insn
+        rb_ary_push(raw_samples, SIZET2NUM(num + 1));
+        rb_ary_push(line_samples, INT2NUM(line_num + 1));
 
-    opt_getinlinecache_miss,
+        // Loop through the length of samples_len and add data to the
+        // frames hash. Also push the current value onto the raw_samples
+        // and line_samples array respectively.
+        for (int o = 0; o < num; o++) {
+            rb_yjit_add_frame(frames, yjit_raw_samples[idx]);
+            rb_ary_push(raw_samples, SIZET2NUM(yjit_raw_samples[idx]));
+            rb_ary_push(line_samples, INT2NUM(yjit_line_samples[idx]));
+            idx++;
+        }
 
-    binding_allocations,
-    binding_set,
+        rb_ary_push(raw_samples, SIZET2NUM(yjit_raw_samples[idx]));
+        rb_ary_push(line_samples, INT2NUM(yjit_line_samples[idx]));
+        idx++;
 
-    vm_insns_count,
-    compiled_iseq_count,
-    compiled_block_count,
+        rb_ary_push(raw_samples, SIZET2NUM(yjit_raw_samples[idx]));
+        rb_ary_push(line_samples, INT2NUM(yjit_line_samples[idx]));
+        idx++;
+    }
 
-    invalidation_count,
-    invalidate_method_lookup,
-    invalidate_bop_redefined,
-    invalidate_ractor_spawn,
-    invalidate_constant_state_bump,
-    invalidate_constant_ic_fill,
+    // Set add the raw_samples, line_samples, and frames to the results
+    // hash.
+    rb_hash_aset(result, ID2SYM(rb_intern("raw")), raw_samples);
+    rb_hash_aset(result, ID2SYM(rb_intern("lines")), line_samples);
+    rb_hash_aset(result, ID2SYM(rb_intern("frames")), frames);
 
-    constant_state_bumps,
+    return result;
+}
 
-    expandarray_splat,
-    expandarray_postarg,
-    expandarray_not_array,
-    expandarray_rhs_too_small,
+// Is anyone listening for :c_call and :c_return event currently?
+bool
+rb_c_method_tracing_currently_enabled(const rb_execution_context_t *ec)
+{
+    return ruby_vm_c_events_enabled > 0;
+}
 
-    gbpp_block_param_modified,
-    gbpp_block_handler_not_iseq,
+// The code we generate in gen_send_cfunc() doesn't fire the c_return TracePoint event
+// like the interpreter. When tracing for c_return is enabled, we patch the code after
+// the C method return to call into this to fire the event.
+void
+rb_full_cfunc_return(rb_execution_context_t *ec, VALUE return_value)
+{
+    rb_control_frame_t *cfp = ec->cfp;
+    RUBY_ASSERT_ALWAYS(cfp == GET_EC()->cfp);
+    const rb_callable_method_entry_t *me = rb_vm_frame_method_entry(cfp);
 
-    // Member with known name for iterating over counters
-    last_member
-)
+    RUBY_ASSERT_ALWAYS(RUBYVM_CFUNC_FRAME_P(cfp));
+    RUBY_ASSERT_ALWAYS(me->def->type == VM_METHOD_TYPE_CFUNC);
 
-static struct rb_yjit_runtime_counters yjit_runtime_counters = { 0 };
-#undef YJIT_DECLARE_COUNTERS
+    // CHECK_CFP_CONSISTENCY("full_cfunc_return"); TODO revive this
 
-#endif // YJIT_STATS
+    // Pop the C func's frame and fire the c_return TracePoint event
+    // Note that this is the same order as vm_call_cfunc_with_frame().
+    rb_vm_pop_frame(ec);
+    EXEC_EVENT_HOOK(ec, RUBY_EVENT_C_RETURN, cfp->self, me->def->original_id, me->called_id, me->owner, return_value);
+    // Note, this deviates from the interpreter in that users need to enable
+    // a c_return TracePoint for this DTrace hook to work. A reasonable change
+    // since the Ruby return event works this way as well.
+    RUBY_DTRACE_CMETHOD_RETURN_HOOK(ec, me->owner, me->def->original_id);
 
-// The number of bytes counting from the beginning of the inline code block
-// that should not be changed. After patching for global invalidation, no one
-// should make changes to the invalidated code region anymore. This is used to
-// break out of invalidation race when there are multiple ractors.
-static uint32_t yjit_codepage_frozen_bytes = 0;
+    // Push return value into the caller's stack. We know that it's a frame that
+    // uses cfp->sp because we are patching a call done with gen_send_cfunc().
+    ec->cfp->sp[0] = return_value;
+    ec->cfp->sp++;
+}
 
-#include "yjit_utils.c"
-#include "yjit_core.c"
-#include "yjit_iface.c"
-#include "yjit_codegen.c"
+// This is defined only as a named struct inside rb_iseq_constant_body.
+// By giving it a separate typedef, we make it nameable by rust-bindgen.
+// Bindgen's temp/anon name isn't guaranteed stable.
+typedef struct rb_iseq_param_keyword rb_seq_param_keyword_struct;
 
+ID rb_get_symbol_id(VALUE namep);
+
+// If true, the iseq has only opt_invokebuiltin_delegate(_leave) and leave insns.
+static bool
+invokebuiltin_delegate_leave_p(const rb_iseq_t *iseq)
+{
+    int insn1 = rb_vm_insn_addr2opcode((void *)ISEQ_BODY(iseq)->iseq_encoded[0]);
+    if ((int)ISEQ_BODY(iseq)->iseq_size != insn_len(insn1) + insn_len(BIN(leave))) {
+        return false;
+    }
+    int insn2 = rb_vm_insn_addr2opcode((void *)ISEQ_BODY(iseq)->iseq_encoded[insn_len(insn1)]);
+    return (insn1 == BIN(opt_invokebuiltin_delegate) || insn1 == BIN(opt_invokebuiltin_delegate_leave)) &&
+            insn2 == BIN(leave);
+}
+
+// Return an rb_builtin_function if the iseq contains only that builtin function.
+const struct rb_builtin_function *
+rb_yjit_builtin_function(const rb_iseq_t *iseq)
+{
+    if (invokebuiltin_delegate_leave_p(iseq)) {
+        return (const struct rb_builtin_function *)ISEQ_BODY(iseq)->iseq_encoded[1];
+    }
+    else {
+        return NULL;
+    }
+}
+
+extern VALUE *rb_vm_base_ptr(struct rb_control_frame_struct *cfp);
+
+VALUE
+rb_str_neq_internal(VALUE str1, VALUE str2)
+{
+    return rb_str_eql_internal(str1, str2) == Qtrue ? Qfalse : Qtrue;
+}
+
+extern VALUE rb_ary_unshift_m(int argc, VALUE *argv, VALUE ary);
+
+VALUE
+rb_yjit_rb_ary_subseq_length(VALUE ary, rb_len_t beg)
+{
+    rb_len_t len = RARRAY_LEN(ary);
+    return rb_ary_subseq(ary, beg, len);
+}
+
+// Checks to establish preconditions for rb_yjit_splat_varg_cfunc()
+VALUE
+rb_yjit_splat_varg_checks(VALUE *sp, VALUE splat_array, rb_control_frame_t *cfp)
+{
+    // We inserted a T_ARRAY guard before this call
+    rb_len_t len = RARRAY_LEN(splat_array);
+
+    // Large splat arrays need a separate allocation
+    if (len < 0 || len > VM_ARGC_STACK_MAX) return Qfalse;
+
+    // Would we overflow if we put the contents of the array onto the stack?
+    if (sp + len > (VALUE *)(cfp - 2)) return Qfalse;
+
+    // Reject keywords hash since that requires duping it sometimes
+    if (len > 0) {
+        VALUE last_hash = RARRAY_AREF(splat_array, len - 1);
+        if (RB_TYPE_P(last_hash, T_HASH) &&
+                FL_TEST_RAW(last_hash, RHASH_PASS_AS_KEYWORDS)) {
+            return Qfalse;
+        }
+    }
+
+    return Qtrue;
+}
+
+// Push array elements to the stack for a C method that has a variable number
+// of parameters. Returns the number of arguments the splat array contributes.
+int
+rb_yjit_splat_varg_cfunc(VALUE *stack_splat_array)
+{
+    VALUE splat_array = *stack_splat_array;
+    int len;
+
+    // We already checked that length fits in `int`
+    RUBY_ASSERT(RB_TYPE_P(splat_array, T_ARRAY));
+    len = (int)RARRAY_LEN(splat_array);
+
+    // Push the contents of the array onto the stack
+    MEMCPY(stack_splat_array, RARRAY_CONST_PTR(splat_array), VALUE, len);
+
+    return len;
+}
+
+// Print the Ruby source location of some ISEQ for debugging purposes
+void
+rb_yjit_dump_iseq_loc(const rb_iseq_t *iseq, uint32_t insn_idx)
+{
+    char *ptr;
+    rb_len_t len;
+    VALUE path = rb_iseq_path(iseq);
+    RSTRING_GETMEM(path, ptr, len);
+    fprintf(stderr, "%s %.*s:%u\n", __func__, (int)len, ptr, rb_iseq_line_no(iseq, insn_idx));
+}
+
+// Get the number of digits required to print an integer
+static int
+num_digits(int integer)
+{
+    int num = 1;
+    while (integer /= 10) {
+        num++;
+    }
+    return num;
+}
+
+// Allocate a C string that formats an ISEQ label like iseq_inspect()
+char *
+rb_yjit_iseq_inspect(const rb_iseq_t *iseq)
+{
+    const char *label = RSTRING_PTR(ISEQ_BODY(iseq)->location.label);
+    const char *path = RSTRING_PTR(rb_iseq_path(iseq));
+    int lineno = ISEQ_BODY(iseq)->location.code_location.beg_pos.lineno;
+
+    const size_t size = strlen(label) + strlen(path) + num_digits(lineno) + 3;
+    char *buf = ZALLOC_N(char, size);
+    snprintf(buf, size, "%s@%s:%d", label, path, lineno);
+    return buf;
+}
+
+// There are RSTRUCT_SETs in ruby/internal/core/rstruct.h and internal/struct.h
+// with different types (int vs long) for k. Here we use the one from ruby/internal/core/rstruct.h,
+// which takes an int.
+void
+rb_RSTRUCT_SET(VALUE st, int k, VALUE v)
+{
+    RSTRUCT_SET(st, k, v);
+}
+
+// Return the string encoding index
+int
+rb_ENCODING_GET(VALUE obj)
+{
+    return RB_ENCODING_GET(obj);
+}
+
+// For running write barriers from Rust. Required when we add a new edge in the
+// object graph from `old` to `young`.
+void
+rb_yjit_obj_written(VALUE old, VALUE young, const char *file, int line)
+{
+    rb_obj_written(old, Qundef, young, file, line);
+}
+
+void
+rb_yjit_compile_iseq(const rb_iseq_t *iseq, rb_execution_context_t *ec, bool jit_exception)
+{
+    RB_VM_LOCKING() {
+        rb_vm_barrier();
+
+        // Compile a block version starting at the current instruction
+        uint8_t *rb_yjit_iseq_gen_entry_point(const rb_iseq_t *iseq, rb_execution_context_t *ec, bool jit_exception); // defined in Rust
+        uintptr_t code_ptr = (uintptr_t)rb_yjit_iseq_gen_entry_point(iseq, ec, jit_exception);
+
+        if (jit_exception) {
+            ISEQ_BODY(iseq)->jit_exception = (rb_jit_func_t)code_ptr;
+        }
+        else {
+            ISEQ_BODY(iseq)->jit_entry = (rb_jit_func_t)code_ptr;
+        }
+    }
+}
+
+// GC root for interacting with the GC
+struct yjit_root_struct {
+    bool unused; // empty structs are not legal in C99
+};
+
+// For dealing with refinements
+void
+rb_yjit_invalidate_all_method_lookup_assumptions(void)
+{
+    // It looks like Module#using actually doesn't need to invalidate all the
+    // method caches, so we do nothing here for now.
+}
+
+// Number of object shapes, which might be useful for investigating YJIT exit reasons.
+VALUE
+rb_object_shape_count(void)
+{
+    // next_shape_id starts from 0, so it's the same as the count
+    return ULONG2NUM((unsigned long)rb_shapes_count());
+}
+
+bool
+rb_yjit_shape_obj_complex_p(VALUE obj)
+{
+    return rb_obj_shape_complex_p(obj);
+}
+
+bool
+rb_yjit_shape_obj_embedded_p(VALUE obj)
+{
+    return rb_obj_shape_embedded_p(obj);
+}
+
+attr_index_t
+rb_yjit_shape_capacity(shape_id_t shape_id)
+{
+    return RSHAPE_CAPACITY(shape_id);
+}
+
+attr_index_t
+rb_yjit_shape_index(shape_id_t shape_id)
+{
+    return RSHAPE_INDEX(shape_id);
+}
+
+// The number of stack slots that vm_sendish() pops for send and invokesuper.
+size_t
+rb_yjit_sendish_sp_pops(const struct rb_callinfo *ci)
+{
+    return 1 - sp_inc_of_sendish(ci); // + 1 to ignore return value push
+}
+
+// The number of stack slots that vm_sendish() pops for invokeblock.
+size_t
+rb_yjit_invokeblock_sp_pops(const struct rb_callinfo *ci)
+{
+    return 1 - sp_inc_of_invokeblock(ci); // + 1 to ignore return value push
+}
+
+rb_serial_t
+rb_yjit_cme_ractor_serial(const rb_callable_method_entry_t *cme)
+{
+    return cme->def->body.bmethod.defined_ractor_id;
+}
+
+bool
+rb_yjit_attached_object_is(VALUE klass, VALUE object)
+{
+    return RCLASS_SINGLETON_P(klass) && RCLASS_ATTACHED_OBJECT(klass) == object;
+}
+
+// Setup jit_return to avoid returning a non-Qundef value on a non-FINISH frame.
+// See [jit_compile_exception] for details.
+void
+rb_yjit_set_exception_return(rb_control_frame_t *cfp, void *leave_exit, void *leave_exception)
+{
+    if (VM_FRAME_FINISHED_P(cfp)) {
+        // If it's a FINISH frame, just normally exit with a non-Qundef value.
+        cfp->jit_return = leave_exit;
+    }
+    else if (cfp->jit_return) {
+        while (!VM_FRAME_FINISHED_P(cfp)) {
+            if (cfp->jit_return == leave_exit) {
+                // Unlike jit_exec(), leave_exit is not safe on a non-FINISH frame on
+                // jit_exec_exception(). See [jit_exec] and [jit_exec_exception] for
+                // details. Exit to the interpreter with Qundef to let it keep executing
+                // other Ruby frames.
+                cfp->jit_return = leave_exception;
+                return;
+            }
+            cfp = RUBY_VM_PREVIOUS_CONTROL_FRAME(cfp);
+        }
+    }
+    else {
+        // If the caller was not JIT code, exit to the interpreter with Qundef
+        // to keep executing Ruby frames with the interpreter.
+        cfp->jit_return = leave_exception;
+    }
+}
+
+#if defined(_WIN32) && defined(_M_X64)
+// RtlUnwindEx(), which longjmp() and C++ exceptions use, needs unwind info for
+// every frame. JIT code calls out only inside the frame gen_entry_prologue()
+// sets up with frame_pointer, so a single UNWIND_INFO based on RBP is right at
+// every call in the code region. It is wrong within the few instructions that
+// set up and tear down the frame, which make no calls, so only an asynchronous
+// exception there, such as a stack overflow on the push, would unwind wrongly:
+//
+//   [RBP]       caller's RBP
+//   [RBP - 8]   copy of RBP
+//   [RBP - 16]  R13
+//   [RBP - 24]  R12
+//   [RBP - 32]  RBX
+static const uint8_t yjit_unwind_info[] = {
+    1,              // Version 1, no handler
+    0,              // No prologue, since every call happens after it
+    9,              // Count of unwind code slots
+    0x25,           // Frame register RBP at 2 * 16 bytes above RBX
+    0, 0x34, 0, 0,  // UWOP_SAVE_NONVOL RBX at [RBP - 32]
+    0, 0xc4, 1, 0,  // UWOP_SAVE_NONVOL R12 at [RBP - 24]
+    0, 0xd4, 2, 0,  // UWOP_SAVE_NONVOL R13 at [RBP - 16]
+    0, 0x03,        // UWOP_SET_FPREG
+    0, 0x32,        // UWOP_ALLOC_SMALL 32 bytes from [RBP - 8] down to RBX
+    0, 0x50,        // UWOP_PUSH_NONVOL RBP
+    0, 0,           // Padding to an even count
+};
+
+static RUNTIME_FUNCTION yjit_runtime_function;
+
+// Reserve the JIT region after a page holding the unwind info, which has to be
+// within 4GiB above the base address of the registered function table.
+uint8_t *
+rb_yjit_reserve_addr_space(uint32_t mem_size)
+{
+    uint32_t page_size = rb_jit_get_page_size();
+    uint8_t *base = rb_jit_reserve_addr_space(page_size + mem_size);
+    DWORD old_protect;
+
+    if (!VirtualAlloc(base, page_size, MEM_COMMIT, PAGE_READWRITE)) {
+        rb_bug("yjit: failed to commit the unwind info page, error: %lu", GetLastError());
+    }
+    memcpy(base, yjit_unwind_info, sizeof(yjit_unwind_info));
+    VirtualProtect(base, page_size, PAGE_READONLY, &old_protect);
+
+    // RtlVirtualUnwind() takes a call followed by a jmp to the start of the
+    // function for an epilogue, so start it at the unwind info no code jumps to.
+    yjit_runtime_function.BeginAddress = 0;
+    yjit_runtime_function.EndAddress = page_size + mem_size;
+    yjit_runtime_function.UnwindData = 0;
+    if (!RtlAddFunctionTable(&yjit_runtime_function, 1, (DWORD64)base)) {
+        rb_bug("yjit: failed to register unwind info for JIT code");
+    }
+
+    return base + page_size;
+}
+#elif defined(_WIN32) && defined(_M_ARM64)
+// The same as on x64. X29 stays at the saved pair while the code moves SP:
+//
+//   [X29 + 8]   LR
+//   [X29]       caller's X29
+//   [X29 - 16]  X19
+//   [X29 - 32]  X20
+//   [X29 - 48]  X21
+//
+// The codes undo a prolog that builds the same frame but sets X29 last, so
+// that the unwinder restores SP from X29 first. An .xdata record covers at
+// most 1MiB, so the region is split into fragments, and the leading end_c
+// gives each fragment an empty prolog, where every PC unwinds as in the body.
+static const uint8_t yjit_unwind_codes[] = {
+    0xe5,       // end_c
+    0xe2, 0x06, // add_fp: X29 = SP + 48
+    0xd0, 0x80, // save_reg X21 at [SP]
+    0xd0, 0x42, // save_reg X20 at [SP + 16]
+    0xd0, 0x04, // save_reg X19 at [SP + 32]
+    0x03,       // alloc_s 48
+    0x81,       // save_fplr_x <X29, LR> at [SP - 16]!
+    0xe4,       // end
+};
+
+#define YJIT_UNWIND_FRAGMENT_SIZE (512 * 1024)
+
+// Write an .xdata record for a fragment of `length` bytes with no epilog.
+static uint8_t *
+yjit_write_xdata(uint8_t *xdata, uint32_t length)
+{
+    uint32_t header = length / 4 | (uint32_t)(sizeof(yjit_unwind_codes) / 4) << 27;
+    memcpy(xdata, &header, sizeof(header));
+    memcpy(xdata + sizeof(header), yjit_unwind_codes, sizeof(yjit_unwind_codes));
+    return xdata + sizeof(header) + sizeof(yjit_unwind_codes);
+}
+
+// Reserve the JIT region after a page holding the unwind info, which has to be
+// above the base address of the registered function table.
+uint8_t *
+rb_yjit_reserve_addr_space(uint32_t mem_size)
+{
+    uint32_t page_size = rb_jit_get_page_size();
+    uint32_t region_size = page_size + mem_size;
+    uint32_t count = (region_size + YJIT_UNWIND_FRAGMENT_SIZE - 1) / YJIT_UNWIND_FRAGMENT_SIZE;
+    uint8_t *base = rb_jit_reserve_addr_space(region_size);
+    DWORD old_protect;
+
+    if (!VirtualAlloc(base, page_size, MEM_COMMIT, PAGE_READWRITE)) {
+        rb_bug("yjit: failed to commit the unwind info page, error: %lu", GetLastError());
+    }
+    // One record for the full fragments and one for the last, which may be shorter
+    uint8_t *last_xdata = yjit_write_xdata(base, YJIT_UNWIND_FRAGMENT_SIZE);
+    yjit_write_xdata(last_xdata, region_size - (count - 1) * YJIT_UNWIND_FRAGMENT_SIZE);
+    VirtualProtect(base, page_size, PAGE_READONLY, &old_protect);
+
+    // Not ZALLOC_N, whose NoMemoryError would longjmp across Rust frames
+    RUNTIME_FUNCTION *table = calloc(count, sizeof(RUNTIME_FUNCTION));
+    if (!table) {
+        rb_bug("yjit: failed to allocate the function table for unwind info");
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        table[i].BeginAddress = i * YJIT_UNWIND_FRAGMENT_SIZE;
+        table[i].UnwindData = i + 1 < count ? 0 : (DWORD)(last_xdata - base);
+    }
+    if (!RtlAddFunctionTable(table, count, (DWORD64)base)) {
+        rb_bug("yjit: failed to register unwind info for JIT code");
+    }
+
+    return base + page_size;
+}
+#endif
+
+// VM_INSTRUCTION_SIZE changes depending on if ZJIT is in the build. Since
+// bindgen can only grab one version of the constant and copy that to rust,
+// we make that the upper bound and this the accurate value.
+uint32_t
+rb_vm_instruction_size(void)
+{
+    return VM_INSTRUCTION_SIZE;
+}
+
+static int
+yjit_cdhash_all_fixnum_i(st_data_t key, st_data_t _val, st_data_t data)
+{
+    if (!FIXNUM_P((VALUE)key)) {
+        *((bool *)data) = false;
+        return ST_STOP;
+    }
+    return ST_CONTINUE;
+}
+
+bool
+rb_yjit_cdhash_all_fixnum_p(VALUE cdhash)
+{
+    bool all_fixnum = true;
+    st_foreach(rb_imemo_cdhash_tbl(cdhash), yjit_cdhash_all_fixnum_i, (st_data_t)&all_fixnum);
+    return all_fixnum;
+}
+
+int
+rb_yjit_cdhash_lookup(VALUE cdhash, st_data_t key, st_data_t *val)
+{
+    return st_lookup(rb_imemo_cdhash_tbl(cdhash), key, val);
+}
+
+// Primitives used by yjit.rb
+VALUE rb_yjit_stats_enabled_p(rb_execution_context_t *ec, VALUE self);
+VALUE rb_yjit_print_stats_p(rb_execution_context_t *ec, VALUE self);
+VALUE rb_yjit_log_enabled_p(rb_execution_context_t *c, VALUE self);
+VALUE rb_yjit_print_log_p(rb_execution_context_t *c, VALUE self);
+VALUE rb_yjit_trace_exit_locations_enabled_p(rb_execution_context_t *ec, VALUE self);
+VALUE rb_yjit_get_stats(rb_execution_context_t *ec, VALUE self, VALUE key);
+VALUE rb_yjit_reset_stats_bang(rb_execution_context_t *ec, VALUE self);
+void rb_yjit_update_max_compile_time_ns(uint64_t max_compile_time_ns);
+VALUE rb_yjit_get_log(rb_execution_context_t *ec, VALUE self);
+VALUE rb_yjit_disasm_iseq(rb_execution_context_t *ec, VALUE self, VALUE iseq);
+VALUE rb_yjit_insns_compiled(rb_execution_context_t *ec, VALUE self, VALUE iseq);
+VALUE rb_yjit_code_gc(rb_execution_context_t *ec, VALUE self);
+VALUE rb_yjit_simulate_oom_bang(rb_execution_context_t *ec, VALUE self);
+VALUE rb_yjit_get_exit_locations(rb_execution_context_t *ec, VALUE self);
+VALUE rb_yjit_enable(rb_execution_context_t *ec, VALUE self, VALUE gen_stats, VALUE print_stats, VALUE gen_compilation_log, VALUE print_compilation_log, VALUE mem_size, VALUE call_threshold);
+VALUE rb_yjit_c_builtin_p(rb_execution_context_t *ec, VALUE self);
+
+static VALUE
+rb_yjit_total_compile_time_ns_get(rb_execution_context_t *ec, VALUE self)
+{
+    return ULL2NUM(rb_yjit_total_compile_time_ns);
+}
+
+static VALUE
+rb_yjit_max_compile_time_ns_get(rb_execution_context_t *ec, VALUE self)
+{
+    return ULL2NUM(rb_yjit_max_compile_time_ns);
+}
+
+static VALUE
+rb_yjit_max_compile_time_ns_set(rb_execution_context_t *ec, VALUE self, VALUE max_compile_time_ns)
+{
+    rb_yjit_update_max_compile_time_ns(NUM2ULL(max_compile_time_ns));
+    return max_compile_time_ns;
+}
+
+// Allow YJIT_C_BUILTIN macro to force --yjit-c-builtin
+#ifdef YJIT_C_BUILTIN
+static VALUE yjit_c_builtin_p(rb_execution_context_t *ec, VALUE self) { return Qtrue; }
 #else
-// !JIT_ENABLED || !PLATFORM_SUPPORTED_P
-// In these builds, YJIT could never be turned on. Provide dummy
-// implementations for YJIT functions exposed to the rest of the code base.
-// See yjit.h.
+#define yjit_c_builtin_p rb_yjit_c_builtin_p
+#endif
 
-void Init_builtin_yjit(void) {}
-bool rb_yjit_enabled_p(void) { return false; }
-unsigned rb_yjit_call_threshold(void) { return UINT_MAX; }
-void rb_yjit_invalidate_all_method_lookup_assumptions(void) {};
-void rb_yjit_method_lookup_change(VALUE klass, ID mid) {};
-void rb_yjit_cme_invalidate(VALUE cme) {}
-void rb_yjit_collect_vm_usage_insn(int insn) {}
-void rb_yjit_collect_binding_alloc(void) {}
-void rb_yjit_collect_binding_set(void) {}
-bool rb_yjit_compile_iseq(const rb_iseq_t *iseq, rb_execution_context_t *ec) { return false; }
-void rb_yjit_init(struct rb_yjit_options *options) {}
-void rb_yjit_bop_redefined(VALUE klass, const rb_method_entry_t *me, enum ruby_basic_operators bop) {}
-void rb_yjit_constant_state_changed(void) {}
-void rb_yjit_iseq_mark(const struct rb_iseq_constant_body *body) {}
-void rb_yjit_iseq_update_references(const struct rb_iseq_constant_body *body) {}
-void rb_yjit_iseq_free(const struct rb_iseq_constant_body *body) {}
-void rb_yjit_before_ractor_spawn(void) {}
-void rb_yjit_constant_ic_update(const rb_iseq_t *iseq, IC ic) {}
-void rb_yjit_tracing_invalidate_all(void) {}
-
-#endif // if JIT_ENABLED && PLATFORM_SUPPORTED_P
+// Preprocessed yjit.rb generated during build
+#include "yjit.rbinc"

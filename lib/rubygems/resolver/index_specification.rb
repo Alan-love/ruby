@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+
 ##
 # Represents a possible Specification object returned from IndexSet.  Used to
 # delay needed to download full Specification objects when only the +name+
@@ -14,14 +15,16 @@ class Gem::Resolver::IndexSpecification < Gem::Resolver::Specification
   # The +name+, +version+ and +platform+ are the name, version and platform of
   # the gem.
 
-  def initialize(set, name, version, source, platform)
+  def initialize(set, name, version, source, platform, content_address: nil)
     super()
 
     @set = set
     @name = name
     @version = version
     @source = source
-    @platform = platform.to_s
+    @platform = Gem::Platform.new(platform.to_s)
+    @original_platform = platform.to_s
+    @content_address = content_address
 
     @spec = nil
   end
@@ -58,29 +61,30 @@ class Gem::Resolver::IndexSpecification < Gem::Resolver::Specification
     self.class === other &&
       @name == other.name &&
       @version == other.version &&
-      @platform == other.platform
+      @platform == other.platform &&
+      @content_address == other.content_address
   end
 
   def hash
-    @name.hash ^ @version.hash ^ @platform.hash
+    [@name, @version, @platform, @content_address].hash
   end
 
   def inspect # :nodoc:
-    '#<%s %s source %s>' % [self.class, full_name, @source]
+    format("#<%s %s source %s>", self.class, full_name, @source)
   end
 
   def pretty_print(q) # :nodoc:
-    q.group 2, '[Index specification', ']' do
+    q.group 2, "[Index specification", "]" do
       q.breakable
       q.text full_name
 
-      unless Gem::Platform::RUBY == @platform
+      unless @platform == Gem::Platform::RUBY
         q.breakable
         q.text @platform.to_s
       end
 
       q.breakable
-      q.text 'source '
+      q.text "source "
       q.pp @source
     end
   end
@@ -91,7 +95,7 @@ class Gem::Resolver::IndexSpecification < Gem::Resolver::Specification
   def spec # :nodoc:
     @spec ||=
       begin
-        tuple = Gem::NameTuple.new @name, @version, @platform
+        tuple = Gem::NameTuple.new @name, @version, @original_platform, content_address: @content_address
 
         @source.fetch_spec tuple
       end

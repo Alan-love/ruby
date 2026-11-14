@@ -1,16 +1,20 @@
 # frozen_string_literal: true
 
-# Allows for declaring a Gemfile inline in a ruby script, optionally installing
-# any gems that aren't already installed on the user's system.
+# Allows for declaring a Gemfile inline in a ruby script, installing any gems
+# that aren't already installed on the user's system.
 #
 # @note Every gem that is specified in this 'Gemfile' will be `require`d, as if
 #       the user had manually called `Bundler.require`. To avoid a requested gem
 #       being automatically required, add the `:require => false` option to the
 #       `gem` dependency declaration.
 #
-# @param install [Boolean] whether gems that aren't already installed on the
-#                          user's system should be installed.
-#                          Defaults to `false`.
+# @param force_latest_compatible [Boolean] Force installing the *latest*
+#                                          compatible versions of the gems,
+#                                          even if compatible versions are
+#                                          already installed locally.
+#                                          This also logs output if the
+#                                          `:quiet` option is not set.
+#                                          Defaults to `false`.
 #
 # @param gemfile [Proc]    a block that is evaluated as a `Gemfile`.
 #
@@ -29,57 +33,122 @@
 #
 #          puts Pod::VERSION # => "0.34.4"
 #
-def gemfile(install = false, options = {}, &gemfile)
+def gemfile(force_latest_compatible = false, options = {}, &gemfile)
   require_relative "../bundler"
+  Bundler.reset!
 
   opts = options.dup
   ui = opts.delete(:ui) { Bundler::UI::Shell.new }
-  ui.level = "silent" if opts.delete(:quiet)
+  ui.level = "silent" if opts.delete(:quiet) || !force_latest_compatible
+  Bundler.ui = ui
   raise ArgumentError, "Unknown options: #{opts.keys.join(", ")}" unless opts.empty?
 
-  begin
-    old_root = Bundler.method(:root)
-    bundler_module = class << Bundler; self; end
-    bundler_module.send(:remove_method, :root)
-    def Bundler.root
-      Bundler::SharedHelpers.pwd.expand_path
-    end
-    old_gemfile = ENV["BUNDLE_GEMFILE"]
-    Bundler::SharedHelpers.set_env "BUNDLE_GEMFILE", "Gemfile"
+  old_gemfile = ENV["BUNDLE_GEMFILE"]
+  old_lockfile = ENV["BUNDLE_LOCKFILE"]
 
-    Bundler::Plugin.gemfile_install(&gemfile) if Bundler.feature_flag.plugins?
+  Bundler.unbundle_env!
+
+  begin
+    Bundler.instance_variable_set(:@bundle_path, Pathname.new(Gem.dir))
+    Bundler::SharedHelpers.set_env "BUNDLE_GEMFILE", "Gemfile"
+    Bundler::SharedHelpers.set_env "BUNDLE_LOCKFILE", "Gemfile.lock"
+
+    Bundler::Plugin.gemfile_install(&gemfile) if Bundler.settings[:plugins]
     builder = Bundler::Dsl.new
     builder.instance_eval(&gemfile)
-    builder.check_primary_source_safety
 
-    Bundler.settings.temporary(:deployment => false, :frozen => false) do
+    Bundler.settings.temporary(deployment: false, frozen: false) do
       definition = builder.to_definition(nil, true)
-      def definition.lock(*); end
       definition.validate_runtime!
 
-      Bundler.ui = install ? ui : Bundler::UI::Silent.new
-      if install || definition.missing_specs?
-        Bundler.settings.temporary(:inline => true) do
-          installer = Bundler::Installer.install(Bundler.root, definition, :system => true)
-          installer.post_install_messages.each do |name, message|
-            Bundler.ui.info "Post-install message from #{name}:\n#{message}"
+      if force_latest_compatible || definition.missing_specs?
+        do_install = -> do
+          Bundler.settings.temporary(inline: true, no_install: false) do
+            installer = Bundler::Installer.install(Bundler.root, definition, system: true)
+            installer.post_install_messages.each do |name, message|
+              Bundler.ui.info "Post-install message from #{name}:\n#{message}"
+            end
           end
+        end
+
+        # When possible we do the install in a subprocess because to install
+        # gems we need to require some default gems like `tempfile` etc
+        # which may later conflict with the Gemfile requirements.
+        installed_in_fork = false
+        if Process.respond_to?(:fork)
+          Gem.load_yaml # Avoid NameError on Ruby 3.2's safe_yaml.rb after Gem::Specification.reset
+          # exit! leaves the script's at_exit hooks to this process, which installs again on failure to raise the error here
+          pid = Process.fork do
+            $VERBOSE = nil
+            do_install.call
+            $stdout.flush
+            $stderr.flush
+            exit!(true)
+          rescue Exception # rubocop:disable Lint/RescueException
+            exit!(false)
+          end
+          installed_in_fork = Process.waitpid2(pid).last.success?
+        end
+
+        if installed_in_fork
+          Bundler.reset!
+          Gem::Specification.reset
+          Bundler.instance_variable_set(:@bundle_path, Pathname.new(Gem.dir))
+
+          builder = Bundler::Dsl.new
+          builder.instance_eval(&gemfile)
+          builder.check_primary_source_safety
+
+          definition = builder.to_definition(nil, true)
+          definition.validate_runtime!
+        else
+          do_install.call
         end
       end
 
-      runtime = Bundler::Runtime.new(nil, definition)
-      runtime.setup.require
+      configure_forked_definition = ->(d) do
+        d.sources.rubygems_sources.each(&:remote!)
+        d.sources.git_sources.each do |source|
+          source.cached!
+          source.instance_variable_set(:@copied, true)
+        end
+        def d.lock(*); end
+      end
+      configure_forked_definition.call(definition) if installed_in_fork
+
+      begin
+        runtime = Bundler::Runtime.new(nil, definition)
+        installed_in_fork ? Bundler.ui.silence { runtime.setup } : runtime.setup
+      rescue Gem::LoadError => e
+        name = e.name
+        version = e.requirement.requirements.first[1]
+        activated_version = Gem.loaded_specs[name].version
+
+        Bundler.ui.info \
+          "The #{name} gem was resolved to #{version}, but #{activated_version} was activated by Bundler while installing it, causing a conflict. " \
+          "Bundler will now retry resolving with #{activated_version} instead."
+
+        builder.dependencies.delete_if {|d| d.name == name }
+        builder.instance_eval { gem name, activated_version }
+        definition = builder.to_definition(nil, true)
+        configure_forked_definition.call(definition) if installed_in_fork
+
+        retry
+      end
+
+      runtime.require
     end
   ensure
-    if bundler_module
-      bundler_module.send(:remove_method, :root)
-      bundler_module.send(:define_method, :root, old_root)
-    end
-
     if old_gemfile
       ENV["BUNDLE_GEMFILE"] = old_gemfile
     else
       ENV["BUNDLE_GEMFILE"] = ""
+    end
+
+    if old_lockfile
+      ENV["BUNDLE_LOCKFILE"] = old_lockfile
+    else
+      ENV["BUNDLE_LOCKFILE"] = ""
     end
   end
 end

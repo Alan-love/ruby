@@ -2,51 +2,8 @@ require_relative '../../spec_helper'
 
 describe "Enumerator.new" do
   context "no block given" do
-    ruby_version_is '3.0' do
-      it "raises" do
-        -> { Enumerator.new(1, :upto, 3) }.should raise_error(ArgumentError)
-      end
-    end
-
-    ruby_version_is ''...'3.0' do
-      it "creates a new custom enumerator with the given object, iterator and arguments" do
-        enum = suppress_warning { Enumerator.new(1, :upto, 3) }
-        enum.should be_an_instance_of(Enumerator)
-      end
-
-      it "creates a new custom enumerator that responds to #each" do
-        enum = suppress_warning { Enumerator.new(1, :upto, 3) }
-        enum.respond_to?(:each).should == true
-      end
-
-      it "creates a new custom enumerator that runs correctly" do
-        suppress_warning { Enumerator.new(1, :upto, 3) }.map{ |x| x }.should == [1,2,3]
-      end
-
-      it "aliases the second argument to :each" do
-        suppress_warning { Enumerator.new(1..2) }.to_a.should ==
-          suppress_warning { Enumerator.new(1..2, :each) }.to_a
-      end
-
-      it "doesn't check for the presence of the iterator method" do
-        suppress_warning { Enumerator.new(nil) }.should be_an_instance_of(Enumerator)
-      end
-
-      it "uses the latest define iterator method" do
-        class StrangeEach
-          def each
-            yield :foo
-          end
-        end
-        enum = suppress_warning { Enumerator.new(StrangeEach.new) }
-        enum.to_a.should == [:foo]
-        class StrangeEach
-          def each
-            yield :bar
-          end
-        end
-        enum.to_a.should == [:bar]
-      end
+    it "raises" do
+      -> { Enumerator.new(1, :upto, 3) }.should.raise(ArgumentError)
     end
   end
 
@@ -77,44 +34,81 @@ describe "Enumerator.new" do
       enum.take(3).should == [1, 2, 3]
     end
 
-    ruby_version_is "2.7" do
-      it "defines iteration with block, yielder argument and treating it as a proc" do
-        enum = Enumerator.new do |yielder|
-          "a\nb\nc".each_line(&yielder)
-        end
-
-        enum.to_a.should == ["a\n", "b\n", "c"]
+    it "defines iteration with block, yielder argument and treating it as a proc" do
+      enum = Enumerator.new do |yielder|
+        "a\nb\nc".each_line(&yielder)
       end
+
+      enum.to_a.should == ["a\n", "b\n", "c"]
     end
 
-    describe 'yielded values' do
-      it 'handles yield arguments properly' do
+    describe '#yield' do
+      it 'accepts a single argument' do
         Enumerator.new { |y| y.yield(1) }.to_a.should == [1]
         Enumerator.new { |y| y.yield(1) }.first.should == 1
+      end
 
-        Enumerator.new { |y| y.yield([1]) }.to_a.should == [[1]]
-        Enumerator.new { |y| y.yield([1]) }.first.should == [1]
-
+      it 'accepts multiple arguments' do
         Enumerator.new { |y| y.yield(1, 2) }.to_a.should == [[1, 2]]
         Enumerator.new { |y| y.yield(1, 2) }.first.should == [1, 2]
+      end
+
+      it "doesn't double-wrap arrays" do
+        Enumerator.new { |y| y.yield([1]) }.to_a.should == [[1]]
+        Enumerator.new { |y| y.yield([1]) }.first.should == [1]
 
         Enumerator.new { |y| y.yield([1, 2]) }.to_a.should == [[1, 2]]
         Enumerator.new { |y| y.yield([1, 2]) }.first.should == [1, 2]
       end
 
-      it 'handles << arguments properly' do
+      it 'returns nil' do
+        ScratchPad.record []
+        Enumerator.new do |y|
+          ScratchPad << y.yield(1)
+        end.to_a
+
+        ScratchPad.recorded.should == [nil]
+      end
+
+      it 'accepts keyword arguments and treats them as a positional hash' do
+        Enumerator.new { |y| y.yield(foo: 42) }.to_a.should == [{ foo: 42 }]
+        Enumerator.new { |y| y.yield(foo: 42) }.first.should == { foo: 42 }
+
+        Enumerator.new { |y| y.yield(123, foo: 42) }.to_a.should == [[123, { foo: 42 }]]
+        Enumerator.new { |y| y.yield(123, foo: 42) }.first.should == [123, { foo: 42 }]
+      end
+    end
+
+    describe '#<<' do
+      it 'accepts a single argument' do
         Enumerator.new { |y| y.<<(1) }.to_a.should == [1]
         Enumerator.new { |y| y.<<(1) }.first.should == 1
+      end
 
+      it "doesn't double-wrap arrays" do
         Enumerator.new { |y| y.<<([1]) }.to_a.should == [[1]]
         Enumerator.new { |y| y.<<([1]) }.first.should == [1]
 
-        # << doesn't accept multiple arguments
-        # Enumerator.new { |y| y.<<(1, 2) }.to_a.should == [[1, 2]]
-        # Enumerator.new { |y| y.<<(1, 2) }.first.should == [1, 2]
-
         Enumerator.new { |y| y.<<([1, 2]) }.to_a.should == [[1, 2]]
         Enumerator.new { |y| y.<<([1, 2]) }.first.should == [1, 2]
+      end
+
+      it 'accepts keyword arguments and treats them as a positional hash' do
+        Enumerator.new { |y| y.<<(foo: 42) }.to_a.should == [{ foo: 42 }]
+        Enumerator.new { |y| y.<<(foo: 42) }.first.should == { foo: 42 }
+      end
+
+      it 'can be chained' do
+        enum = Enumerator.new do |y|
+          y << 1 << 2
+        end
+        enum.to_a.should == [1, 2]
+      end
+
+      it 'raises ArgumentError when given more than one argument' do
+        -> {
+          Enumerator.new { |y| y.<<(1, 2) }.to_a
+        }.should.raise(ArgumentError, "wrong number of arguments (given 2, expected 1)")
       end
     end
   end

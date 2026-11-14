@@ -1,13 +1,11 @@
-# -*- encoding: binary -*-
+# encoding: binary
 require_relative '../../../spec_helper'
 require_relative '../fixtures/classes'
 require_relative 'shared/basic'
-require_relative 'shared/taint'
 
 describe "String#unpack with format 'M'" do
   it_behaves_like :string_unpack_basic, 'M'
   it_behaves_like :string_unpack_no_platform, 'M'
-  it_behaves_like :string_unpack_taint, 'M'
 
   it "decodes an empty string" do
     "".unpack("M").should == [""]
@@ -97,12 +95,16 @@ describe "String#unpack with format 'M'" do
       ["=FF=\n",                      ["\xff"]]
     ].should be_computed_by(:unpack, "M")
   end
+
+  it "unpacks incomplete escape sequences as literal characters" do
+    "foo=".unpack("M").should == ["foo="]
+    "foo=4".unpack("M").should == ["foo=4"]
+  end
 end
 
 describe "String#unpack with format 'm'" do
   it_behaves_like :string_unpack_basic, 'm'
   it_behaves_like :string_unpack_no_platform, 'm'
-  it_behaves_like :string_unpack_taint, 'm'
 
   it "decodes an empty string" do
     "".unpack("m").should == [""]
@@ -181,7 +183,7 @@ describe "String#unpack with format 'm'" do
     end
 
     it "raises an ArgumentError for an invalid base64 character" do
-      -> { "dGV%zdA==".unpack("m0") }.should raise_error(ArgumentError)
+      -> { "dGV%zdA==".unpack("m0") }.should.raise(ArgumentError)
     end
   end
 end

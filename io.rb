@@ -25,9 +25,9 @@ class IO
   #
   # read_nonblock causes EOFError on EOF.
   #
-  # On some platforms, such as Windows, non-blocking mode is not supported
-  # on IO objects other than sockets. In such cases, Errno::EBADF will
-  # be raised.
+  # If the underlying file descriptor cannot be set to non-blocking mode,
+  # read_nonblock will still attempt to read from the file descriptor.
+  # For example, this can occur with regular files on Windows.
   #
   # If the read byte buffer is not empty,
   # read_nonblock reads from the buffer like readpartial.
@@ -119,5 +119,18 @@ class IO
   # return the symbol +:wait_writable+ instead.
   def write_nonblock(buf, exception: true)
     Primitive.io_write_nonblock(buf, exception)
+  end
+
+  # call-seq:
+  #   readline(sep = $/, chomp: false)   -> string
+  #   readline(limit, chomp: false)      -> string
+  #   readline(sep, limit, chomp: false) -> string
+  #
+  # Reads a line as with IO#gets, but raises EOFError if already at end-of-stream.
+  #
+  # Optional keyword argument +chomp+ specifies whether line separators
+  # are to be omitted.
+  def readline(sep = $/, limit = nil, chomp: false)
+    Primitive.io_readline(sep, limit, chomp)
   end
 end

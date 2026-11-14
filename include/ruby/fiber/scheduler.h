@@ -11,16 +11,76 @@
  */
 #include "ruby/internal/config.h"
 
+#include <errno.h>
+
 #ifdef STDC_HEADERS
 #include <stddef.h> /* size_t */
 #endif
 
 #include "ruby/ruby.h"
 #include "ruby/internal/dllexport.h"
+#include "ruby/internal/arithmetic.h"
 
 RBIMPL_SYMBOL_EXPORT_BEGIN()
 
+// Version 3: Adds support for `fiber_interrupt`.
+// Version 4: IO hooks use single-transfer `(offset, length)` semantics.
+// Version 5: `fiber_interrupt` may receive an operation-scoped proxy.
+#define RUBY_FIBER_SCHEDULER_VERSION 5
+
 struct timeval;
+struct rb_thread_struct;
+
+/**
+ * Wrap a `ssize_t` and `int errno` into a single `VALUE`. This interface should
+ * be used to safely capture results from system calls  like `read` and `write`.
+ *
+ * You should use `rb_fiber_scheduler_io_result_apply` to unpack the result of
+ * this value and update `int errno`.
+ *
+ * You should not directly try to interpret the result value as it is considered
+ * an opaque representation. However, the general representation is an integer
+ * in the range of `[-int errno, size_t size]`. Linux generally restricts the
+ * result of system calls like `read` and `write` to `<= 2^31` which means this
+ * will typically fit within a single FIXNUM.
+ *
+ * @param[in]  result   The result of the system call.
+ * @param[in]  error    The value of `errno`.
+ * @return              A `VALUE` which contains the result and/or errno.
+ */
+static inline VALUE
+rb_fiber_scheduler_io_result(ssize_t result, int error)
+{
+    if (result == -1) {
+        return RB_INT2NUM(-error);
+    }
+    else {
+        return RB_SIZE2NUM(result);
+    }
+}
+
+/**
+ * Apply an io result to the local thread, returning the value of the original
+ * system call that created it and updating `int errno`.
+ *
+ * You should not directly try to interpret the result value as it is considered
+ * an opaque representation.
+ *
+ * @param[in]  result   The `VALUE` which contains an errno and/or result size.
+ * @post                Updates `int errno` with the value if negative.
+ * @return              The original result of the system call.
+ */
+static inline ssize_t
+rb_fiber_scheduler_io_result_apply(VALUE result)
+{
+    if (RB_FIXNUM_P(result) && RB_NUM2INT(result) < 0) {
+        errno = -RB_NUM2INT(result);
+        return -1;
+    }
+    else {
+        return RB_NUM2SIZE(result);
+    }
+}
 
 /**
  * Queries the  current scheduler of  the current  thread that is  calling this
@@ -41,7 +101,7 @@ VALUE rb_fiber_scheduler_get(void);
  * current  thread  will  call  scheduler's  `#close`  method  on  finalisation
  * (allowing  the  scheduler  to  properly  manage  all  non-finished  fibers).
  * `scheduler`   can   be   an   object   of   any   class   corresponding   to
- * `Fiber::SchedulerInterface`. Its implementation is up to the user.
+ * `Fiber::Scheduler` interface. Its implementation is up to the user.
  *
  * @param[in]  scheduler     The scheduler to set.
  * @exception  rb_eArgError  `scheduler` does not conform the interface.
@@ -61,7 +121,7 @@ VALUE rb_fiber_scheduler_current(void);
 
 /**
  * Identical to rb_fiber_scheduler_current(), except it queries for that of the
- * passed thread instead of the implicit current one.
+ * passed thread value instead of the implicit current one.
  *
  * @param[in]  thread         Target thread.
  * @exception  rb_eTypeError  `thread` is not a thread.
@@ -69,6 +129,17 @@ VALUE rb_fiber_scheduler_current(void);
  * @retval     otherwise      The scheduler that is in effect in `thread`.
  */
 VALUE rb_fiber_scheduler_current_for_thread(VALUE thread);
+
+/**
+ * Identical to rb_fiber_scheduler_current_for_thread(), except it expects
+ * a threadptr instead of a thread value.
+ *
+ * @param[in]  thread         Target thread.
+ * @exception  rb_eTypeError  `thread` is not a thread.
+ * @retval     RUBY_Qnil      No scheduler is in effect in `thread`.
+ * @retval     otherwise      The scheduler that is in effect in `thread`.
+ */
+VALUE rb_fiber_scheduler_current_for_threadptr(struct rb_thread_struct *thread);
 
 /**
  * Converts the passed timeout to an expression that rb_fiber_scheduler_block()
@@ -90,7 +161,7 @@ VALUE rb_fiber_scheduler_make_timeout(struct timeval *timeout);
 VALUE rb_fiber_scheduler_close(VALUE scheduler);
 
 /**
- * Nonblocking  `sleep`.   Depending  on  scheduler  implementation,  this  for
+ * Non-blocking  `sleep`.  Depending  on  scheduler  implementation,  this  for
  * instance switches to another fiber etc.
  *
  * @param[in]  scheduler  Target scheduler.
@@ -110,6 +181,14 @@ VALUE rb_fiber_scheduler_kernel_sleep(VALUE scheduler, VALUE duration);
  */
 VALUE rb_fiber_scheduler_kernel_sleepv(VALUE scheduler, int argc, VALUE * argv);
 
+/**
+ * Yield to the scheduler, to be resumed on the next scheduling cycle.
+ *
+ * @param[in]  scheduler  Target scheduler.
+ * @return     What `scheduler.yield` returns.
+ */
+VALUE rb_fiber_scheduler_yield(VALUE scheduler);
+
 /* Description TBW */
 #if 0
 VALUE rb_fiber_scheduler_timeout_after(VALUE scheduler, VALUE timeout, VALUE exception, VALUE message);
@@ -118,7 +197,7 @@ int rb_fiber_scheduler_supports_process_wait(VALUE scheduler);
 #endif
 
 /**
- * Nonblocking  `waitpid`.  Depending  on  scheduler  implementation, this  for
+ * Non-blocking `waitpid`.  Depending  on  scheduler  implementation, this  for
  * instance switches to another fiber etc.
  *
  * @param[in]  scheduler  Target scheduler.
@@ -129,7 +208,7 @@ int rb_fiber_scheduler_supports_process_wait(VALUE scheduler);
 VALUE rb_fiber_scheduler_process_wait(VALUE scheduler, rb_pid_t pid, int flags);
 
 /**
- * Nonblocking  wait   for  the  passed   "blocker",  which  is   for  instance
+ * Non-blocking  wait  for  the  passed   "blocker",  which  is   for  instance
  * `Thread.join` or `Mutex.lock`.  Depending  on scheduler implementation, this
  * for instance switches to another fiber etc.
  *
@@ -143,6 +222,8 @@ VALUE rb_fiber_scheduler_block(VALUE scheduler, VALUE blocker, VALUE timeout);
 /**
  * Wakes up a fiber previously blocked using rb_fiber_scheduler_block().
  *
+ * This function may be called from a different thread.
+ *
  * @param[in]  scheduler  Target scheduler.
  * @param[in]  blocker    What was awaited for.
  * @param[in]  fiber      What to unblock.
@@ -151,11 +232,11 @@ VALUE rb_fiber_scheduler_block(VALUE scheduler, VALUE blocker, VALUE timeout);
 VALUE rb_fiber_scheduler_unblock(VALUE scheduler, VALUE blocker, VALUE fiber);
 
 /**
- * Nonblocking version of rb_io_wait().  Depending on scheduler implementation,
- * this for instance switches to another fiber etc.
+ * Non-blocking version of rb_io_wait().  Depending on scheduler
+ * implementation, this for instance switches to another fiber etc.
  *
  * The  "events" here  is a  Ruby level  integer, which  is an  OR-ed value  of
- * `IO::READABLE`, `IO::WRITable`, and `IO::PRIORITY`.
+ * `IO::READABLE`, `IO::WRITABLE`, and `IO::PRIORITY`.
  *
  * @param[in]  scheduler  Target scheduler.
  * @param[in]  io         An io object to wait.
@@ -166,7 +247,7 @@ VALUE rb_fiber_scheduler_unblock(VALUE scheduler, VALUE blocker, VALUE fiber);
 VALUE rb_fiber_scheduler_io_wait(VALUE scheduler, VALUE io, VALUE events, VALUE timeout);
 
 /**
- * Nonblocking  wait until  the passed  IO  is ready  for reading.   This is  a
+ * Non-blocking  wait until the passed  IO  is ready  for reading.   This is  a
  * special  case   of  rb_fiber_scheduler_io_wait(),  where  the   interest  is
  * `IO::READABLE` and timeout is never.
  *
@@ -177,7 +258,7 @@ VALUE rb_fiber_scheduler_io_wait(VALUE scheduler, VALUE io, VALUE events, VALUE 
 VALUE rb_fiber_scheduler_io_wait_readable(VALUE scheduler, VALUE io);
 
 /**
- * Nonblocking  wait until  the passed  IO  is ready  for writing.   This is  a
+ * Non-blocking  wait until  the passed  IO  is ready  for writing.   This is a
  * special  case   of  rb_fiber_scheduler_io_wait(),  where  the   interest  is
  * `IO::WRITABLE` and timeout is never.
  *
@@ -188,55 +269,131 @@ VALUE rb_fiber_scheduler_io_wait_readable(VALUE scheduler, VALUE io);
 VALUE rb_fiber_scheduler_io_wait_writable(VALUE scheduler, VALUE io);
 
 /**
- * Nonblocking read from the passed IO.
+ * Non-blocking version of `IO.select`.
+ *
+ * It's possible that this will be emulated using a thread, so you should not
+ * rely on it for high performance.
+ *
+ * @param[in]  scheduler    Target scheduler.
+ * @param[in]  readables    An array of readable objects.
+ * @param[in]  writables    An array of writable objects.
+ * @param[in]  exceptables  An array of objects that might encounter exceptional conditions.
+ * @param[in]  timeout      Numeric timeout or nil.
+ * @return     What `scheduler.io_select` returns, normally a 3-tuple of arrays of ready objects.
+ */
+VALUE rb_fiber_scheduler_io_select(VALUE scheduler, VALUE readables, VALUE writables, VALUE exceptables, VALUE timeout);
+
+/**
+ * Non-blocking version of `IO.select`, `argv` variant.
+ */
+VALUE rb_fiber_scheduler_io_selectv(VALUE scheduler, int argc, VALUE *argv);
+
+/**
+ * Non-blocking read from the passed IO.
  *
  * @param[in]   scheduler    Target scheduler.
- * @param[out]  io           An io object to read from.
- * @param[out]  buffer       Return buffer.
- * @param[in]   length       Requested number of bytes to read.
+ * @param[in]   io           An io object to read from.
+ * @param[in]   buffer       The buffer to read to.
+ * @param[in]   offset       The offset in the buffer to read to.
+ * @param[in]   length       The maximum number of bytes to read in one operation.
+ * @retval      RUBY_Qundef  `scheduler` doesn't have `#io_read`.
+ * @return      otherwise    What `scheduler.io_read` returns `[-errno, size]`.
+ */
+VALUE rb_fiber_scheduler_io_read(VALUE scheduler, VALUE io, VALUE buffer, size_t offset, size_t length);
+
+/**
+ * Non-blocking write to the passed IO.
+ *
+ * @param[in]   scheduler    Target scheduler.
+ * @param[in]   io           An io object to write to.
+ * @param[in]   buffer       The buffer to write from.
+ * @param[in]   offset       The offset in the buffer to write from.
+ * @param[in]   length       The maximum number of bytes to write in one operation.
+ * @retval      RUBY_Qundef  `scheduler` doesn't have `#io_write`.
+ * @return      otherwise    What `scheduler.io_write` returns `[-errno, size]`.
+ */
+VALUE rb_fiber_scheduler_io_write(VALUE scheduler, VALUE io, VALUE buffer, size_t offset, size_t length);
+
+/**
+ * Non-blocking read from the passed IO at the specified offset.
+ *
+ * @param[in]   scheduler    Target scheduler.
+ * @param[in]   io           An io object to read from.
+ * @param[in]   from         The offset to read from.
+ * @param[in]   buffer       The buffer to read to.
+ * @param[in]   offset       The offset in the buffer to read to.
+ * @param[in]   length       The maximum number of bytes to read in one operation.
  * @retval      RUBY_Qundef  `scheduler` doesn't have `#io_read`.
  * @return      otherwise    What `scheduler.io_read` returns.
  */
-VALUE rb_fiber_scheduler_io_read(VALUE scheduler, VALUE io, VALUE buffer, size_t length);
+VALUE rb_fiber_scheduler_io_pread(VALUE scheduler, VALUE io, rb_off_t from, VALUE buffer, size_t offset, size_t length);
 
 /**
- * Nonblocking write to the passed IO.
+ * Non-blocking write to the passed IO at the specified offset.
  *
  * @param[in]   scheduler    Target scheduler.
- * @param[out]  io           An io object to write to.
- * @param[in]   buffer       What to write.
- * @param[in]   length       Number of bytes to write.
+ * @param[in]   io           An io object to write to.
+ * @param[in]   from         The offset to write to.
+ * @param[in]   buffer       The buffer to write from.
+ * @param[in]   offset       The offset in the buffer to write from.
+ * @param[in]   length       The maximum number of bytes to write in one operation.
  * @retval      RUBY_Qundef  `scheduler` doesn't have `#io_write`.
  * @return      otherwise    What `scheduler.io_write` returns.
  */
-VALUE rb_fiber_scheduler_io_write(VALUE scheduler, VALUE io, VALUE buffer, size_t length);
+VALUE rb_fiber_scheduler_io_pwrite(VALUE scheduler, VALUE io, rb_off_t from, VALUE buffer, size_t offset, size_t length);
 
 /**
- * Nonblocking read from the passed IO using a native buffer.
+ * Non-blocking read from the passed IO using a native buffer.
  *
  * @param[in]   scheduler    Target scheduler.
- * @param[out]  io           An io object to read from.
- * @param[out]  buffer       Return buffer.
- * @param[in]   length       Requested number of bytes to read.
+ * @param[in]   io           An io object to read from.
+ * @param[in]   base         The memory to read to.
+ * @param[in]   size         The maximum number of bytes to read in one operation.
  * @retval      RUBY_Qundef  `scheduler` doesn't have `#io_read`.
  * @return      otherwise    What `scheduler.io_read` returns.
  */
-VALUE rb_fiber_scheduler_io_read_memory(VALUE scheduler, VALUE io, void *buffer, size_t size, size_t length);
+VALUE rb_fiber_scheduler_io_read_memory(VALUE scheduler, VALUE io, void *base, size_t size);
 
 /**
- * Nonblocking write to the passed IO using a native buffer.
+ * Non-blocking write to the passed IO using a native buffer.
  *
  * @param[in]   scheduler    Target scheduler.
- * @param[out]  io           An io object to write to.
- * @param[in]   buffer       What to write.
- * @param[in]   length       Number of bytes to write.
+ * @param[in]   io           An io object to write to.
+ * @param[in]   base         The memory to write from.
+ * @param[in]   size         The maximum number of bytes to write in one operation.
  * @retval      RUBY_Qundef  `scheduler` doesn't have `#io_write`.
  * @return      otherwise    What `scheduler.io_write` returns.
  */
-VALUE rb_fiber_scheduler_io_write_memory(VALUE scheduler, VALUE io, const void *buffer, size_t size, size_t length);
+VALUE rb_fiber_scheduler_io_write_memory(VALUE scheduler, VALUE io, const void *base, size_t size);
 
 /**
- * Nonblocking close the given IO.
+ * Non-blocking pread from the passed IO using a native buffer.
+ *
+ * @param[in]   scheduler    Target scheduler.
+ * @param[in]   io           An io object to read from.
+ * @param[in]   from         The offset to read from.
+ * @param[in]   base         The memory to read to.
+ * @param[in]   size         The maximum number of bytes to read in one operation.
+ * @retval      RUBY_Qundef  `scheduler` doesn't have `#io_read`.
+ * @return      otherwise    What `scheduler.io_read` returns.
+ */
+VALUE rb_fiber_scheduler_io_pread_memory(VALUE scheduler, VALUE io, rb_off_t from, void *base, size_t size);
+
+/**
+ * Non-blocking pwrite to the passed IO using a native buffer.
+ *
+ * @param[in]   scheduler    Target scheduler.
+ * @param[in]   io           An io object to write to.
+ * @param[in]   from         The offset to write from.
+ * @param[in]   base         The memory to write from.
+ * @param[in]   size         The maximum number of bytes to write in one operation.
+ * @retval      RUBY_Qundef  `scheduler` doesn't have `#io_write`.
+ * @return      otherwise    What `scheduler.io_write` returns.
+ */
+VALUE rb_fiber_scheduler_io_pwrite_memory(VALUE scheduler, VALUE io, rb_off_t from, const void *base, size_t size);
+
+/**
+ * Non-blocking close the given IO.
  *
  * @param[in]  scheduler    Target scheduler.
  * @param[in]  io           An io object to close.
@@ -246,7 +403,7 @@ VALUE rb_fiber_scheduler_io_write_memory(VALUE scheduler, VALUE io, const void *
 VALUE rb_fiber_scheduler_io_close(VALUE scheduler, VALUE io);
 
 /**
- * Nonblocking DNS lookup.
+ * Non-blocking DNS lookup.
  *
  * @param[in]  scheduler    Target scheduler.
  * @param[in]  hostname     A host name to query.
@@ -254,6 +411,98 @@ VALUE rb_fiber_scheduler_io_close(VALUE scheduler, VALUE io);
  * @return     otherwise    What `scheduler.address_resolve` returns.
  */
 VALUE rb_fiber_scheduler_address_resolve(VALUE scheduler, VALUE hostname);
+
+// The state of the blocking operation execution.
+struct rb_fiber_scheduler_blocking_operation_state {
+    void *result;
+    int saved_errno;
+};
+
+// The opaque handle for the blocking operation.
+typedef struct rb_fiber_scheduler_blocking_operation rb_fiber_scheduler_blocking_operation_t;
+
+/**
+ * Extract the blocking operation handle from a BlockingOperationRuby object.
+ *
+ * This function safely extracts the opaque handle from a BlockingOperation VALUE
+ * while holding the GVL. The returned pointer can be passed to worker threads
+ * and used with rb_fiber_scheduler_blocking_operation_execute.
+ *
+ * @param[in] self The BlockingOperation VALUE to extract from
+ * @return The opaque struct pointer on success, NULL on error
+ * @note Experimental.
+ */
+rb_fiber_scheduler_blocking_operation_t *rb_fiber_scheduler_blocking_operation_extract(VALUE self);
+
+/**
+ * Execute blocking operation from handle (GVL not required).
+ *
+ * This function executes a blocking operation using the opaque handle
+ * obtained from rb_fiber_scheduler_blocking_operation_extract.
+ * It can be called from native threads without holding the GVL.
+ *
+ * @param[in] blocking_operation The opaque handle.
+ * @return 0 on success, -1 on error.
+ * @note Experimental. Can be called from any thread without holding the GVL
+ */
+int rb_fiber_scheduler_blocking_operation_execute(rb_fiber_scheduler_blocking_operation_t *blocking_operation);
+
+/**
+ * Cancel a blocking operation.
+ *
+ * This function cancels a blocking operation. If the operation is queued,
+ * it just marks it as cancelled. If it's executing, it marks it as cancelled
+ * and calls the unblock function to interrupt the operation.
+ *
+ * @param blocking_operation The opaque struct pointer
+ * @return 1 if unblock function was called, 0 if just marked cancelled, -1 on error
+ * @note Experimental.
+ */
+int rb_fiber_scheduler_blocking_operation_cancel(rb_fiber_scheduler_blocking_operation_t *blocking_operation);
+
+/**
+ * Defer the execution of the passed function to the scheduler.
+ *
+ * @param[in]  scheduler         Target scheduler.
+ * @param[in]  function          The function to run.
+ * @param[in]  data              The data to pass to the function.
+ * @param[in]  unblock_function  The unblock function to use to interrupt the operation.
+ * @param[in]  data2             The data to pass to the unblock function.
+ * @param[in]  flags             Flags passed to `rb_nogvl`.
+ * @param[out] state             The result and errno of the operation.
+ * @retval     RUBY_Qundef       `scheduler` doesn't have `#blocking_operation_wait`.
+ * @return     otherwise         What `scheduler.blocking_operation_wait` returns.
+ */
+VALUE rb_fiber_scheduler_blocking_operation_wait(VALUE scheduler, void* (*function)(void *), void *data, rb_unblock_function_t *unblock_function, void *data2, int flags, struct rb_fiber_scheduler_blocking_operation_state *state);
+
+/**
+ * Interrupt a target by raising an exception. You can construct an exception using `rb_make_exception`.
+ *
+ * The target is usually a Fiber. For an IO operation, it may instead be an
+ * operation-scoped proxy which responds to `alive?`, `raise`, and `transfer`.
+ * Calling `transfer` raises the stored exception in the target Fiber, allowing
+ * the proxy to be queued directly. Schedulers should restrict their use of the
+ * target to those methods.
+ *
+ * This hook may be invoked by a different thread.
+ *
+ * @param[in]  scheduler  Target scheduler.
+ * @param[in]  target     The Fiber or operation-scoped proxy to interrupt.
+ * @param[in]  exception  The exception to raise in the fiber.
+ * @return     What `scheduler.fiber_interrupt` returns.
+ */
+VALUE rb_fiber_scheduler_fiber_interrupt(VALUE scheduler, VALUE target, VALUE exception);
+
+/**
+ * Create and schedule a non-blocking fiber.
+ *
+ * @param[in]  scheduler  Target scheduler.
+ * @param[in]  argc      Number of arguments in argv.
+ * @param[in]  argv      Array of arguments to pass to the fiber.
+ * @param[in]  kw_splat  Whether to expand last argument as keywords.
+ * @return     The created and scheduled fiber.
+ */
+VALUE rb_fiber_scheduler_fiber(VALUE scheduler, int argc, VALUE *argv, int kw_splat);
 
 RBIMPL_SYMBOL_EXPORT_END()
 

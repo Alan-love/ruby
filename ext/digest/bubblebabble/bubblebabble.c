@@ -14,6 +14,10 @@
 #include <ruby/ruby.h>
 #include "../digest.h"
 
+#ifndef HAVE_RB_LEN_T
+# define RB_LEN_MAX LONG_MAX
+#endif
+
 static ID id_digest;
 
 static VALUE
@@ -36,8 +40,8 @@ bubblebabble_str_new(VALUE str_digest)
     digest = RSTRING_PTR(str_digest);
     digest_len = RSTRING_LEN(str_digest);
 
-    if ((LONG_MAX - 2) / 3 < (digest_len | 1)) {
-	rb_raise(rb_eRuntimeError, "digest string too long");
+    if ((RB_LEN_MAX - 2) / 3 < (digest_len | 1)) {
+        rb_raise(rb_eRuntimeError, "digest string too long");
     }
 
     str = rb_str_new(0, (digest_len | 1) * 3 + 2);
@@ -129,15 +133,14 @@ Init_bubblebabble(void)
 
     rb_require("digest");
 
-    rb_mDigest = rb_path2class("Digest");
-    rb_mDigest_Instance = rb_path2class("Digest::Instance");
-    rb_cDigest_Class = rb_path2class("Digest::Class");
-
 #if 0
     rb_mDigest = rb_define_module("Digest");
     rb_mDigest_Instance = rb_define_module_under(rb_mDigest, "Instance");
     rb_cDigest_Class = rb_define_class_under(rb_mDigest, "Class", rb_cObject);
 #endif
+    rb_mDigest = rb_digest_namespace();
+    rb_mDigest_Instance = rb_const_get(rb_mDigest, rb_intern_const("Instance"));
+    rb_cDigest_Class = rb_const_get(rb_mDigest, rb_intern_const("Class"));
 
     rb_define_module_function(rb_mDigest, "bubblebabble", rb_digest_s_bubblebabble, 1);
     rb_define_singleton_method(rb_cDigest_Class, "bubblebabble", rb_digest_class_s_bubblebabble, -1);

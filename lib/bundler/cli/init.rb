@@ -26,13 +26,21 @@ module Bundler
         end
 
         spec = Bundler.load_gemspec_uncached(gemspec)
+        unless spec
+          Bundler.ui.error "Gem specification #{gemspec} did not produce a specification"
+          exit 1
+        end
 
         File.open(gemfile, "wb") do |file|
           file << "# Generated from #{gemspec}\n"
           file << spec.to_gemfile
         end
       else
-        FileUtils.cp(File.expand_path("../../templates/#{gemfile}", __FILE__), gemfile)
+        File.open(File.expand_path("../templates/Gemfile", __dir__), "r") do |template|
+          File.open(gemfile, "wb") do |destination|
+            IO.copy_stream(template, destination)
+          end
+        end
       end
 
       puts "Writing new #{gemfile} to #{SharedHelpers.pwd}/#{gemfile}"
@@ -41,7 +49,7 @@ module Bundler
     private
 
     def gemfile
-      @gemfile ||= Bundler.preferred_gemfile_name
+      @gemfile ||= options[:gemfile] || Bundler.preferred_gemfile_name
     end
   end
 end

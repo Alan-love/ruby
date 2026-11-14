@@ -170,7 +170,7 @@ In this mode, all values assigned to constants are made shareable.
 
   # shareable_constant_value: experimental_everything
   FOO = Set[1, 2, {foo: []}]
-  # same as FOO = Ractor.make_sharable(...)
+  # same as FOO = Ractor.make_shareable(...)
   # OR same as `FOO = Set[1, 2, {foo: [].freeze}.freeze].freeze`
 
   var = [{foo: []}]
@@ -196,7 +196,7 @@ The method Module#const_set is not affected.
 In this mode, all values assigned to constants are deeply copied and
 made shareable. It is safer mode than +experimental_everything+.
 
-  # shareable_constant_value: experimental_everything
+  # shareable_constant_value: experimental_copy
   var = [{foo: []}]
   var.frozen? # => false (assignment was made to local variable)
   X = var # => calls `Ractor.make_shareable(var, copy: true)`

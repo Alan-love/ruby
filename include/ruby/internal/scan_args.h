@@ -49,11 +49,11 @@
 /** Same behaviour as rb_scan_args(). */
 #define RB_SCAN_ARGS_PASS_CALLED_KEYWORDS 0
 
-/** The final argument should be a hash treated as keywords.*/
+/** The final argument must be a hash, which will be treated as keywords. */
 #define RB_SCAN_ARGS_KEYWORDS 1
 
 /**
- * Treat a  final argument as  keywords if  it is a  hash, and not  as keywords
+ * Treat a final argument as keywords if it is a hash, and not as keywords
  * otherwise.
  */
 #define RB_SCAN_ARGS_LAST_HASH_KEYWORDS 3
@@ -68,14 +68,14 @@
 /** Do not pass keywords. */
 #define RB_NO_KEYWORDS 0
 
-/** Pass keywords, final argument should be a hash of keywords. */
+/** Pass keywords, final argument must be a hash of keywords. */
 #define RB_PASS_KEYWORDS 1
 
 /**
  * Pass keywords if current method is called with keywords, useful for argument
  * delegation
  */
-#define RB_PASS_CALLED_KEYWORDS rb_keyword_given_p()
+#define RB_PASS_CALLED_KEYWORDS !!rb_keyword_given_p()
 
 /** @} */
 
@@ -100,7 +100,7 @@ RBIMPL_ATTR_NONNULL((2, 3))
  * param-arg-spec        := pre-arg-spec [post-arg-spec] / post-arg-spec /
  *                          pre-opt-post-arg-spec
  * pre-arg-spec          := num-of-leading-mandatory-args
-                            [num-of-optional-args]
+ *                          [num-of-optional-args]
  * post-arg-spec         := sym-for-variable-length-args
  *                          [num-of-trailing-mandatory-args]
  * pre-opt-post-arg-spec := num-of-leading-mandatory-args num-of-optional-args

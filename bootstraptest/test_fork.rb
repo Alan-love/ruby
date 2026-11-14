@@ -54,7 +54,7 @@ assert_equal 'ok', %q{
   rescue NotImplementedError
     :ok
   end
-}, '[ruby-core:28924]'
+}, '[ruby-core:28924]' unless ENV["RUBYCI_OPENBSD"] == "1"
 
 assert_equal '[1, 2]', %q{
   a = []
@@ -74,4 +74,31 @@ assert_equal '[1, 2]', %q{
     [1, 2]
   end
 }, '[ruby-dev:44005] [Ruby 1.9 - Bug #4950]'
+
+assert_equal 'ok', %q{
+  def now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+  Thread.new do
+    loop { sleep 0.0001 }
+  end
+
+  10.times do
+    pid = fork{ exit!(0) }
+    deadline = now + 10
+    while true
+      _, status = Process.waitpid2(pid, Process::WNOHANG)
+      break if status
+      if now > deadline
+        Process.kill(:KILL, pid)
+        raise "failed"
+      end
+      sleep 0.001
+    end
+    unless status.success?
+      raise "child exited with status #{status}"
+    end
+  rescue NotImplementedError
+  end
+  :ok
+}, '[Bug #20670]'
 

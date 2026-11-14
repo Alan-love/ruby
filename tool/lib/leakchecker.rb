@@ -77,6 +77,7 @@ class LeakChecker
         end
         (h[fd] ||= []) << [io, autoclose, inspect]
       }
+      inspect = {}
       fd_leaked.select! {|fd|
         str = ''.dup
         pos = nil
@@ -98,6 +99,7 @@ class LeakChecker
             s = io.stat
           rescue Errno::EBADF
             # something un-stat-able
+            live2.delete(fd)
             next
           else
             next if /darwin/ =~ RUBY_PLATFORM and [0, -1].include?(s.dev)
@@ -106,15 +108,55 @@ class LeakChecker
             io&.close
           end
         end
-        puts "Leaked file descriptor: #{test_name}: #{fd}#{str}"
-        puts "  The IO was created at #{pos}" if pos
+        inspect[fd] = [str, pos]
         true
       }
       unless fd_leaked.empty?
         unless @@try_lsof == false
-          @@try_lsof |= system(*%W[lsof -a -d #{fd_leaked.minmax.uniq.join("-")} -p #$$], out: Test::Unit::Runner.output)
+          begin
+            open_list = IO.popen(%W[lsof -w -a -d #{fd_leaked.minmax.uniq.join("-")} -p #$$], &:readlines)
+          rescue
+            @@try_lsof = false
+          else
+            @@try_lsof |= $?.success?
+          end
+          if header = open_list&.shift
+            columns = header.split
+            fd_index, type_index, node_index = %w'FD TYPE NODE'.map {|n| columns.index(n)}
+          end
+          unless fd_index and type_index and node_index
+            # Not the lsof we expect, e.g. busybox lsof which ignores
+            # the options and prints no header.
+            @@try_lsof = false if header
+            header = nil
+          end
+          if header
+            open_list.reject! do |of|
+              of = of.chomp.split(' ', node_index + 2)
+              if of[node_index] == 'TCP' and of.last.end_with?('(CLOSE_WAIT)', '(CLOSED)')
+                # Sometimes TCP sockets still live in the kernel space
+                # but have been closed in the user space.
+                skip = true
+              elsif of[type_index] == 'systm'
+                # AF_SYSTEM on macOS is kept alive
+                skip = true
+              end
+              if skip
+                fd = of[fd_index].to_i
+                inspect.delete(fd)
+                h.delete(fd)
+                live2.delete(fd)
+              end
+              skip
+            end
+            puts(header, open_list) unless open_list.empty?
+          end
         end
       end
+      inspect.each {|fd, (str, pos)|
+        puts "Leaked file descriptor: #{test_name}: #{fd}#{str}"
+        puts "  The IO was created at #{pos}" if pos
+      }
       h.each {|fd, list|
         next if list.length <= 1
         if 1 < list.count {|io, autoclose, inspect| autoclose }
@@ -136,14 +178,14 @@ class LeakChecker
         attr_accessor :count
       end
 
-      def new(data)
+      def new(...)
         LeakChecker::TempfileCounter.count += 1
-        super(data)
+        super
       end
     }
     LeakChecker.const_set(:TempfileCounter, m)
 
-    class << Tempfile::Remover
+    class << Tempfile
       prepend LeakChecker::TempfileCounter
     end
   end
@@ -155,8 +197,8 @@ class LeakChecker
     if prev_count == count
       [prev_count, []]
     else
-      tempfiles = ObjectSpace.each_object(Tempfile).find_all {|t|
-        t.instance_variable_defined?(:@tmpfile) and t.path
+      tempfiles = ObjectSpace.each_object(Tempfile).reject {|t|
+        t.instance_variables.empty? || (t.closed? rescue true)
       }
       [count, tempfiles]
     end
@@ -182,7 +224,8 @@ class LeakChecker
 
   def find_threads
     Thread.list.find_all {|t|
-      t != Thread.current && t.alive?
+      t != Thread.current && t.alive? &&
+        !(t.thread_variable?(:"\0__detached_thread__") && t.thread_variable_get(:"\0__detached_thread__"))
     }
   end
 
@@ -209,15 +252,36 @@ class LeakChecker
     return leaked
   end
 
-  def find_env
-    ENV.to_h
+  e = ENV["_Ruby_Env_Ignorecase_"], ENV["_RUBY_ENV_IGNORECASE_"]
+  begin
+    ENV["_Ruby_Env_Ignorecase_"] = ENV["_RUBY_ENV_IGNORECASE_"] = nil
+    ENV["_RUBY_ENV_IGNORECASE_"] = "ENV_CASE_TEST"
+    ENV_IGNORECASE = ENV["_Ruby_Env_Ignorecase_"] == "ENV_CASE_TEST"
+  ensure
+    ENV["_Ruby_Env_Ignorecase_"], ENV["_RUBY_ENV_IGNORECASE_"] = e
+  end
+
+  if ENV_IGNORECASE
+    def find_env
+      ENV.to_h {|k, v| [k.upcase, v]}
+    end
+  else
+    def find_env
+      ENV.to_h
+    end
   end
 
   def check_env(test_name)
     old_env = @env_info
-    new_env = ENV.to_h
+    new_env = find_env
     return false if old_env == new_env
+    if defined?(Bundler::EnvironmentPreserver)
+      bundler_prefix = Bundler::EnvironmentPreserver::BUNDLER_PREFIX
+    end
     (old_env.keys | new_env.keys).sort.each {|k|
+      # Don't report changed environment variables caused by Bundler's backups
+      next if bundler_prefix and k.start_with?(bundler_prefix)
+
       if old_env.has_key?(k)
         if new_env.has_key?(k)
           if old_env[k] != new_env[k]

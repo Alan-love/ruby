@@ -1,5 +1,4 @@
 require_relative '../../spec_helper'
-require 'thread'
 
 describe "ConditionVariable#signal" do
   it "releases the first thread waiting in line for this resource" do
@@ -25,7 +24,7 @@ describe "ConditionVariable#signal" do
     # wait until all threads are sleeping (ie waiting)
     Thread.pass until threads.all?(&:stop?)
 
-    r2.should be_empty
+    r2.should.empty?
     100.times do |i|
       m.synchronize do
         cv.signal

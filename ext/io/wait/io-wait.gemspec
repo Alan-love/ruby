@@ -1,26 +1,28 @@
-_VERSION = "0.2.0"
+_VERSION = "999.999.999"
 
 Gem::Specification.new do |spec|
   spec.name          = "io-wait"
   spec.version       = _VERSION
-  spec.authors       = ["Nobu Nakada"]
-  spec.email         = ["nobu@ruby-lang.org"]
+  spec.authors       = ["Nobu Nakada", "Charles Oliver Nutter"]
+  spec.email         = ["nobu@ruby-lang.org", "headius@headius.com"]
 
-  spec.summary       = %q{Waits until IO is readable or writable without blocking.}
-  spec.description   = %q{Waits until IO is readable or writable without blocking.}
+  spec.summary       = %q{Deprecated: All functionality ships with Ruby 3.2 and higher.}
+  spec.description   = %q{Deprecated: All functionality ships with Ruby 3.2 and higher.}
   spec.homepage      = "https://github.com/ruby/io-wait"
   spec.licenses      = ["Ruby", "BSD-2-Clause"]
-  spec.required_ruby_version = Gem::Requirement.new(">= 2.6.0")
+  spec.required_ruby_version = Gem::Requirement.new(">= 4.1")
 
   spec.metadata["homepage_uri"] = spec.homepage
   spec.metadata["source_code_uri"] = spec.homepage
 
-  spec.files         = Dir.chdir(File.expand_path('..', __FILE__)) do
-    `git ls-files -z`.split("\x0").reject do |f|
-      f.match(%r{\A(?:test|spec|features)/|\A\.(?:git|travis)})
-    end
-  end
-  spec.extensions    = %w[ext/io/wait/extconf.rb]
+  dir, gemspec = File.split(__FILE__)
+  excludes = [
+    *%w[:^/.git* :^/Gemfile* :^/Rakefile* :^/bin/ :^/test/ :^/rakelib/],
+    ":(exclude,literal,top)#{gemspec}"
+  ]
+  files = IO.popen(%w[git ls-files -z --] + excludes, chdir: dir, &:read).split("\x0")
+
+  spec.files = files
   spec.bindir        = "exe"
   spec.executables   = []
   spec.require_paths = ["lib"]

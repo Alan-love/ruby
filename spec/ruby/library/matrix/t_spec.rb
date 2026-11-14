@@ -1,9 +1,8 @@
 require_relative '../../spec_helper'
+require 'matrix'
 
-ruby_version_is ""..."3.1" do
-  require_relative 'shared/transpose'
-
-  describe "Matrix#transpose" do
-    it_behaves_like :matrix_transpose, :t
+describe "Matrix#t" do
+  it "is an alias of Matrix#transpose" do
+    Matrix.instance_method(:t).should == Matrix.instance_method(:transpose)
   end
 end

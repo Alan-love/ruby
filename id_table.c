@@ -30,40 +30,67 @@ id2key(ID id)
    uses mark-bit on collisions - need extra 1 bit,
    ID is strictly 3 bits larger than rb_id_serial_t */
 
+#if SIZEOF_VALUE == 8
+/* The table body is a single buffer laid out as:
+
+     [VALUE values[capa] | id_key_t keys[capa] | collision bitmap]
+
+   where the collision bitmap uses one mark bit per slot.  Keeping the
+   keys out of the item struct avoids padding them to the alignment of
+   VALUE.  The three regions are computed from buf and capa, so the
+   struct only needs to store the buffer pointer. */
+#define COLLISION_TABLE_SIZE(capa) roomof((size_t)(capa), CHAR_BIT)
+#define ID_TABLE_BUF_SIZE(capa) \
+    ((sizeof(VALUE) + sizeof(id_key_t)) * (size_t)(capa) + COLLISION_TABLE_SIZE(capa))
+
+static inline VALUE *
+id_table_items(struct rb_id_table *tbl)
+{
+    return (VALUE *)tbl->buf;
+}
+
+static inline id_key_t *
+id_table_keys(struct rb_id_table *tbl)
+{
+    return (id_key_t *)(id_table_items(tbl) + tbl->capa);
+}
+
+static inline uint8_t *
+id_table_collision_table(struct rb_id_table *tbl)
+{
+    return (uint8_t *)(id_table_keys(tbl) + tbl->capa);
+}
+
+#define ITEM_GET_KEY(tbl, i) (id_table_keys(tbl)[i])
+#define ITEM_KEY_ISSET(tbl, i) ((tbl)->buf && id_table_keys(tbl)[i])
+#define ITEM_COLLIDED(tbl, i) (id_table_collision_table(tbl)[(i) / CHAR_BIT] & ((uint8_t)1 << ((i) % CHAR_BIT)))
+#define ITEM_SET_COLLIDED(tbl, i) (id_table_collision_table(tbl)[(i) / CHAR_BIT] |= ((uint8_t)1 << ((i) % CHAR_BIT)))
+#define ITEM_VALUE(tbl, i) (id_table_items(tbl)[i])
+
+static inline void
+ITEM_SET_KEY(struct rb_id_table *tbl, int i, id_key_t key)
+{
+    id_table_keys(tbl)[i] = key;
+}
+#else
 typedef struct rb_id_item {
     id_key_t key;
-#if SIZEOF_VALUE == 8
-    int      collision;
-#endif
     VALUE    val;
 } item_t;
 
-struct rb_id_table {
-    int capa;
-    int num;
-    int used;
-    item_t *items;
-};
+#define ID_TABLE_BUF_SIZE(capa) (sizeof(item_t) * (size_t)(capa))
+#define id_table_items(tbl) ((item_t *)(tbl)->buf)
 
-#if SIZEOF_VALUE == 8
-#define ITEM_GET_KEY(tbl, i) ((tbl)->items[i].key)
-#define ITEM_KEY_ISSET(tbl, i) ((tbl)->items[i].key)
-#define ITEM_COLLIDED(tbl, i) ((tbl)->items[i].collision)
-#define ITEM_SET_COLLIDED(tbl, i) ((tbl)->items[i].collision = 1)
+#define ITEM_GET_KEY(tbl, i) (id_table_items(tbl)[i].key >> 1)
+#define ITEM_KEY_ISSET(tbl, i) (id_table_items(tbl)[i].key > 1)
+#define ITEM_COLLIDED(tbl, i) (id_table_items(tbl)[i].key & 1)
+#define ITEM_SET_COLLIDED(tbl, i) (id_table_items(tbl)[i].key |= 1)
+#define ITEM_VALUE(tbl, i) (id_table_items(tbl)[i].val)
+
 static inline void
 ITEM_SET_KEY(struct rb_id_table *tbl, int i, id_key_t key)
 {
-    tbl->items[i].key = key;
-}
-#else
-#define ITEM_GET_KEY(tbl, i) ((tbl)->items[i].key >> 1)
-#define ITEM_KEY_ISSET(tbl, i) ((tbl)->items[i].key > 1)
-#define ITEM_COLLIDED(tbl, i) ((tbl)->items[i].key & 1)
-#define ITEM_SET_COLLIDED(tbl, i) ((tbl)->items[i].key |= 1)
-static inline void
-ITEM_SET_KEY(struct rb_id_table *tbl, int i, id_key_t key)
-{
-    tbl->items[i].key = (key << 1) | ITEM_COLLIDED(tbl, i);
+    id_table_items(tbl)[i].key = (key << 1) | ITEM_COLLIDED(tbl, i);
 }
 #endif
 
@@ -80,29 +107,46 @@ round_capa(int capa)
     return (capa + 1) << 2;
 }
 
-static struct rb_id_table *
-rb_id_table_init(struct rb_id_table *tbl, int capa)
+static void
+id_table_alloc_buf(struct rb_id_table *tbl, int capa)
 {
+#if SIZEOF_VALUE == 8
+    tbl->buf = ruby_xcalloc(1, ID_TABLE_BUF_SIZE(capa));
+#else
+    tbl->buf = ZALLOC_N(item_t, capa);
+#endif
+}
+
+struct rb_id_table *
+rb_id_table_init(struct rb_id_table *tbl, size_t s_capa)
+{
+    int capa = (int)s_capa;
     MEMZERO(tbl, struct rb_id_table, 1);
     if (capa > 0) {
-	capa = round_capa(capa);
-	tbl->capa = (int)capa;
-	tbl->items = ZALLOC_N(item_t, capa);
+        capa = round_capa(capa);
+        tbl->capa = (int)capa;
+        id_table_alloc_buf(tbl, capa);
     }
     return tbl;
 }
 
-MJIT_FUNC_EXPORTED struct rb_id_table *
+struct rb_id_table *
 rb_id_table_create(size_t capa)
 {
     struct rb_id_table *tbl = ALLOC(struct rb_id_table);
-    return rb_id_table_init(tbl, (int)capa);
+    return rb_id_table_init(tbl, capa);
+}
+
+void
+rb_id_table_free_items(struct rb_id_table *tbl)
+{
+    xfree(tbl->buf);
 }
 
 void
 rb_id_table_free(struct rb_id_table *tbl)
 {
-    xfree(tbl->items);
+    xfree(tbl->buf);
     xfree(tbl);
 }
 
@@ -111,7 +155,9 @@ rb_id_table_clear(struct rb_id_table *tbl)
 {
     tbl->num = 0;
     tbl->used = 0;
-    MEMZERO(tbl->items, item_t, tbl->capa);
+    if (tbl->buf) {
+        memset(tbl->buf, 0, ID_TABLE_BUF_SIZE(tbl->capa));
+    }
 }
 
 size_t
@@ -123,23 +169,23 @@ rb_id_table_size(const struct rb_id_table *tbl)
 size_t
 rb_id_table_memsize(const struct rb_id_table *tbl)
 {
-    return sizeof(item_t) * tbl->capa + sizeof(struct rb_id_table);
+    return ID_TABLE_BUF_SIZE(tbl->capa) + sizeof(struct rb_id_table);
 }
 
 static int
 hash_table_index(struct rb_id_table* tbl, id_key_t key)
 {
     if (tbl->capa > 0) {
-	int mask = tbl->capa - 1;
-	int ix = key & mask;
-	int d = 1;
-	while (key != ITEM_GET_KEY(tbl, ix)) {
-	    if (!ITEM_COLLIDED(tbl, ix))
-		return -1;
-	    ix = (ix + d) & mask;
-	    d++;
-	}
-	return ix;
+        int mask = tbl->capa - 1;
+        int ix = key & mask;
+        int d = 1;
+        while (key != ITEM_GET_KEY(tbl, ix)) {
+            if (!ITEM_COLLIDED(tbl, ix))
+                return -1;
+            ix = (ix + d) & mask;
+            d++;
+        }
+        return ix;
     }
     return -1;
 }
@@ -150,34 +196,34 @@ hash_table_raw_insert(struct rb_id_table *tbl, id_key_t key, VALUE val)
     int mask = tbl->capa - 1;
     int ix = key & mask;
     int d = 1;
-    assert(key != 0);
+    RUBY_ASSERT(key != 0);
     while (ITEM_KEY_ISSET(tbl, ix)) {
-	ITEM_SET_COLLIDED(tbl, ix);
-	ix = (ix + d) & mask;
-	d++;
+        ITEM_SET_COLLIDED(tbl, ix);
+        ix = (ix + d) & mask;
+        d++;
     }
     tbl->num++;
     if (!ITEM_COLLIDED(tbl, ix)) {
-	tbl->used++;
+        tbl->used++;
     }
     ITEM_SET_KEY(tbl, ix, key);
-    tbl->items[ix].val = val;
+    ITEM_VALUE(tbl, ix) = val;
 }
 
 static int
 hash_delete_index(struct rb_id_table *tbl, int ix)
 {
     if (ix >= 0) {
-	if (!ITEM_COLLIDED(tbl, ix)) {
-	    tbl->used--;
-	}
-	tbl->num--;
-	ITEM_SET_KEY(tbl, ix, 0);
-	tbl->items[ix].val = 0;
-	return TRUE;
+        if (!ITEM_COLLIDED(tbl, ix)) {
+            tbl->used--;
+        }
+        tbl->num--;
+        ITEM_SET_KEY(tbl, ix, 0);
+        ITEM_VALUE(tbl, ix) = 0;
+        return TRUE;
     }
     else {
-	return FALSE;
+        return FALSE;
     }
 }
 
@@ -185,24 +231,24 @@ static void
 hash_table_extend(struct rb_id_table* tbl)
 {
     if (tbl->used + (tbl->used >> 1) >= tbl->capa) {
-	int new_cap = round_capa(tbl->num + (tbl->num >> 1));
-	int i;
-	item_t* old;
-	struct rb_id_table tmp_tbl = {0, 0, 0};
-	if (new_cap < tbl->capa) {
-	    new_cap = round_capa(tbl->used + (tbl->used >> 1));
-	}
-	tmp_tbl.capa = new_cap;
-	tmp_tbl.items = ZALLOC_N(item_t, new_cap);
-	for (i = 0; i < tbl->capa; i++) {
-	    id_key_t key = ITEM_GET_KEY(tbl, i);
-	    if (key != 0) {
-		hash_table_raw_insert(&tmp_tbl, key, tbl->items[i].val);
-	    }
-	}
-	old = tbl->items;
-	*tbl = tmp_tbl;
-	xfree(old);
+        int new_cap = round_capa(tbl->num + (tbl->num >> 1));
+        int i;
+        void *old;
+        struct rb_id_table tmp_tbl = {0};
+        if (new_cap < tbl->capa) {
+            new_cap = round_capa(tbl->used + (tbl->used >> 1));
+        }
+        tmp_tbl.capa = new_cap;
+        id_table_alloc_buf(&tmp_tbl, new_cap);
+        for (i = 0; i < tbl->capa; i++) {
+            id_key_t key = ITEM_GET_KEY(tbl, i);
+            if (key != 0) {
+                hash_table_raw_insert(&tmp_tbl, key, ITEM_VALUE(tbl, i));
+            }
+        }
+        old = tbl->buf;
+        *tbl = tmp_tbl;
+        xfree(old);
     }
 }
 
@@ -210,31 +256,31 @@ hash_table_extend(struct rb_id_table* tbl)
 static void
 hash_table_show(struct rb_id_table *tbl)
 {
-    const id_key_t *keys = tbl->keys;
     const int capa = tbl->capa;
     int i;
 
     fprintf(stderr, "tbl: %p (capa: %d, num: %d, used: %d)\n", tbl, tbl->capa, tbl->num, tbl->used);
     for (i=0; i<capa; i++) {
-	if (ITEM_KEY_ISSET(tbl, i)) {
-	    fprintf(stderr, " -> [%d] %s %d\n", i, rb_id2name(key2id(keys[i])), (int)keys[i]);
-	}
+        if (ITEM_KEY_ISSET(tbl, i)) {
+            const id_key_t key = ITEM_GET_KEY(tbl, i);
+            fprintf(stderr, " -> [%d] %s %d\n", i, rb_id2name(key2id(key)), (int)key);
+        }
     }
 }
 #endif
 
-MJIT_FUNC_EXPORTED int
+int
 rb_id_table_lookup(struct rb_id_table *tbl, ID id, VALUE *valp)
 {
     id_key_t key = id2key(id);
     int index = hash_table_index(tbl, key);
 
     if (index >= 0) {
-        *valp = tbl->items[index].val;
-	return TRUE;
+        *valp = ITEM_VALUE(tbl, index);
+        return TRUE;
     }
     else {
-	return FALSE;
+        return FALSE;
     }
 }
 
@@ -244,16 +290,16 @@ rb_id_table_insert_key(struct rb_id_table *tbl, const id_key_t key, const VALUE 
     const int index = hash_table_index(tbl, key);
 
     if (index >= 0) {
-	tbl->items[index].val = val;
+        ITEM_VALUE(tbl, index) = val;
     }
     else {
-	hash_table_extend(tbl);
-	hash_table_raw_insert(tbl, key, val);
+        hash_table_extend(tbl);
+        hash_table_raw_insert(tbl, key, val);
     }
     return TRUE;
 }
 
-MJIT_FUNC_EXPORTED int
+int
 rb_id_table_insert(struct rb_id_table *tbl, ID id, VALUE val)
 {
     return rb_id_table_insert_key(tbl, id2key(id), val);
@@ -268,42 +314,21 @@ rb_id_table_delete(struct rb_id_table *tbl, ID id)
 }
 
 void
-rb_id_table_foreach_with_replace(struct rb_id_table *tbl, rb_id_table_foreach_func_t *func, rb_id_table_update_callback_func_t *replace, void *data)
-{
-    int i, capa = tbl->capa;
-
-    for (i=0; i<capa; i++) {
-        if (ITEM_KEY_ISSET(tbl, i)) {
-            enum rb_id_table_iterator_result ret = (*func)((ID)0, tbl->items[i].val, data);
-            assert(ITEM_GET_KEY(tbl, i));
-
-            if (ret == ID_TABLE_REPLACE) {
-                VALUE val = tbl->items[i].val;
-                ret = (*replace)(NULL, &val, data, TRUE);
-                tbl->items[i].val = val;
-            }
-            else if (ret == ID_TABLE_STOP)
-                return;
-        }
-    }
-}
-
-void
 rb_id_table_foreach(struct rb_id_table *tbl, rb_id_table_foreach_func_t *func, void *data)
 {
     int i, capa = tbl->capa;
 
     for (i=0; i<capa; i++) {
-	if (ITEM_KEY_ISSET(tbl, i)) {
-	    const id_key_t key = ITEM_GET_KEY(tbl, i);
-	    enum rb_id_table_iterator_result ret = (*func)(key2id(key), tbl->items[i].val, data);
-	    assert(key != 0);
+        if (ITEM_KEY_ISSET(tbl, i)) {
+            const id_key_t key = ITEM_GET_KEY(tbl, i);
+            enum rb_id_table_iterator_result ret = (*func)(key2id(key), ITEM_VALUE(tbl, i), data);
+            RUBY_ASSERT(key != 0);
 
-	    if (ret == ID_TABLE_DELETE)
-		hash_delete_index(tbl, i);
-	    else if (ret == ID_TABLE_STOP)
-		return;
-	}
+            if (ret == ID_TABLE_DELETE)
+                hash_delete_index(tbl, i);
+            else if (ret == ID_TABLE_STOP)
+                return;
+        }
     }
 }
 
@@ -312,14 +337,237 @@ rb_id_table_foreach_values(struct rb_id_table *tbl, rb_id_table_foreach_values_f
 {
     int i, capa = tbl->capa;
 
-    for (i=0; i<capa; i++) {
-	if (ITEM_KEY_ISSET(tbl, i)) {
-	    enum rb_id_table_iterator_result ret = (*func)(tbl->items[i].val, data);
-
-	    if (ret == ID_TABLE_DELETE)
-		hash_delete_index(tbl, i);
-	    else if (ret == ID_TABLE_STOP)
-		return;
-	}
+    if (!tbl->buf) {
+        return;
     }
+
+    for (i=0; i<capa; i++) {
+        if (ITEM_KEY_ISSET(tbl, i)) {
+            enum rb_id_table_iterator_result ret = (*func)(ITEM_VALUE(tbl, i), data);
+
+            if (ret == ID_TABLE_DELETE)
+                hash_delete_index(tbl, i);
+            else if (ret == ID_TABLE_STOP)
+                return;
+        }
+    }
+}
+
+void
+rb_id_table_foreach_values_with_replace(struct rb_id_table *tbl, rb_id_table_foreach_values_func_t *func, rb_id_table_update_value_callback_func_t *replace, void *data)
+{
+    int i, capa = tbl->capa;
+
+    for (i = 0; i < capa; i++) {
+        if (ITEM_KEY_ISSET(tbl, i)) {
+            enum rb_id_table_iterator_result ret = (*func)(ITEM_VALUE(tbl, i), data);
+
+            if (ret == ID_TABLE_REPLACE) {
+                VALUE val = ITEM_VALUE(tbl, i);
+                ret = (*replace)(&val, data, TRUE);
+                ITEM_VALUE(tbl, i) = val;
+            }
+
+            if (ret == ID_TABLE_STOP)
+                return;
+        }
+    }
+}
+
+static void
+managed_id_table_free(void *data)
+{
+    struct rb_id_table *tbl = (struct rb_id_table *)data;
+    rb_id_table_free_items(tbl);
+}
+
+static size_t
+managed_id_table_memsize(const void *data)
+{
+    const struct rb_id_table *tbl = (const struct rb_id_table *)data;
+    return rb_id_table_memsize(tbl) - sizeof(struct rb_id_table);
+}
+
+const rb_data_type_t rb_managed_id_table_type = {
+    .wrap_struct_name = "VM/managed_id_table",
+    .function = {
+        .dmark = NULL, // Nothing to mark
+        .dfree = managed_id_table_free,
+        .dsize = managed_id_table_memsize,
+    },
+    .flags = RUBY_TYPED_THREAD_SAFE_FREE | RUBY_TYPED_WB_PROTECTED | RUBY_TYPED_EMBEDDABLE,
+};
+
+static inline struct rb_id_table *
+managed_id_table_ptr(VALUE obj)
+{
+    RUBY_ASSERT(RB_TYPE_P(obj, T_DATA));
+    RUBY_ASSERT(rb_typeddata_inherited_p(RTYPEDDATA_TYPE(obj), &rb_managed_id_table_type));
+
+    return RTYPEDDATA_GET_DATA(obj);
+}
+
+VALUE
+rb_managed_id_table_create(const rb_data_type_t *type, size_t capa)
+{
+    struct rb_id_table *tbl;
+    VALUE obj = TypedData_Make_Struct(0, struct rb_id_table, type, tbl);
+    RB_OBJ_SET_SHAREABLE(obj);
+    rb_id_table_init(tbl, capa); // NOTE: this can cause GC, so dmark and dsize need to check tbl->buf
+    return obj;
+}
+
+VALUE
+rb_managed_id_table_new(size_t capa)
+{
+    return rb_managed_id_table_create(&rb_managed_id_table_type, capa);
+}
+
+static enum rb_id_table_iterator_result
+managed_id_table_dup_i(ID id, VALUE val, void *data)
+{
+    struct rb_id_table *new_tbl = (struct rb_id_table *)data;
+    rb_id_table_insert(new_tbl, id, val);
+    return ID_TABLE_CONTINUE;
+}
+
+VALUE
+rb_managed_id_table_dup(VALUE old_table)
+{
+    struct rb_id_table *new_tbl;
+    VALUE obj = TypedData_Make_Struct(0, struct rb_id_table, RTYPEDDATA_TYPE(old_table), new_tbl);
+    /* A managed id table hangs off VM-global state (e.g. a shape tree's edge
+     * table grows via this dup) and is reachable from every Ractor, so mark it
+     * shareable. */
+    RB_OBJ_SET_SHAREABLE(obj);
+    struct rb_id_table *old_tbl = managed_id_table_ptr(old_table);
+    rb_id_table_init(new_tbl, old_tbl->num + 1);
+    rb_id_table_foreach(old_tbl, managed_id_table_dup_i, new_tbl);
+    /* The table body is embedded (RUBY_TYPED_EMBEDDABLE), so old_tbl is an
+     * interior pointer.  Keep old_table live in case dup_i triggers a GC. */
+    RB_GC_GUARD(old_table);
+    return obj;
+}
+
+int
+rb_managed_id_table_lookup(VALUE table, ID id, VALUE *valp)
+{
+    return rb_id_table_lookup(managed_id_table_ptr(table), id, valp);
+}
+
+int
+rb_managed_id_table_insert(VALUE table, ID id, VALUE val)
+{
+    int result = rb_id_table_insert(managed_id_table_ptr(table), id, val);
+    /* The table body is embedded (RUBY_TYPED_EMBEDDABLE), so the pointer above
+     * is interior.  Keep table live in case the insert grows the buffer. */
+    RB_GC_GUARD(table);
+    return result;
+}
+
+size_t
+rb_managed_id_table_size(VALUE table)
+{
+    return rb_id_table_size(managed_id_table_ptr(table));
+}
+
+void
+rb_managed_id_table_foreach(VALUE table, rb_id_table_foreach_func_t *func, void *data)
+{
+    rb_id_table_foreach(managed_id_table_ptr(table), func, data);
+    /* The table body is embedded (RUBY_TYPED_EMBEDDABLE), so the pointer above
+     * is interior.  Keep table live in case func triggers a GC. */
+    RB_GC_GUARD(table);
+}
+
+void
+rb_managed_id_table_foreach_values(VALUE table, rb_id_table_foreach_values_func_t *func, void *data)
+{
+    rb_id_table_foreach_values(managed_id_table_ptr(table), func, data);
+    RB_GC_GUARD(table);
+}
+
+int
+rb_managed_id_table_delete(VALUE table, ID id)
+{
+    return rb_id_table_delete(managed_id_table_ptr(table), id);
+}
+
+static enum rb_id_table_iterator_result
+marked_id_table_mark_i(VALUE val, void *data)
+{
+    rb_gc_mark_movable(val);
+    return ID_TABLE_CONTINUE;
+}
+
+static void
+marked_id_table_mark(void *ptr)
+{
+    struct rb_id_table *tbl = (struct rb_id_table *)ptr;
+    rb_id_table_foreach_values(tbl, marked_id_table_mark_i, NULL);
+}
+
+static enum rb_id_table_iterator_result
+marked_id_table_compact_check_i(VALUE value, void *data)
+{
+    if (rb_gc_location(value) != value) {
+        return ID_TABLE_REPLACE;
+    }
+    return ID_TABLE_CONTINUE;
+}
+
+static enum rb_id_table_iterator_result
+marked_id_table_compact_replace_i(VALUE *value, void *data, int existing)
+{
+    rb_gc_update_moved(value);
+    return ID_TABLE_CONTINUE;
+}
+
+static void
+marked_id_table_compact(void *ptr)
+{
+    struct rb_id_table *tbl = (struct rb_id_table *)ptr;
+    rb_id_table_foreach_values_with_replace(tbl, marked_id_table_compact_check_i, marked_id_table_compact_replace_i, NULL);
+}
+
+const rb_data_type_t rb_marked_id_table_type = {
+    .wrap_struct_name = "VM/marked_id_table",
+    .function = {
+        .dmark = marked_id_table_mark,
+        .dfree = managed_id_table_free,
+        .dsize = managed_id_table_memsize,
+        .dcompact = marked_id_table_compact,
+    },
+    .parent = &rb_managed_id_table_type,
+    .flags = RUBY_TYPED_THREAD_SAFE_FREE | RUBY_TYPED_WB_PROTECTED | RUBY_TYPED_EMBEDDABLE,
+};
+
+VALUE
+rb_marked_id_table_new(size_t capa)
+{
+    return rb_managed_id_table_create(&rb_marked_id_table_type, capa);
+}
+
+int
+rb_marked_id_table_insert(VALUE table, ID id, VALUE val)
+{
+    int result = rb_managed_id_table_insert(table, id, val);
+    RB_OBJ_WRITTEN(table, Qundef, val);
+    return result;
+}
+
+static enum rb_id_table_iterator_result
+marked_id_table_dup_i(VALUE val, void *data)
+{
+    VALUE new_table = (VALUE)data;
+    RB_OBJ_WRITTEN(new_table, Qundef, val);
+    return ID_TABLE_CONTINUE;
+}
+
+VALUE
+rb_marked_id_table_dup(VALUE old_table)
+{
+    VALUE new_table = rb_managed_id_table_dup(old_table);
+    rb_managed_id_table_foreach_values(new_table, marked_id_table_dup_i, (void *)new_table);
+    return new_table;
 }

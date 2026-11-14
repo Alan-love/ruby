@@ -40,7 +40,15 @@
 
 #if defined(_MSC_VER) && defined(_WIN64)
 # include <intrin.h>
+# if defined(_M_AMD64)
 # pragma intrinsic(_umul128)
+# if !defined(__clang__) /* clang-cl defines it as an inline function */
+# pragma intrinsic(_addcarry_u64)
+# endif
+# endif
+# if defined(_M_ARM64)
+# pragma intrinsic(__umulh)
+# endif
 #endif
 
 #include "ruby/internal/attr/alloc_size.h"
@@ -56,13 +64,14 @@
 #include "ruby/internal/has/builtin.h"
 #include "ruby/internal/stdalign.h"
 #include "ruby/internal/stdbool.h"
+#include "ruby/internal/stdckdint.h"
 #include "ruby/internal/xmalloc.h"
 #include "ruby/backward/2/limits.h"
 #include "ruby/backward/2/long_long.h"
 #include "ruby/backward/2/assume.h"
 #include "ruby/defines.h"
 
-/** @cond INTENAL_MACRO  */
+/** @cond INTERNAL_MACRO  */
 
 /* Make alloca work the best possible way.  */
 #if defined(alloca)
@@ -287,18 +296,18 @@ typedef uint128_t DSIZE_T;
     RBIMPL_CAST((type *)alloca(rbimpl_size_mul_or_raise(sizeof(type), (n))))
 
 /**
- * Identical to #RB_ALLOCV_N(), except it  implicitly assumes the type of array
- * is ::VALUE.
+ * Identical to #RB_ALLOCV_N(), except that it allocates a number of bytes and
+ * returns a void* .
  *
  * @param   v  A variable to hold the just-in-case opaque Ruby object.
  * @param   n  Size of allocation, in bytes.
- * @return  An array of `n` bytes of ::VALUE.
+ * @return  A void pointer to `n` bytes storage.
  * @note    `n` may be evaluated twice.
  */
 #define RB_ALLOCV(v, n)        \
     ((n) < RUBY_ALLOCV_LIMIT ? \
      ((v) = 0, alloca(n)) :    \
-     rb_alloc_tmp_buffer(&(v), (n)))
+     rb_alloc_tmp_buffer(&(v), (n), true))
 
 /**
  * Allocates a  memory region, possibly  on stack.   If the given  size exceeds
@@ -363,7 +372,7 @@ typedef uint128_t DSIZE_T;
  * @return  `p1`.
  * @post    First `n` elements of `p2` are copied into `p1`.
  */
-#define MEMCPY(p1,p2,type,n) memcpy((p1), (p2), rbimpl_size_mul_or_raise(sizeof(type), (n)))
+#define MEMCPY(p1,p2,type,n) ruby_nonempty_memcpy((p1), (p2), rbimpl_size_mul_or_raise(sizeof(type), (n)))
 
 /**
  * Handy macro to call memmove.
@@ -402,7 +411,8 @@ typedef uint128_t DSIZE_T;
 /**
  * @private
  *
- * This is an implementation detail of rbimpl_size_mul_overflow().
+ * This is an implementation detail of rbimpl_size_mul_overflow() and
+ * rbimpl_size_add_overflow().
  *
  * @internal
  *
@@ -410,9 +420,9 @@ typedef uint128_t DSIZE_T;
  * nothing more than std::variant<std::size_t> if  we could use recent C++, but
  * reality is we cannot.
  */
-struct rbimpl_size_mul_overflow_tag {
-    bool left;                  /**< Whether overflow happened or not. */
-    size_t right;               /**< Multiplication result. */
+struct rbimpl_size_overflow_tag {
+    bool overflowed;            /**< Whether overflow happened or not. */
+    size_t result;              /**< Calculation result. */
 };
 
 RBIMPL_SYMBOL_EXPORT_BEGIN()
@@ -431,30 +441,7 @@ RBIMPL_ATTR_NONNULL(())
  * @return      Allocated `len` bytes array.
  * @post        `store` holds the corresponding tmp buffer object.
  */
-void *rb_alloc_tmp_buffer(volatile VALUE *store, long len);
-
-RBIMPL_ATTR_RESTRICT()
-RBIMPL_ATTR_RETURNS_NONNULL()
-RBIMPL_ATTR_ALLOC_SIZE((2,3))
-RBIMPL_ATTR_NONNULL(())
-/**
- * @private
- *
- * This is an  implementation detail of #RB_ALLOCV_N().  People  don't use this
- * directly.
- *
- * @param[out]  store  Pointer to a variable.
- * @param[in]   len    Requested number of bytes to allocate.
- * @param[in]   count  Number of elements in an array.
- * @return      Allocated `len` bytes array.
- * @post        `store` holds the corresponding tmp buffer object.
- *
- * @internal
- *
- * Although  the  meaning  of  `count` variable  is  clear,  @shyouhei  doesn't
- * understand its needs.
- */
-void *rb_alloc_tmp_buffer_with_count(volatile VALUE *store, size_t len,size_t count);
+void *rb_alloc_tmp_buffer(volatile VALUE *store, rb_len_t len, bool mark);
 
 /**
  * @private
@@ -482,6 +469,18 @@ RBIMPL_ATTR_NORETURN()
  */
 void ruby_malloc_size_overflow(size_t x, size_t y);
 
+RBIMPL_ATTR_NORETURN()
+/**
+ * @private
+ *
+ * This is an implementation detail. People don't use this directly.
+ *
+ * @param[in]  x             Arbitrary value.
+ * @param[in]  y             Arbitrary value.
+ * @exception  rb_eArgError  `x` + `y` would integer overflow.
+ */
+void ruby_malloc_add_size_overflow(size_t x, size_t y);
+
 #ifdef HAVE_RB_GC_GUARDED_PTR_VAL
 volatile VALUE *rb_gc_guarded_ptr_val(volatile VALUE *ptr, VALUE val);
 #endif
@@ -508,36 +507,6 @@ rb_gc_guarded_ptr(volatile VALUE *ptr)
 # pragma optimize("", on)
 #endif
 
-/**
- * @deprecated  This   function   was   an   implementation   detail   of   old
- *              #RB_ALLOCV_N().  We no longer  use it.  @shyouhei suspects that
- *              there are  no actual usage now.   However it was not  marked as
- *              private before.  We cannot delete it any longer.
- * @param[in]   a    Arbitrary value.
- * @param[in]   b    Arbitrary value.
- * @param[in]   max  Possible maximum value.
- * @param[out]  c    A pointer to return the computation result.
- * @retval      1    `c` is insane.
- * @retval      0    `c` is sane.
- * @post        `c` holds `a` * `b`, but could be overflowed.
- */
-static inline int
-rb_mul_size_overflow(size_t a, size_t b, size_t max, size_t *c)
-{
-#ifdef DSIZE_T
-    RB_GNUC_EXTENSION DSIZE_T da, db, c2;
-    da = a;
-    db = b;
-    c2 = da * db;
-    if (c2 > max) return 1;
-    *c = RBIMPL_CAST((size_t)c2);
-#else
-    if (b != 0 && a > max / b) return 1;
-    *c = a * b;
-#endif
-    return 0;
-}
-
 #if defined(__DOXYGEN__)
 RBIMPL_ATTR_CONSTEXPR(CXX14)
 #elif RBIMPL_COMPILER_SINCE(GCC, 7, 0, 0)
@@ -554,39 +523,46 @@ RBIMPL_ATTR_CONST()
  *
  * @param[in]  x  Arbitrary value.
  * @param[in]  y  Arbitrary value.
- * @return     `{ left, right }`,  where `left` is whether there  is an integer
- *             overflow or not,  and `right` is a  (possibly overflowed) result
- *             of `x` * `y`.
+ * @return     `{ overflowed, result }`, where  `overflowed` is whether there is
+ *             an  integer  overflow  or  not,   and  `result`  is  a  (possibly
+ *             overflowed) result of `x` * `y`.
  *
  * @internal
  *
  * This is in fact also an implementation detail of ruby_xmalloc2() etc.
  */
-static inline struct rbimpl_size_mul_overflow_tag
+static inline struct rbimpl_size_overflow_tag
 rbimpl_size_mul_overflow(size_t x, size_t y)
 {
-    struct rbimpl_size_mul_overflow_tag ret = { false,  0, };
+    struct rbimpl_size_overflow_tag ret = { false,  0, };
 
-#if RBIMPL_HAS_BUILTIN(__builtin_mul_overflow)
-    ret.left = __builtin_mul_overflow(x, y, &ret.right);
+#if defined(ckd_mul)
+    ret.overflowed = ckd_mul(&ret.result, x, y);
+
+#elif RBIMPL_HAS_BUILTIN(__builtin_mul_overflow)
+    ret.overflowed = __builtin_mul_overflow(x, y, &ret.result);
 
 #elif defined(DSIZE_T)
     RB_GNUC_EXTENSION DSIZE_T dx = x;
     RB_GNUC_EXTENSION DSIZE_T dy = y;
     RB_GNUC_EXTENSION DSIZE_T dz = dx * dy;
-    ret.left  = dz > SIZE_MAX;
-    ret.right = RBIMPL_CAST((size_t)dz);
+    ret.overflowed  = dz > SIZE_MAX;
+    ret.result = RBIMPL_CAST((size_t)dz);
 
-#elif defined(_MSC_VER) && defined(_WIN64)
+#elif defined(_MSC_VER) && defined(_M_AMD64)
     unsigned __int64 dp = 0;
     unsigned __int64 dz = _umul128(x, y, &dp);
-    ret.left  = RBIMPL_CAST((bool)dp);
-    ret.right = RBIMPL_CAST((size_t)dz);
+    ret.overflowed  = RBIMPL_CAST((bool)dp);
+    ret.result = RBIMPL_CAST((size_t)dz);
+
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+    ret.overflowed  = __umulh(x, y) != 0;
+    ret.result = x * y;
 
 #else
     /* https://wiki.sei.cmu.edu/confluence/display/c/INT30-C.+Ensure+that+unsigned+integer+operations+do+not+wrap */
-    ret.left  = (y != 0) && (x > SIZE_MAX / y);
-    ret.right = x * y;
+    ret.overflowed  = (y != 0) && (x > SIZE_MAX / y);
+    ret.result = x * y;
 #endif
 
     return ret;
@@ -610,14 +586,95 @@ rbimpl_size_mul_overflow(size_t x, size_t y)
 static inline size_t
 rbimpl_size_mul_or_raise(size_t x, size_t y)
 {
-    struct rbimpl_size_mul_overflow_tag size =
+    struct rbimpl_size_overflow_tag size =
         rbimpl_size_mul_overflow(x, y);
 
-    if (RB_LIKELY(! size.left)) {
-        return size.right;
+    if (RB_LIKELY(! size.overflowed)) {
+        return size.result;
     }
     else {
         ruby_malloc_size_overflow(x, y);
+        RBIMPL_UNREACHABLE_RETURN(0);
+    }
+}
+
+#if defined(__DOXYGEN__)
+RBIMPL_ATTR_CONSTEXPR(CXX14)
+#elif RBIMPL_COMPILER_SINCE(GCC, 7, 0, 0)
+RBIMPL_ATTR_CONSTEXPR(CXX14) /* https://gcc.gnu.org/bugzilla/show_bug.cgi?id=70507 */
+#elif RBIMPL_COMPILER_SINCE(Clang, 7, 0, 0)
+RBIMPL_ATTR_CONSTEXPR(CXX14) /* https://bugs.llvm.org/show_bug.cgi?id=37633 */
+#endif
+RBIMPL_ATTR_CONST()
+/**
+ * @private
+ *
+ * This is an  implementation detail. People don't use this directly.
+ *
+ * @param[in]  x  Arbitrary value.
+ * @param[in]  y  Arbitrary value.
+ * @return     `{ overflowed, result }`, where  `overflowed` is whether there is
+ *             an  integer  overflow  or  not,   and  `result`  is  a  (possibly
+ *             overflowed) result of `x` + `y`.
+ *
+ * @internal
+ */
+static inline struct rbimpl_size_overflow_tag
+rbimpl_size_add_overflow(size_t x, size_t y)
+{
+    struct rbimpl_size_overflow_tag ret = { false,  0, };
+
+#if defined(ckd_add)
+    ret.overflowed = ckd_add(&ret.result, x, y);
+
+#elif RBIMPL_HAS_BUILTIN(__builtin_add_overflow)
+    ret.overflowed = __builtin_add_overflow(x, y, &ret.result);
+
+#elif defined(DSIZE_T)
+    RB_GNUC_EXTENSION DSIZE_T dx = x;
+    RB_GNUC_EXTENSION DSIZE_T dy = y;
+    RB_GNUC_EXTENSION DSIZE_T dz = dx + dy;
+    ret.overflowed = dz > SIZE_MAX;
+    ret.result = (size_t)dz;
+
+#elif defined(_MSC_VER) && defined(_M_AMD64)
+    unsigned __int64 dz = 0;
+    unsigned char carry = _addcarry_u64(0, x, y, &dz);
+    ret.overflowed = RBIMPL_CAST((bool)carry);
+    ret.result = RBIMPL_CAST((size_t)dz);
+
+#else
+    ret.result = x + y;
+    ret.overflowed = ret.result < y;
+
+#endif
+
+    return ret;
+}
+
+/**
+ * @private
+ *
+ * This is an  implementation detail. People don't use this directly.
+ *
+ * @param[in]  x             Arbitrary value.
+ * @param[in]  y             Arbitrary value.
+ * @exception  rb_eArgError  Multiplication could integer overflow.
+ * @return     `x` + `y`.
+ *
+ * @internal
+ */
+static inline size_t
+rbimpl_size_add_or_raise(size_t x, size_t y)
+{
+    struct rbimpl_size_overflow_tag size =
+        rbimpl_size_add_overflow(x, y);
+
+    if (RB_LIKELY(!size.overflowed)) {
+        return size.result;
+    }
+    else {
+        ruby_malloc_add_size_overflow(x, y);
         RBIMPL_UNREACHABLE_RETURN(0);
     }
 }
@@ -637,14 +694,12 @@ rbimpl_size_mul_or_raise(size_t x, size_t y)
  * We might want to deprecate this function and make a `rbimpl_` counterpart.
  */
 static inline void *
-rb_alloc_tmp_buffer2(volatile VALUE *store, long count, size_t elsize)
+rb_alloc_tmp_buffer2(volatile VALUE *store, rb_len_t count, size_t elsize)
 {
-    const size_t total_size = rbimpl_size_mul_or_raise(count, elsize);
-    const size_t cnt = (total_size + sizeof(VALUE) - 1) / sizeof(VALUE);
-    return rb_alloc_tmp_buffer_with_count(store, total_size, cnt);
+    const size_t total_size = rbimpl_size_mul_or_raise(RBIMPL_CAST((size_t)count), elsize);
+    return rb_alloc_tmp_buffer(store, (rb_len_t)total_size, elsize >= sizeof(VALUE));
 }
 
-#if ! defined(__MINGW32__) && ! defined(__DOXYGEN__)
 RBIMPL_SYMBOL_EXPORT_BEGIN()
 RBIMPL_ATTR_NOALIAS()
 RBIMPL_ATTR_NONNULL((1))
@@ -663,8 +718,5 @@ ruby_nonempty_memcpy(void *dest, const void *src, size_t n)
     }
 }
 RBIMPL_SYMBOL_EXPORT_END()
-#undef memcpy
-#define memcpy ruby_nonempty_memcpy
-#endif
 
 #endif /* RBIMPL_MEMORY_H */

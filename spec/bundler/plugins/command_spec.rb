@@ -18,7 +18,7 @@ RSpec.describe "command plugins" do
       end
     end
 
-    bundle "plugin install command-mah --source #{file_uri_for(gem_repo2)}"
+    bundle "plugin install command-mah --source https://gem.repo2"
   end
 
   it "executes without arguments" do
@@ -29,7 +29,7 @@ RSpec.describe "command plugins" do
   end
 
   it "accepts the arguments" do
-    build_repo2 do
+    update_repo2 do
       build_plugin "the-echoer" do |s|
         s.write "plugins.rb", <<-RUBY
           module Resonance
@@ -46,15 +46,49 @@ RSpec.describe "command plugins" do
       end
     end
 
-    bundle "plugin install the-echoer --source #{file_uri_for(gem_repo2)}"
+    bundle "plugin install the-echoer --source https://gem.repo2"
     expect(out).to include("Installed plugin the-echoer")
 
     bundle "echo tacos tofu lasange"
     expect(out).to eq("You gave me tacos, tofu, lasange")
   end
 
+  it "passes help flag to plugin" do
+    update_repo2 do
+      build_plugin "helpful" do |s|
+        s.write "plugins.rb", <<-RUBY
+          module Helpful
+            class Command
+              Bundler::Plugin::API.command "greet", self
+
+              def exec(command, args)
+                if args.include?("--help") || args.include?("-h")
+                  puts "Usage: bundle greet [NAME]"
+                else
+                  puts "Hello"
+                end
+              end
+            end
+          end
+        RUBY
+      end
+    end
+
+    bundle "plugin install helpful --source https://gem.repo2"
+    expect(out).to include("Installed plugin helpful")
+
+    bundle "greet --help"
+    expect(out).to eq("Usage: bundle greet [NAME]")
+
+    bundle "greet -h"
+    expect(out).to eq("Usage: bundle greet [NAME]")
+
+    bundle "help greet"
+    expect(out).to eq("Usage: bundle greet [NAME]")
+  end
+
   it "raises error on redeclaration of command" do
-    build_repo2 do
+    update_repo2 do
       build_plugin "copycat" do |s|
         s.write "plugins.rb", <<-RUBY
           module CopyCat
@@ -69,7 +103,7 @@ RSpec.describe "command plugins" do
       end
     end
 
-    bundle "plugin install copycat --source #{file_uri_for(gem_repo2)}", :raise_on_error => false
+    bundle "plugin install copycat --source https://gem.repo2", raise_on_error: false
 
     expect(out).not_to include("Installed plugin copycat")
 

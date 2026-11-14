@@ -1,6 +1,5 @@
 # frozen_string_literal: true
 require_relative 'helper'
-require 'date'
 
 module Psych
   class TestDateTime < TestCase
@@ -44,6 +43,26 @@ module Psych
       assert_match(/12:00:00-05:00/,  cycled.last.to_s)
     end
 
+    def test_julian_date
+      d = Date.new(1582, 10, 4, Date::GREGORIAN)
+      assert_cycle d
+    end
+
+    def test_proleptic_gregorian_date
+      d = Date.new(1582, 10, 14, Date::GREGORIAN)
+      assert_cycle d
+    end
+
+    def test_julian_datetime
+      dt = DateTime.new(1582, 10, 4, 23, 58, 59, 0, Date::GREGORIAN)
+      assert_cycle dt
+    end
+
+    def test_proleptic_gregorian_datetime
+      dt = DateTime.new(1582, 10, 14, 23, 58, 59, 0, Date::GREGORIAN)
+      assert_cycle dt
+    end
+
     def test_invalid_date
       assert_cycle "2013-10-31T10:40:07-000000000000033"
     end
@@ -65,6 +84,21 @@ module Psych
       yaml = Psych.dump h
       assert_match('&', yaml)
       assert_match('*', yaml)
+    end
+
+    def test_overwritten_to_s
+      pend "Failing on JRuby" if RUBY_PLATFORM =~ /java/
+      s = Psych.dump(Date.new(2023, 9, 2), permitted_classes: [Date])
+      assert_separately(%W[-rpsych -rdate - #{s}], "#{<<~"begin;"}\n#{<<~'end;'}")
+      class Date
+        undef to_s
+        def to_s; strftime("%D"); end
+      end
+      expected = ARGV.shift
+      begin;
+        s = Psych.dump(Date.new(2023, 9, 2), permitted_classes: [Date])
+        assert_equal(expected, s)
+      end;
     end
   end
 end

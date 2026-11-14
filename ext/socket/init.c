@@ -27,6 +27,7 @@ VALUE rb_cSocket;
 VALUE rb_cAddrinfo;
 
 VALUE rb_eSocket;
+VALUE rb_eResolution;
 
 #ifdef SOCKS
 VALUE rb_cSOCKSSocket;
@@ -34,24 +35,34 @@ VALUE rb_cSOCKSSocket;
 
 int rsock_do_not_reverse_lookup = 1;
 static VALUE sym_wait_readable;
+static ID id_error_code;
 
 void
-rsock_raise_socket_error(const char *reason, int error)
+rsock_raise_resolution_error_for_host(const char *reason, int error, VALUE host)
 {
 #ifdef EAI_SYSTEM
     int e;
     if (error == EAI_SYSTEM && (e = errno) != 0)
-	rb_syserr_fail(e, reason);
+        rb_syserr_fail(e, reason);
 #endif
+
 #ifdef _WIN32
     rb_encoding *enc = rb_default_internal_encoding();
     VALUE msg = rb_sprintf("%s: ", reason);
     if (!enc) enc = rb_default_internal_encoding();
     rb_str_concat(msg, rb_w32_conv_from_wchar(gai_strerrorW(error), enc));
-    rb_exc_raise(rb_exc_new_str(rb_eSocket, msg));
 #else
-    rb_raise(rb_eSocket, "%s: %s", reason, gai_strerror(error));
+    VALUE msg = rb_sprintf("%s: %s", reason, gai_strerror(error));
 #endif
+
+    if (RTEST(host)) {
+        rb_str_catf(msg, " %+"PRIsVALUE, host);
+    }
+
+    StringValue(msg);
+    VALUE self = rb_class_new_instance(1, &msg, rb_eResolution);
+    rb_ivar_set(self, id_error_code, INT2NUM(error));
+    rb_exc_raise(self);
 }
 
 #if defined __APPLE__
@@ -71,12 +82,19 @@ rsock_init_sock(VALUE sock, int fd)
     fp->mode = FMODE_READWRITE|FMODE_DUPLEX;
     rb_io_ascii8bit_binmode(sock);
     if (rsock_do_not_reverse_lookup) {
-	fp->mode |= FMODE_NOREVLOOKUP;
+        fp->mode |= FMODE_NOREVLOOKUP;
     }
     rb_io_synchronized(fp);
 
     return sock;
 }
+
+#ifdef _WIN32
+/* Winsock takes the length as int; the caller sees a short write. */
+# define SEND_LENGTH(str) (int)(RSTRING_LEN(str) > INT_MAX ? INT_MAX : RSTRING_LEN(str))
+#else
+# define SEND_LENGTH(str) RSTRING_LEN(str)
+#endif
 
 VALUE
 rsock_sendto_blocking(void *data)
@@ -84,8 +102,8 @@ rsock_sendto_blocking(void *data)
     struct rsock_send_arg *arg = data;
     VALUE mesg = arg->mesg;
     ssize_t ret;
-    do_write_retry(sendto(arg->fd, RSTRING_PTR(mesg), RSTRING_LEN(mesg),
-			  arg->flags, arg->to, arg->tolen));
+    do_write_retry(sendto(arg->fd, RSTRING_PTR(mesg), SEND_LENGTH(mesg),
+                          arg->flags, arg->to, arg->tolen));
     return (VALUE)ret;
 }
 
@@ -95,12 +113,13 @@ rsock_send_blocking(void *data)
     struct rsock_send_arg *arg = data;
     VALUE mesg = arg->mesg;
     ssize_t ret;
-    do_write_retry(send(arg->fd, RSTRING_PTR(mesg), RSTRING_LEN(mesg),
-			arg->flags));
+    do_write_retry(send(arg->fd, RSTRING_PTR(mesg), SEND_LENGTH(mesg),
+                        arg->flags));
     return (VALUE)ret;
 }
 
 struct recvfrom_arg {
+    rb_io_t *fptr;
     int fd, flags;
     VALUE str;
     size_t length;
@@ -116,6 +135,7 @@ recvfrom_blocking(void *data)
     ssize_t ret;
     ret = recvfrom(arg->fd, RSTRING_PTR(arg->str), arg->length,
                    arg->flags, &arg->buf.addr, &arg->alen);
+
     if (ret != -1 && len0 < arg->alen)
         arg->alen = len0;
 
@@ -125,16 +145,16 @@ recvfrom_blocking(void *data)
 static VALUE
 rsock_strbuf(VALUE str, long buflen)
 {
-    long len;
+    rb_len_t len;
 
     if (NIL_P(str)) return rb_str_new(0, buflen);
 
     StringValue(str);
     len = RSTRING_LEN(str);
     if (len >= buflen) {
-	rb_str_modify(str);
+        rb_str_modify(str);
     } else {
-	rb_str_modify_expand(str, buflen - len);
+        rb_str_modify_expand(str, buflen - len);
     }
     return str;
 }
@@ -144,7 +164,19 @@ recvfrom_locktmp(VALUE v)
 {
     struct recvfrom_arg *arg = (struct recvfrom_arg *)v;
 
-    return rb_thread_io_blocking_region(recvfrom_blocking, arg, arg->fd);
+    return rb_io_blocking_region(arg->fptr, recvfrom_blocking, arg);
+}
+
+int
+rsock_is_dgram(rb_io_t *fptr)
+{
+    int socktype;
+    socklen_t optlen = (socklen_t)sizeof(socktype);
+    int ret = getsockopt(fptr->fd, SOL_SOCKET, SO_TYPE, (void*)&socktype, &optlen);
+    if (ret == -1) {
+        rb_sys_fail("getsockopt(SO_TYPE)");
+    }
+    return socktype == SOCK_DGRAM;
 }
 
 VALUE
@@ -173,6 +205,7 @@ rsock_s_recvfrom(VALUE socket, int argc, VALUE *argv, enum sock_recv_type from)
         rb_raise(rb_eIOError, "recv for buffered IO");
     }
 
+    arg.fptr = fptr;
     arg.fd = fptr->fd;
     arg.alen = (socklen_t)sizeof(arg.buf);
     arg.str = str;
@@ -185,11 +218,15 @@ rsock_s_recvfrom(VALUE socket, int argc, VALUE *argv, enum sock_recv_type from)
         rb_io_wait(fptr->self, RB_INT2NUM(RUBY_IO_READABLE), Qnil);
 #endif
 
-        slen = (long)rb_str_locktmp_ensure(str, recvfrom_locktmp, (VALUE)&arg);
+        rb_str_locktmp(str);
+        slen = (long)rb_ensure(recvfrom_locktmp, (VALUE)&arg, rb_str_unlocktmp, str);
 
+        if (slen == 0 && !rsock_is_dgram(fptr)) {
+            return Qnil;
+        }
         if (slen >= 0) break;
 
-        if (!rb_io_maybe_wait_readable(errno, socket, Qnil))
+        if (!rb_io_maybe_wait_readable(errno, socket, RUBY_IO_TIMEOUT_DEFAULT))
             rb_sys_fail("recvfrom(2)");
     }
 
@@ -197,32 +234,32 @@ rsock_s_recvfrom(VALUE socket, int argc, VALUE *argv, enum sock_recv_type from)
     rb_str_set_len(str, slen);
     switch (from) {
       case RECV_RECV:
-	return str;
+        return str;
       case RECV_IP:
 #if 0
-	if (arg.alen != sizeof(struct sockaddr_in)) {
-	    rb_raise(rb_eTypeError, "sockaddr size differs - should not happen");
-	}
+        if (arg.alen != sizeof(struct sockaddr_in)) {
+            rb_raise(rb_eTypeError, "sockaddr size differs - should not happen");
+        }
 #endif
-	if (arg.alen && arg.alen != sizeof(arg.buf)) /* OSX doesn't return a from result for connection-oriented sockets */
-	    return rb_assoc_new(str, rsock_ipaddr(&arg.buf.addr, arg.alen, fptr->mode & FMODE_NOREVLOOKUP));
-	else
-	    return rb_assoc_new(str, Qnil);
+        if (arg.alen && arg.alen != sizeof(arg.buf)) /* OSX doesn't return a from result for connection-oriented sockets */
+            return rb_assoc_new(str, rsock_ipaddr(&arg.buf.addr, arg.alen, fptr->mode & FMODE_NOREVLOOKUP));
+        else
+            return rb_assoc_new(str, Qnil);
 
-#ifdef HAVE_SYS_UN_H
+#ifdef HAVE_TYPE_STRUCT_SOCKADDR_UN
       case RECV_UNIX:
         return rb_assoc_new(str, rsock_unixaddr(&arg.buf.un, arg.alen));
 #endif
       case RECV_SOCKET:
-	return rb_assoc_new(str, rsock_io_socket_addrinfo(socket, &arg.buf.addr, arg.alen));
+        return rb_assoc_new(str, rsock_io_socket_addrinfo(socket, &arg.buf.addr, arg.alen));
       default:
-	rb_bug("rsock_s_recvfrom called with bad value");
+        rb_bug("rsock_s_recvfrom called with bad value");
     }
 }
 
 VALUE
 rsock_s_recvfrom_nonblock(VALUE sock, VALUE len, VALUE flg, VALUE str,
-			  VALUE ex, enum sock_recv_type from)
+                          VALUE ex, enum sock_recv_type from)
 {
     rb_io_t *fptr;
     union_sockaddr buf;
@@ -245,35 +282,39 @@ rsock_s_recvfrom_nonblock(VALUE sock, VALUE len, VALUE flg, VALUE str,
 
     GetOpenFile(sock, fptr);
     if (rb_io_read_pending(fptr)) {
-	rb_raise(rb_eIOError, "recvfrom for buffered IO");
+        rb_raise(rb_eIOError, "recvfrom for buffered IO");
     }
     fd = fptr->fd;
 
     rb_io_check_closed(fptr);
 
     if (!MSG_DONTWAIT_RELIABLE)
-	rb_io_set_nonblock(fptr);
+        rb_io_set_nonblock(fptr);
 
     len0 = alen;
     slen = recvfrom(fd, RSTRING_PTR(str), buflen, flags, &buf.addr, &alen);
     if (slen != -1 && len0 < alen)
         alen = len0;
 
+    if (slen == 0 && !rsock_is_dgram(fptr)) {
+        return Qnil;
+    }
+
     if (slen < 0) {
-	int e = errno;
-	switch (e) {
-	  case EAGAIN:
+        int e = errno;
+        switch (e) {
+          case EAGAIN:
 #if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
-	  case EWOULDBLOCK:
+          case EWOULDBLOCK:
 #endif
             if (ex == Qfalse)
-		return sym_wait_readable;
+                return sym_wait_readable;
             rb_readwrite_syserr_fail(RB_IO_WAIT_READABLE, e, "recvfrom(2) would block");
-	}
-	rb_syserr_fail(e, "recvfrom(2)");
+        }
+        rb_syserr_fail(e, "recvfrom(2)");
     }
     if (slen != RSTRING_LEN(str)) {
-	rb_str_set_len(str, slen);
+        rb_str_set_len(str, slen);
     }
     switch (from) {
       case RECV_RECV:
@@ -324,31 +365,31 @@ rsock_read_nonblock(VALUE sock, VALUE length, VALUE buf, VALUE ex)
     GetOpenFile(sock, fptr);
 
     if (len == 0) {
-	rb_str_set_len(str, 0);
-	return str;
+        rb_str_set_len(str, 0);
+        return str;
     }
 
     ptr = RSTRING_PTR(str);
     n = read_buffered_data(ptr, len, fptr);
     if (n <= 0) {
-	n = (long)recv(fptr->fd, ptr, len, MSG_DONTWAIT);
-	if (n < 0) {
-	    int e = errno;
-	    if ((e == EWOULDBLOCK || e == EAGAIN)) {
-		if (ex == Qfalse) return sym_wait_readable;
-		rb_readwrite_syserr_fail(RB_IO_WAIT_READABLE,
-					 e, "read would block");
-	    }
-	    rb_syserr_fail_path(e, fptr->pathv);
-	}
+        n = (long)recv(fptr->fd, ptr, len, MSG_DONTWAIT);
+        if (n < 0) {
+            int e = errno;
+            if ((e == EWOULDBLOCK || e == EAGAIN)) {
+                if (ex == Qfalse) return sym_wait_readable;
+                rb_readwrite_syserr_fail(RB_IO_WAIT_READABLE,
+                                         e, "read would block");
+            }
+            rb_syserr_fail_path(e, fptr->pathv);
+        }
     }
     if (n != RSTRING_LEN(str)) {
-	rb_str_modify(str);
-	rb_str_set_len(str, n);
+        rb_str_modify(str);
+        rb_str_set_len(str, n);
     }
     if (n == 0) {
-	if (ex == Qfalse) return Qnil;
-	rb_eof_error();
+        if (ex == Qfalse) return Qnil;
+        rb_eof_error();
     }
 
     return str;
@@ -362,7 +403,7 @@ rsock_write_nonblock(VALUE sock, VALUE str, VALUE ex)
     long n;
 
     if (!RB_TYPE_P(str, T_STRING))
-	str = rb_obj_as_string(str);
+        str = rb_obj_as_string(str);
 
     sock = rb_io_get_write_io(sock);
     GetOpenFile(sock, fptr);
@@ -374,27 +415,27 @@ rsock_write_nonblock(VALUE sock, VALUE str, VALUE ex)
      * are not userspace-buffered in Ruby by default.
      */
     if (fptr->wbuf.len > 0) {
-	rb_io_flush(sock);
+        rb_io_flush(sock);
     }
 
 #ifdef __APPLE__
   again:
 #endif
-    n = (long)send(fptr->fd, RSTRING_PTR(str), RSTRING_LEN(str), MSG_DONTWAIT);
+    n = (long)send(fptr->fd, RSTRING_PTR(str), SEND_LENGTH(str), MSG_DONTWAIT);
     if (n < 0) {
-	int e = errno;
+        int e = errno;
 
 #ifdef __APPLE__
-	if (e == EPROTOTYPE) {
-	    goto again;
-	}
+        if (e == EPROTOTYPE) {
+            goto again;
+        }
 #endif
-	if (e == EWOULDBLOCK || e == EAGAIN) {
-	    if (ex == Qfalse) return sym_wait_writable;
-	    rb_readwrite_syserr_fail(RB_IO_WAIT_WRITABLE, e,
-				    "write would block");
-	}
-	rb_syserr_fail_path(e, fptr->pathv);
+        if (e == EWOULDBLOCK || e == EAGAIN) {
+            if (ex == Qfalse) return sym_wait_writable;
+            rb_readwrite_syserr_fail(RB_IO_WAIT_WRITABLE, e,
+                                     "write would block");
+        }
+        rb_syserr_fail_path(e, fptr->pathv);
     }
 
     return LONG2FIX(n);
@@ -433,9 +474,9 @@ rsock_socket(int domain, int type, int proto)
 
     fd = rsock_socket0(domain, type, proto);
     if (fd < 0) {
-       if (rb_gc_for_fd(errno)) {
-           fd = rsock_socket0(domain, type, proto);
-       }
+        if (rb_gc_for_fd(errno)) {
+            fd = rsock_socket0(domain, type, proto);
+        }
     }
     if (0 <= fd)
         rb_update_max_fd(fd);
@@ -444,10 +485,11 @@ rsock_socket(int domain, int type, int proto)
 
 /* emulate blocking connect behavior on EINTR or non-blocking socket */
 static int
-wait_connectable(int fd, struct timeval *timeout)
+wait_connectable(VALUE self, VALUE timeout, const struct sockaddr *sockaddr, int len)
 {
-    int sockerr, revents;
+    int sockerr;
     socklen_t sockerrlen;
+    int fd = rb_io_descriptor(self);
 
     sockerrlen = (socklen_t)sizeof(sockerr);
     if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *)&sockerr, &sockerrlen) < 0)
@@ -481,7 +523,15 @@ wait_connectable(int fd, struct timeval *timeout)
      *
      * Note: rb_wait_for_single_fd already retries on EINTR/ERESTART
      */
-    revents = rb_wait_for_single_fd(fd, RB_WAITFD_IN|RB_WAITFD_OUT, timeout);
+    VALUE result = rb_io_wait(self, RB_INT2NUM(RUBY_IO_READABLE|RUBY_IO_WRITABLE), timeout);
+
+    if (result == Qfalse) {
+        VALUE rai = rsock_addrinfo_new((struct sockaddr *)sockaddr, len, PF_UNSPEC, 0, 0, Qnil, Qnil);
+        VALUE addr_str = rsock_addrinfo_inspect_sockaddr(rai);
+        rb_raise(rb_eIOTimeoutError, "user specified timeout for %" PRIsVALUE, addr_str);
+    }
+
+    int revents = RB_NUM2INT(result);
 
     if (revents < 0)
         return -1;
@@ -492,16 +542,10 @@ wait_connectable(int fd, struct timeval *timeout)
 
     switch (sockerr) {
       case 0:
-      /*
-       * be defensive in case some platforms set SO_ERROR on the original,
-       * interrupted connect()
-       */
-
-	/* when the connection timed out, no errno is set and revents is 0. */
-	if (timeout && revents == 0) {
-	    errno = ETIMEDOUT;
-	    return -1;
-	}
+        /*
+         * be defensive in case some platforms set SO_ERROR on the original,
+         * interrupted connect()
+         */
       case EINTR:
 #ifdef ERESTART
       case ERESTART:
@@ -516,7 +560,7 @@ wait_connectable(int fd, struct timeval *timeout)
 #ifdef EISCONN
       case EISCONN:
 #endif
-	return 0; /* success */
+        return 0; /* success */
       default:
         /* likely (but not limited to): ECONNREFUSED, ETIMEDOUT, EHOSTUNREACH */
         errno = sockerr;
@@ -549,19 +593,19 @@ socks_connect_blocking(void *data)
 #endif
 
 int
-rsock_connect(int fd, const struct sockaddr *sockaddr, int len, int socks, struct timeval *timeout)
+rsock_connect(VALUE self, const struct sockaddr *sockaddr, int len, int socks, VALUE timeout)
 {
-    int status;
+    int descriptor = rb_io_descriptor(self);
     rb_blocking_function_t *func = connect_blocking;
-    struct connect_arg arg;
+    struct connect_arg arg = {.fd = descriptor, .sockaddr = sockaddr, .len = len};
 
-    arg.fd = fd;
-    arg.sockaddr = sockaddr;
-    arg.len = len;
+    rb_io_t *fptr;
+    RB_IO_POINTER(self, fptr);
+
 #if defined(SOCKS) && !defined(SOCKS5)
     if (socks) func = socks_connect_blocking;
 #endif
-    status = (int)BLOCKING_REGION_FD(func, &arg);
+    int status = (int)rb_io_blocking_region(fptr, func, &arg);
 
     if (status < 0) {
         switch (errno) {
@@ -573,7 +617,7 @@ rsock_connect(int fd, const struct sockaddr *sockaddr, int len, int socks, struc
 #ifdef EINPROGRESS
           case EINPROGRESS:
 #endif
-            return wait_connectable(fd, timeout);
+            return wait_connectable(self, timeout, sockaddr, len);
         }
     }
     return status;
@@ -634,27 +678,27 @@ cloexec_accept(int socket, struct sockaddr *address, socklen_t *address_len)
 
 VALUE
 rsock_s_accept_nonblock(VALUE klass, VALUE ex, rb_io_t *fptr,
-			struct sockaddr *sockaddr, socklen_t *len)
+                        struct sockaddr *sockaddr, socklen_t *len)
 {
     int fd2;
 
     rb_io_set_nonblock(fptr);
     fd2 = cloexec_accept(fptr->fd, (struct sockaddr*)sockaddr, len);
     if (fd2 < 0) {
-	int e = errno;
-	switch (e) {
-	  case EAGAIN:
+        int e = errno;
+        switch (e) {
+          case EAGAIN:
 #if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
-	  case EWOULDBLOCK:
+          case EWOULDBLOCK:
 #endif
-	  case ECONNABORTED:
+          case ECONNABORTED:
 #if defined EPROTO
-	  case EPROTO:
+          case EPROTO:
 #endif
             if (ex == Qfalse)
-		return sym_wait_readable;
+                return sym_wait_readable;
             rb_readwrite_syserr_fail(RB_IO_WAIT_READABLE, e, "accept(2) would block");
-	}
+        }
         rb_syserr_fail(e, "accept(2)");
     }
     rb_update_max_fd(fd2);
@@ -681,9 +725,9 @@ rsock_s_accept(VALUE klass, VALUE io, struct sockaddr *sockaddr, socklen_t *len)
     RB_IO_POINTER(io, fptr);
 
     struct accept_arg accept_arg = {
-      .fd = fptr->fd,
-      .sockaddr = sockaddr,
-      .len = len
+        .fd = fptr->fd,
+        .sockaddr = sockaddr,
+        .len = len
     };
 
     int retry = 0, peer;
@@ -692,7 +736,7 @@ rsock_s_accept(VALUE klass, VALUE io, struct sockaddr *sockaddr, socklen_t *len)
 #ifdef RSOCK_WAIT_BEFORE_BLOCKING
     rb_io_wait(fptr->self, RB_INT2NUM(RUBY_IO_READABLE), Qnil);
 #endif
-    peer = (int)BLOCKING_REGION_FD(accept_blocking, &accept_arg);
+    peer = (int)rb_io_blocking_region(fptr, accept_blocking, &accept_arg);
     if (peer < 0) {
         int error = errno;
 
@@ -705,7 +749,7 @@ rsock_s_accept(VALUE klass, VALUE io, struct sockaddr *sockaddr, socklen_t *len)
             retry = 1;
             goto retry;
           default:
-            if (!rb_io_maybe_wait_readable(error, io, Qnil)) break;
+            if (!rb_io_maybe_wait_readable(error, io, RUBY_IO_TIMEOUT_DEFAULT)) break;
             retry = 0;
             goto retry;
         }
@@ -730,11 +774,11 @@ rsock_getfamily(rb_io_t *fptr)
     if (cached) {
         switch (cached) {
 #ifdef AF_UNIX
-	    case FMODE_UNIX: return AF_UNIX;
+          case FMODE_UNIX: return AF_UNIX;
 #endif
-	    case FMODE_INET: return AF_INET;
-	    case FMODE_INET6: return AF_INET6;
-	}
+          case FMODE_INET: return AF_INET;
+          case FMODE_INET6: return AF_INET6;
+        }
     }
 
     ss.addr.sa_family = AF_UNSPEC;
@@ -752,6 +796,28 @@ rsock_getfamily(rb_io_t *fptr)
     return ss.addr.sa_family;
 }
 
+/*
+ * call-seq:
+ *   error_code     -> integer
+ *
+ * Returns the raw error code indicating the cause of the hostname resolution failure.
+ *
+ *    begin
+ *      Addrinfo.getaddrinfo("ruby-lang.org", nil)
+ *    rescue Socket::ResolutionError => e
+ *      if e.error_code == Socket::EAI_AGAIN
+ *        puts "Temporary failure in name resolution."
+ *      end
+ *    end
+ *
+ * Note that error codes depend on the operating system.
+ */
+static VALUE
+sock_resolv_error_code(VALUE self)
+{
+    return rb_attr_get(self, id_error_code);
+}
+
 void
 rsock_init_socket_init(void)
 {
@@ -759,6 +825,11 @@ rsock_init_socket_init(void)
      * SocketError is the error class for socket.
      */
     rb_eSocket = rb_define_class("SocketError", rb_eStandardError);
+    /*
+     * Socket::ResolutionError is the error class for hostname resolution.
+     */
+    rb_eResolution = rb_define_class_under(rb_cSocket, "ResolutionError", rb_eSocket);
+    rb_define_method(rb_eResolution, "error_code", sock_resolv_error_code, 0);
     rsock_init_ipsocket();
     rsock_init_tcpsocket();
     rsock_init_tcpserver();
@@ -771,6 +842,8 @@ rsock_init_socket_init(void)
     rsock_init_addrinfo();
     rsock_init_sockifaddr();
     rsock_init_socket_constants();
+
+    id_error_code = rb_intern_const("error_code");
 
 #undef rb_intern
     sym_wait_readable = ID2SYM(rb_intern("wait_readable"));

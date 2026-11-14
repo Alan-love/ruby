@@ -4,7 +4,7 @@
 
 struct sort_data {
     rb_encoding *enc;
-    long elsize;
+    rb_len_t elsize;
 };
 
 static int
@@ -29,28 +29,28 @@ static VALUE
 bug_str_qsort_bang(int argc, VALUE *argv, VALUE str)
 {
     VALUE beg, len, size;
-    long l, b = 0, n, s = 1;
+    rb_len_t l, b = 0, n, s = 1;
     struct sort_data d;
 
     rb_scan_args(argc, argv, "03", &beg, &len, &size);
     l = RSTRING_LEN(str);
     if (!NIL_P(beg) && (b = NUM2INT(beg)) < 0 && (b += l) < 0) {
-	rb_raise(rb_eArgError, "out of bounds");
+        rb_raise(rb_eArgError, "out of bounds");
     }
     if (!NIL_P(size) && (s = NUM2INT(size)) < 0) {
-	rb_raise(rb_eArgError, "negative size");
+        rb_raise(rb_eArgError, "negative size");
     }
     if (NIL_P(len) ||
-	(((n = NUM2INT(len)) < 0) ?
-	 (rb_raise(rb_eArgError, "negative length"), 0) :
-	 (b + n * s > l))) {
-	n = (l - b) / s;
+        (((n = NUM2INT(len)) < 0) ?
+         (rb_raise(rb_eArgError, "negative length"), 0) :
+         (b + n * s > l))) {
+        n = (l - b) / s;
     }
     rb_str_modify(str);
     d.enc = rb_enc_get(str);
     d.elsize = s;
     ruby_qsort(RSTRING_PTR(str) + b, n, s,
-	       rb_block_given_p() ? cmp_1 : cmp_2, &d);
+               rb_block_given_p() ? cmp_1 : cmp_2, &d);
     return str;
 }
 

@@ -1,8 +1,6 @@
 # frozen_string_literal: true
 
-require_relative "compact_index"
-
-Artifice.deactivate
+require_relative "helpers/compact_index"
 
 class CompactIndexRateLimited < CompactIndexAPI
   class RequestCounter
@@ -34,7 +32,7 @@ class CompactIndexRateLimited < CompactIndexAPI
       if RequestCounter.size == 1
         etag_response do
           gem = gems.find {|g| g.name == params[:name] }
-          CompactIndex.info(gem ? gem.versions : [])
+          VendoredCompactIndex.info(gem ? gem.versions : [])
         end
       else
         status 429
@@ -44,5 +42,7 @@ class CompactIndexRateLimited < CompactIndexAPI
     end
   end
 end
+
+require_relative "helpers/artifice"
 
 Artifice.activate_with(CompactIndexRateLimited)

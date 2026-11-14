@@ -1,7 +1,8 @@
 # frozen_string_literal: true
 
 require_relative "base"
-require "cgi"
+require "cgi/escape"
+require "cgi/util" unless defined?(CGI::EscapeExt)
 
 module Bundler
   class Fetcher
@@ -24,7 +25,7 @@ module Bundler
       def specs(gem_names, full_dependency_list = [], last_spec_list = [])
         query_list = gem_names.uniq - full_dependency_list
 
-        log_specs "Query List: #{query_list.inspect}"
+        log_specs { "Query List: #{query_list.inspect}" }
 
         return last_spec_list if query_list.empty?
 
@@ -34,13 +35,9 @@ module Bundler
 
         returned_gems = spec_list.map(&:first).uniq
         specs(deps_list, full_dependency_list + returned_gems, spec_list + last_spec_list)
-      rescue MarshalError
+      rescue MarshalError, HTTPError, GemspecError
         Bundler.ui.info "" unless Bundler.ui.debug? # new line now that the dots are over
         Bundler.ui.debug "could not fetch from the dependency API, trying the full index"
-        nil
-      rescue HTTPError, GemspecError
-        Bundler.ui.info "" unless Bundler.ui.debug? # new line now that the dots are over
-        Bundler.ui.debug "could not fetch from the dependency API\nit's suggested to retry using the full index via `bundle install --full-index`"
         nil
       end
 
@@ -53,9 +50,9 @@ module Bundler
 
       def unmarshalled_dep_gems(gem_names)
         gem_list = []
-        gem_names.each_slice(Source::Rubygems::API_REQUEST_SIZE) do |names|
+        gem_names.each_slice(api_request_size) do |names|
           marshalled_deps = downloader.fetch(dependency_api_uri(names)).body
-          gem_list.concat(Bundler.load_marshal(marshalled_deps))
+          gem_list.concat(Bundler.safe_load_marshal(marshalled_deps))
         end
         gem_list
       end
@@ -76,6 +73,12 @@ module Bundler
         uri = fetch_uri + "api/v1/dependencies"
         uri.query = "gems=#{CGI.escape(gem_names.sort.join(","))}" if gem_names.any?
         uri
+      end
+
+      private
+
+      def api_request_size
+        Bundler.settings[:api_request_size]&.to_i || Source::Rubygems::API_REQUEST_SIZE
       end
     end
   end

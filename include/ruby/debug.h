@@ -10,6 +10,7 @@
  *             modify this file, provided that  the conditions mentioned in the
  *             file COPYING are met.  Consult the file for details.
  */
+#include "ruby/internal/attr/deprecated.h"
 #include "ruby/internal/attr/nonnull.h"
 #include "ruby/internal/attr/returns_nonnull.h"
 #include "ruby/internal/dllexport.h"
@@ -49,6 +50,25 @@ RBIMPL_ATTR_NONNULL((3))
  * `const struct rb_callable_method_entry_struct *`.
  */
 int rb_profile_frames(int start, int limit, VALUE *buff, int *lines);
+
+/**
+ * Queries mysterious "frame"s of the given range.
+ *
+ * A per-thread version of rb_profile_frames().
+ * Arguments and return values are the same with rb_profile_frames() with the
+ * exception of the first argument _thread_, which accepts the Thread to be
+ * profiled/queried.
+ *
+ * @param[in]   thread The Ruby Thread to be profiled.
+ * @param[in]   start  Start position (0 means the topmost).
+ * @param[in]   limit  Number objects of `buff`.
+ * @param[out]  buff   Return buffer.
+ * @param[out]  lines  Return buffer.
+ * @return      Number of objects filled into `buff`.
+ * @post        `buff` is filled with backtrace pointers.
+ * @post        `lines` is filled with `__LINE__` of each backtraces.
+ */
+int rb_profile_thread_frames(VALUE thread, int start, int limit, VALUE *buff, int *lines);
 
 /**
  * Queries the path of the passed backtrace.
@@ -207,6 +227,17 @@ typedef VALUE (*rb_debug_inspector_func_t)(const rb_debug_inspector_t *dc, void 
 VALUE rb_debug_inspector_open(rb_debug_inspector_func_t func, void *data);
 
 /**
+ * Queries  the backtrace  object  of the  context.   This is  as  if you  call
+ * `caller_locations` at the point of debugger.
+ *
+ * @param[in]  dc  A debug context.
+ * @return     An array  of `Thread::Backtrace::Location` which  represents the
+ *             current point of execution at `dc`.
+
+ */
+VALUE rb_debug_inspector_backtrace_locations(const rb_debug_inspector_t *dc);
+
+/**
  * Queries the current receiver of the passed context's upper frame.
  *
  * @param[in]  dc           A debug context.
@@ -214,7 +245,7 @@ VALUE rb_debug_inspector_open(rb_debug_inspector_func_t func, void *data);
  * @exception  rb_eArgError `index` out of range.
  * @return     The current receiver at `index`-th frame.
  */
-VALUE rb_debug_inspector_frame_self_get(const rb_debug_inspector_t *dc, long index);
+VALUE rb_debug_inspector_frame_self_get(const rb_debug_inspector_t *dc, rb_len_t index);
 
 /**
  * Queries the current class of the passed context's upper frame.
@@ -224,7 +255,7 @@ VALUE rb_debug_inspector_frame_self_get(const rb_debug_inspector_t *dc, long ind
  * @exception  rb_eArgError `index` out of range.
  * @return     The current class at `index`-th frame.
  */
-VALUE rb_debug_inspector_frame_class_get(const rb_debug_inspector_t *dc, long index);
+VALUE rb_debug_inspector_frame_class_get(const rb_debug_inspector_t *dc, rb_len_t index);
 
 /**
  * Queries the binding of the passed context's upper frame.
@@ -234,7 +265,7 @@ VALUE rb_debug_inspector_frame_class_get(const rb_debug_inspector_t *dc, long in
  * @exception  rb_eArgError `index` out of range.
  * @return     The binding at `index`-th frame.
  */
-VALUE rb_debug_inspector_frame_binding_get(const rb_debug_inspector_t *dc, long index);
+VALUE rb_debug_inspector_frame_binding_get(const rb_debug_inspector_t *dc, rb_len_t index);
 
 /**
  * Queries the instruction sequence of the passed context's upper frame.
@@ -247,18 +278,30 @@ VALUE rb_debug_inspector_frame_binding_get(const rb_debug_inspector_t *dc, long 
  *                          represents the  instruction sequence  at `index`-th
  *                          frame.
  */
-VALUE rb_debug_inspector_frame_iseq_get(const rb_debug_inspector_t *dc, long index);
+VALUE rb_debug_inspector_frame_iseq_get(const rb_debug_inspector_t *dc, rb_len_t index);
 
 /**
- * Queries  the backtrace  object  of the  context.   This is  as  if you  call
- * `caller_locations` at the point of debugger.
+ * Queries the depth of the passed context's upper frame.
  *
- * @param[in]  dc  A debug context.
- * @return     An array  of `Thread::Backtrace::Location` which  represents the
- *             current point of execution at `dc`.
-
+ * Note that the depth is not same as the frame index because debug_inspector
+ * skips some special frames but the depth counts all frames.
+ *
+ * @param[in]  dc           A debug context.
+ * @param[in]  index        Index of the frame from top to bottom.
+ * @exception  rb_eArgError `index` out of range.
+ * @retval     The depth at `index`-th frame in Integer.
  */
-VALUE rb_debug_inspector_backtrace_locations(const rb_debug_inspector_t *dc);
+VALUE rb_debug_inspector_frame_depth(const rb_debug_inspector_t *dc, rb_len_t index);
+
+// A macro to recognize `rb_debug_inspector_frame_depth()` is available or not
+#define RB_DEBUG_INSPECTOR_FRAME_DEPTH(dc, index) rb_debug_inspector_frame_depth(dc, index)
+
+/**
+ * Return current frame depth.
+ *
+ * @retval     The depth of the current frame in Integer.
+ */
+VALUE rb_debug_inspector_current_depth(void);
 
 /** @} */
 
@@ -436,7 +479,7 @@ RBIMPL_ATTR_RETURNS_NONNULL()
  */
 rb_trace_arg_t *rb_tracearg_from_tracepoint(VALUE tpval);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the event of the passed trace.
  *
@@ -445,7 +488,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 rb_event_flag_t rb_tracearg_event_flag(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Identical to  rb_tracearg_event_flag(), except  it returns  the name  of the
  * event in Ruby's symbol.
@@ -455,7 +498,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_event(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the line of the point where the trace is at.
  *
@@ -465,7 +508,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_lineno(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the file name of the point where the trace is at.
  *
@@ -475,7 +518,19 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_path(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
+/**
+ *
+ * Queries the parameters passed on a call or return event.
+ *
+ * @param[in]  trace_arg         A trace instance
+ * @exception  rb_eRuntimeError  The tracing event does not support querying parameters.
+ * @return     Array of parameters in the format of `Method#parameters`.
+ *
+ */
+VALUE rb_tracearg_parameters(rb_trace_arg_t *trace_arg);
+
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the method name of the point where the trace is at.
  *
@@ -485,7 +540,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_method_id(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Identical  to  rb_tracearg_method_id(), except  it  returns  callee id  like
  * rb_frame_callee().
@@ -496,7 +551,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_callee_id(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the class that defines the method that the passed trace is at.  This
  * can be different from the class of rb_tracearg_self()'s return value because
@@ -508,7 +563,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_defined_class(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Creates a binding object of the point where the trace is at.
  *
@@ -523,7 +578,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_binding(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the receiver of the point trace is at.
  *
@@ -532,7 +587,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_self(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the return value that the trace represents.
  *
@@ -542,7 +597,7 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_return_value(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the raised exception that the trace represents.
  *
@@ -552,7 +607,33 @@ RBIMPL_ATTR_NONNULL(())
  */
 VALUE rb_tracearg_raised_exception(rb_trace_arg_t *trace_arg);
 
-RBIMPL_ATTR_NONNULL(())
+RBIMPL_ATTR_NONNULL((1))
+/**
+ * Queries the compiled source code of the 'script_compiled' event.
+ * If loaded from a file, it will return nil.
+ *
+ * @param[in]  trace_arg         A trace instance
+ * @exception  rb_eRuntimeError  The tracing event is not 'script_compiled'.
+ * @retval     RUBY_Qnil         The script was loaded from a file.
+ * @retval     otherwise         The compiled source code.
+ *
+ */
+VALUE rb_tracearg_eval_script(rb_trace_arg_t *trace_arg);
+
+RBIMPL_ATTR_NONNULL((1))
+/**
+ *
+ * Queries the compiled instruction sequence on a 'script_compiled' event.
+ * Note that this method is MRI specific.
+ *
+ * @param[in]  trace_arg         A trace instance
+ * @exception  rb_eRuntimeError  The tracing event is not 'script_compiled'.
+ * @return     The `RubyVM::InstructionSequence` object representing the instruction sequence.
+ *
+ */
+VALUE rb_tracearg_instruction_sequence(rb_trace_arg_t *trace_arg);
+
+RBIMPL_ATTR_NONNULL((1))
 /**
  * Queries the allocated/deallocated object that the trace represents.
  *
@@ -573,49 +654,105 @@ VALUE rb_tracearg_object(rb_trace_arg_t *trace_arg);
 
 /*
  * Postponed Job API
- * rb_postponed_job_register and rb_postponed_job_register_one are
- * async-signal-safe and used via SIGPROF by the "stackprof" RubyGem
+ *
+ * This API is designed to be called from contexts where it is not safe to run Ruby
+ * code (e.g. because they do not hold the GVL or because GC is in progress), and
+ * defer a callback to run in a context where it _is_ safe. The primary intended
+ * users of this API is for sampling profilers like the "stackprof" gem; these work
+ * by scheduling the periodic delivery of a SIGPROF signal, and inside the C-level
+ * signal handler, deferring a job to collect a Ruby backtrace when it is next safe
+ * to do so.
+ *
+ * Ruby maintains a small, fixed-size postponed job table. An extension using this
+ * API should first call `rb_postponed_job_preregister` to register a callback
+ * function in this table and obtain a handle of type `rb_postponed_job_handle_t`
+ * to it. Subsequently, the callback can be triggered  by calling
+ * `rb_postponed_job_trigger` with that handle, or the `data` associated with the
+ * callback function can be changed by calling `rb_postponed_job_preregister` again.
+ *
+ * Because the postponed job table is quite small (it only has 32 entries on most
+ * common systems), extensions should generally only preregister one or two `func`
+ * values.
+ *
+ * Historically, this API provided two functions `rb_postponed_job_register` and
+ * `rb_postponed_job_register_one`, which claimed to be fully async-signal-safe and
+ * would call back the provided `func` and `data` at an appropriate time. However,
+ * these functions were subject to race conditions which could cause crashes when
+ * racing with Ruby's internal use of them. These two functions are still present,
+ * but are marked as deprecated and have slightly changed semantics:
+ *
+ * * rb_postponed_job_register now works like rb_postponed_job_register_one i.e.
+ *   `func` will only be executed at most one time each time Ruby checks for
+ *   interrupts, no matter how many times it is registered
+ * * They are also called with the last `data` to be registered, not the first
+ *   (which is how rb_postponed_job_register_one previously worked)
  */
+
 
 /**
  * Type of postponed jobs.
  *
- * @param[in,out]  arg What was passed to rb_postponed_job_register().
+ * @param[in,out]  arg What was passed to `rb_postponed_job_preregister`
  */
 typedef void (*rb_postponed_job_func_t)(void *arg);
 
 /**
- * Registers a postponed job.
- *
- * There  are situations  when running  a ruby  program is  not possible.   For
- * instance when  a program is in  a signal handler; for  another instance when
- * the GC  is busy.   On such situations  however, there might  be needs  to do
- * something.  We cannot but defer such operations until we are 100% sure it is
- * safe  to execute  them.   This  mechanism is  called  postponed jobs.   This
- * function  registers a  new one.   The registered  job would  eventually gets
- * executed.
- *
- * @param[in]      flags      (Unused) reserved for future extensions.
- * @param[in]      func       Job body.
- * @param[in,out]  data       Passed as-is to `func`.
- * @retval         0          Postponed job buffer is full.  Failed.
- * @retval         otherwise  Opaque return value.
- * @post           The passed job is postponed.
+ * The type of a handle returned from `rb_postponed_job_preregister` and
+ * passed to `rb_postponed_job_trigger`
  */
-int rb_postponed_job_register(unsigned int flags, rb_postponed_job_func_t func, void *data);
+typedef unsigned int rb_postponed_job_handle_t;
+#define POSTPONED_JOB_HANDLE_INVALID ((rb_postponed_job_handle_t)UINT_MAX)
 
 /**
- * Identical to rb_postponed_job_register_one(),  except it additionally checks
- * for  duplicated registration.   In case  the passed  job is  already in  the
- * postponed job buffer this function does nothing.
+ * Pre-registers a func in Ruby's postponed job preregistration table,
+ * returning an opaque handle which can be used to trigger the job later. Generally,
+ * this function will be called during the initialization routine of an extension.
  *
- * @param[in]      flags      (Unused) reserved for future extensions.
- * @param[in]      func       Job body.
- * @param[in,out]  data       Passed as-is to `func`.
- * @retval         0          Postponed job buffer is full.  Failed.
- * @retval         otherwise  Opaque return value.
+ * The returned handle can be used later to call `rb_postponed_job_trigger`. This will
+ * cause Ruby to call back into the registered `func` with `data` at a later time, in
+ * a context where the GVL is held and it is safe to perform Ruby allocations.
+ *
+ * If the given `func` was already pre-registered, this function will overwrite the
+ * stored data with the newly passed data, and return the same handle instance as
+ * was previously returned.
+ *
+ * If this function is called concurrently with the same `func`, then the stored data
+ * could be the value from either call (but will definitely be one of them).
+ *
+ * If this function is called to update the data concurrently with a call to
+ * `rb_postponed_job_trigger` on the same handle, it's undefined whether `func` will
+ * be called with the old data or the new data.
+ *
+ * Although the current implementation of this function is in fact async-signal-safe and
+ * has defined semantics when called concurrently on the same `func`, a future Ruby
+ * version might require that this method be called under the GVL; thus, programs which
+ * aim to be forward-compatible should call this method whilst holding the GVL.
+ *
+ * @param[in]   flags       Unused and ignored
+ * @param[in]   func        The function to be pre-registered
+ * @param[in]   data        The data to be pre-registered
+ * @retval      POSTPONED_JOB_HANDLE_INVALID    The job table is full; this registration
+ *                          did not succeed and no further registration will do so for
+ *                          the lifetime of the program.
+ * @retval      otherwise   A handle which can be passed to `rb_postponed_job_trigger`
  */
-int rb_postponed_job_register_one(unsigned int flags, rb_postponed_job_func_t func, void *data);
+rb_postponed_job_handle_t rb_postponed_job_preregister(unsigned int flags, rb_postponed_job_func_t func, void *data);
+
+/**
+ * Triggers a pre-registered job registered with rb_postponed_job_preregister,
+ * scheduling it for execution the next time the Ruby VM checks for interrupts.
+ * The context in which the job is called in holds the GVL and is safe to perform
+ * Ruby allocations within (i.e. it is not during GC).
+ *
+ * This method is async-signal-safe and can be called from any thread, at any
+ * time, including in signal handlers.
+ *
+ * If this method is called multiple times, Ruby will coalesce this into only
+ * one call to the job the next time it checks for interrupts.
+ *
+ * @params[in]  h   A handle returned from rb_postponed_job_preregister
+ */
+void rb_postponed_job_trigger(rb_postponed_job_handle_t h);
 
 /** @} */
 

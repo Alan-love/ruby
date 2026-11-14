@@ -1,8 +1,6 @@
 # frozen_string_literal: true
 require 'test/unit'
 
-experimental, Warning[:experimental] = Warning[:experimental], false # suppress "warning: Pattern matching is experimental, and the behavior may change in future versions of Ruby!"
-eval "\n#{<<~'END_of_GUARD'}", binding, __FILE__, __LINE__
 class TestPatternMatching < Test::Unit::TestCase
   class NullFormatter
     def message_for(corrections)
@@ -11,14 +9,14 @@ class TestPatternMatching < Test::Unit::TestCase
   end
 
   def setup
-    if defined?(DidYouMean)
+    if defined?(DidYouMean.formatter=nil)
       @original_formatter = DidYouMean.formatter
       DidYouMean.formatter = NullFormatter.new
     end
   end
 
   def teardown
-    if defined?(DidYouMean)
+    if defined?(DidYouMean.formatter=nil)
       DidYouMean.formatter = @original_formatter
     end
   end
@@ -111,16 +109,12 @@ class TestPatternMatching < Test::Unit::TestCase
     end
 
     assert_block do
-      # suppress "warning: Pattern matching is experimental, and the behavior may change in future versions of Ruby!"
-      experimental, Warning[:experimental] = Warning[:experimental], false
       eval(%q{
         case true
         in a
           a
         end
       })
-    ensure
-      Warning[:experimental] = experimental
     end
 
     assert_block do
@@ -203,11 +197,152 @@ class TestPatternMatching < Test::Unit::TestCase
       end
     end
 
-    assert_syntax_error(%q{
+    assert_valid_syntax(%{
+      case 0
+      in [ :a | :b, x]
+        true
+      end
+    })
+
+    # a binding that precedes an unrelated alternative pattern is fine
+    assert_valid_syntax(%{
+      case 0
+      in [ x, :a | :b ]
+        true
+      end
+    })
+
+    assert_valid_syntax(%{
+      case 0
+      in { a: String => t, b: Integer | String }
+        true
+      end
+    })
+
+    assert_valid_syntax(%{
+      case 0
+      in [ one, "a" | "b" => two ]
+        true
+      end
+    })
+
+    assert_valid_syntax(%{
+      case 0
+      in [ x, (1 | 2), y ]
+        true
+      end
+    })
+
+    # a nested alternation on the right binds nothing either
+    assert_valid_syntax(%{
+      case 0
+      in [ x, 1 | [2 | 3] ]
+        true
+      end
+    })
+
+    # find pattern with anonymous rests
+    assert_valid_syntax(%{
+      case 0
+      in [ x, [*, 1, *] | 2 ]
+        true
+      end
+    })
+
+    # top-level array pattern without brackets
+    assert_valid_syntax(%{
+      case 0
+      in x, 1 | 2
+        true
+      end
+    })
+
+    # rightward assignment
+    assert_valid_syntax(%{
+      0 => [ x, 1 | 2 ]
+    })
+
+    assert_in_out_err(['-c'], %q{
+      case 0
+      in [ x, :a | y ]
+      end
+    }, [], /alternative pattern/,
+    success: false)
+
+    assert_in_out_err(['-c'], %q{
       case 0
       in a | 0
       end
-    }, /illegal variable in alternative pattern/)
+    }, [], /alternative pattern/,
+    success: false)
+
+    assert_in_out_err(['-c'], %q{
+      case 0
+      in 0 | a
+      end
+    }, [], /alternative pattern/,
+    success: false)
+
+    assert_in_out_err(['-c'], %q{
+      case 0
+      in { a: 1, **rest } | 1
+      end
+    }, [], /alternative pattern/,
+    success: false)
+
+    assert_in_out_err(['-c'], %q{
+      case 0
+      in 1 | { a: 1, **rest }
+      end
+    }, [], /alternative pattern/,
+    success: false)
+
+    # `**nil` binds nothing
+    assert_valid_syntax(%{
+      case 0
+      in { a: 1, **nil } | 1
+        true
+      end
+    })
+
+    # a `**rest` binding must not leak into an unrelated sibling alternation
+    assert_valid_syntax(%{
+      case 0
+      in [ { **rest }, 1 | 2 ]
+        true
+      end
+    })
+  end
+
+  def test_alternative_pattern_nested
+    assert_in_out_err(['-c'], %q{
+      case 0
+      in [a] | 1
+      end
+    }, [], /alternative pattern/,
+    success: false)
+
+    assert_in_out_err(['-c'], %q{
+      case 0
+      in { a: b } | 1
+      end
+    }, [], /alternative pattern/,
+    success: false)
+
+    assert_in_out_err(['-c'], %q{
+      case 0
+      in [{ a: [{ b: [{ c: }] }] }] | 1
+      end
+    }, [], /alternative pattern/,
+    success: false)
+
+    # still inside the outer alternation after a nested one
+    assert_in_out_err(['-c'], %q{
+      case 0
+      in 1 | [ 2 | 3, x ]
+      end
+    }, [], /alternative pattern/,
+    success: false)
   end
 
   def test_var_pattern
@@ -264,6 +399,18 @@ class TestPatternMatching < Test::Unit::TestCase
     assert_syntax_error(%q{
       case 0
       in a, {"a":}
+      end
+    }, /duplicated variable name/)
+
+    assert_syntax_error(%q{
+      case 0
+      in {a: x, **x}
+      end
+    }, /duplicated variable name/)
+
+    assert_syntax_error(%q{
+      case 0
+      in {a:, **a}
       end
     }, /duplicated variable name/)
 
@@ -355,6 +502,14 @@ END
     assert_block do
       case 'abc'
       in /a/
+        true
+      end
+    end
+
+    assert_block do
+      a = "abc"
+      case 'abc'
+      in /#{a}/o
         true
       end
     end
@@ -466,6 +621,8 @@ END
         true
       end
     end
+
+    assert_valid_syntax("1 in ^(1\n)")
   end
 
   def test_array_pattern
@@ -800,6 +957,10 @@ END
         true
       end
     end
+
+    assert_syntax_error(%q{
+      0 => [a, *a]
+    }, /duplicated variable name/)
   end
 
   def test_find_pattern
@@ -868,6 +1029,10 @@ END
         false
       end
     end
+
+    assert_syntax_error(%q{
+      0 => [*a, a, b, *b]
+    }, /duplicated variable name/)
   end
 
   def test_hash_pattern
@@ -1157,6 +1322,28 @@ END
       end
     end
 
+    bug18890 = assert_warning(/(?:.*:[47]: warning: possibly useless use of a literal in void context\n){2}/) do
+      eval("#{<<~';;;'}")
+      proc do |i|
+        case i
+        in a:
+          0 # line 4
+          a
+        in "b":
+          0 # line 7
+          b
+        else
+          false
+        end
+      end
+      ;;;
+    end
+    [{a: 42}, {b: 42}].each do |i|
+      assert_block('newline should be significant after pattern label') do
+        bug18890.call(i)
+      end
+    end
+
     assert_syntax_error(%q{
       case _
       in a:, a:
@@ -1297,7 +1484,7 @@ END
     end
 
     assert_block do
-      case {}
+      case C.new({})
       in {}
         C.keys == nil
       end
@@ -1550,20 +1737,16 @@ END
     assert_equal false, (1 in 2)
   end
 
-  def assert_experimental_warning(code)
-    w = Warning[:experimental]
+  def test_bug18990
+    {a: 0} => a:
+    assert_equal 0, a
+    {a: 0} => a:
+    assert_equal 0, a
 
-    Warning[:experimental] = false
-    assert_warn('') {eval(code)}
-
-    Warning[:experimental] = true
-    assert_warn(/is experimental/) {eval(code)}
-  ensure
-    Warning[:experimental] = w
-  end
-
-  def test_experimental_warning
-    assert_experimental_warning("case [0]; in [*, 0, *]; end")
+    {a: 0} in a:
+    assert_equal 0, a
+    {a: 0} in a:
+    assert_equal 0, a
   end
 
   ################################################################
@@ -1634,7 +1817,7 @@ END
       raise a # suppress "unused variable: a" warning
     end
 
-    assert_raise_with_message(NoMatchingPatternKeyError, "{:a=>0}: key not found: :aa") do
+    assert_raise_with_message(NoMatchingPatternKeyError, "{a: 0}: key not found: :aa") do
       {a: 0} => {aa:}
       raise aa # suppress "unused variable: aa" warning
     rescue NoMatchingPatternKeyError => e
@@ -1643,7 +1826,7 @@ END
       raise e
     end
 
-    assert_raise_with_message(NoMatchingPatternKeyError, "{:a=>{:b=>0}}: key not found: :bb") do
+    assert_raise_with_message(NoMatchingPatternKeyError, "{a: {b: 0}}: key not found: :bb") do
       {a: {b: 0}} => {a: {bb:}}
       raise bb # suppress "unused variable: bb" warning
     rescue NoMatchingPatternKeyError => e
@@ -1652,15 +1835,15 @@ END
       raise e
     end
 
-    assert_raise_with_message(NoMatchingPatternError, "{:a=>0}: 1 === 0 does not return true") do
+    assert_raise_with_message(NoMatchingPatternError, "{a: 0}: 1 === 0 does not return true") do
       {a: 0} => {a: 1}
     end
 
-    assert_raise_with_message(NoMatchingPatternError, "{:a=>0}: {:a=>0} is not empty") do
+    assert_raise_with_message(NoMatchingPatternError, "{a: 0}: {a: 0} is not empty") do
       {a: 0} => {}
     end
 
-    assert_raise_with_message(NoMatchingPatternError, "[{:a=>0}]: rest of {:a=>0} is not empty") do
+    assert_raise_with_message(NoMatchingPatternError, "[{a: 0}]: rest of {a: 0} is not empty") do
       [{a: 0}] => [{**nil}]
     end
   end
@@ -1693,5 +1876,3 @@ END
     end
   end
 end
-END_of_GUARD
-Warning[:experimental] = experimental

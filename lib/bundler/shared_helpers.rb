@@ -1,34 +1,37 @@
 # frozen_string_literal: true
 
-require "pathname"
-require "rbconfig"
-
 require_relative "version"
-require_relative "constants"
 require_relative "rubygems_integration"
 require_relative "current_ruby"
 
 module Bundler
+  autoload :WINDOWS, File.expand_path("constants", __dir__)
+  autoload :FREEBSD, File.expand_path("constants", __dir__)
+  autoload :NULL, File.expand_path("constants", __dir__)
+
   module SharedHelpers
     def root
       gemfile = find_gemfile
       raise GemfileNotFound, "Could not locate Gemfile" unless gemfile
-      Pathname.new(gemfile).tap{|x| x.untaint if RUBY_VERSION < "2.7" }.expand_path.parent
+      Pathname.new(gemfile).expand_path.parent
     end
 
     def default_gemfile
       gemfile = find_gemfile
       raise GemfileNotFound, "Could not locate Gemfile" unless gemfile
-      Pathname.new(gemfile).tap{|x| x.untaint if RUBY_VERSION < "2.7" }.expand_path
+      Pathname.new(gemfile).expand_path
     end
 
     def default_lockfile
+      given = ENV["BUNDLE_LOCKFILE"]
+      return Pathname.new(given) if given && !given.empty?
+
       gemfile = default_gemfile
 
       case gemfile.basename.to_s
       when "gems.rb" then Pathname.new(gemfile.sub(/.rb$/, ".locked"))
       else Pathname.new("#{gemfile}.lock")
-      end.tap{|x| x.untaint if RUBY_VERSION < "2.7" }
+      end
     end
 
     def default_bundle_dir
@@ -55,7 +58,7 @@ module Bundler
 
     def pwd
       Bundler.rubygems.ext_lock.synchronize do
-        Pathname.pwd
+        Dir.pwd
       end
     end
 
@@ -94,14 +97,17 @@ module Bundler
     #   given block
     #
     # @example
-    #   filesystem_access("vendor/cache", :write) do
+    #   filesystem_access("vendor/cache", :create) do
     #     FileUtils.mkdir_p("vendor/cache")
     #   end
     #
     # @see {Bundler::PermissionError}
     def filesystem_access(path, action = :write, &block)
-      yield(path.dup.tap{|x| x.untaint if RUBY_VERSION < "2.7" })
-    rescue Errno::EACCES
+      yield(path.dup)
+    rescue Errno::EACCES => e
+      path_basename = File.basename(path.to_s)
+      raise unless e.message.include?(path_basename) || action == :create
+
       raise PermissionError.new(path, action)
     rescue Errno::EAGAIN
       raise TemporaryResourceError.new(path, action)
@@ -111,26 +117,25 @@ module Bundler
       raise NoSpaceOnDeviceError.new(path, action)
     rescue Errno::ENOTSUP
       raise OperationNotSupportedError.new(path, action)
+    rescue Errno::EPERM
+      raise OperationNotPermittedError.new(path, action)
+    rescue Errno::EROFS
+      raise ReadOnlyFileSystemError.new(path, action)
     rescue Errno::EEXIST, Errno::ENOENT
       raise
     rescue SystemCallError => e
-      raise GenericSystemCallError.new(e, "There was an error accessing `#{path}`.")
+      raise GenericSystemCallError.new(e, "There was an error #{[:create, :write].include?(action) ? "creating" : "accessing"} `#{path}`.")
     end
 
-    def major_deprecation(major_version, message, print_caller_location: false)
-      if print_caller_location
-        caller_location = caller_locations(2, 2).first
-        message = "#{message} (called at #{caller_location.path}:#{caller_location.lineno})"
-      end
+    def feature_deprecated!(message)
+      return unless prints_major_deprecations?
 
-      bundler_major_version = Bundler.bundler_major_version
-      if bundler_major_version > major_version
-        require_relative "errors"
-        raise DeprecatedError, "[REMOVED] #{message}"
-      end
-
-      return unless bundler_major_version >= major_version && prints_major_deprecations?
       Bundler.ui.warn("[DEPRECATED] #{message}")
+    end
+
+    def feature_removed!(message)
+      require_relative "errors"
+      raise RemovedError, "[REMOVED] #{message}"
     end
 
     def print_major_deprecations!
@@ -141,7 +146,7 @@ module Bundler
       end
       return unless multiple_gemfiles
       message = "Multiple gemfiles (gems.rb and Gemfile) detected. " \
-                "Make sure you remove Gemfile and Gemfile.lock since bundler is ignoring them in favor of gems.rb and gems.rb.locked."
+                "Make sure you remove Gemfile and Gemfile.lock since bundler is ignoring them in favor of gems.rb and gems.locked."
       Bundler.ui.warn message
     end
 
@@ -156,14 +161,14 @@ module Bundler
       extra_deps = new_deps - old_deps
       return if extra_deps.empty?
 
-      Bundler.ui.debug "#{spec.full_name} from #{spec.remote} has either corrupted API or lockfile dependencies" \
+      Bundler.ui.debug "#{spec.full_name} from #{spec.remote} has corrupted API dependencies" \
         " (was expecting #{old_deps.map(&:to_s)}, but the real spec has #{new_deps.map(&:to_s)})"
       raise APIResponseMismatchError,
-        "Downloading #{spec.full_name} revealed dependencies not in the API or the lockfile (#{extra_deps.join(", ")})." \
-        "\nEither installing with `--full-index` or running `bundle update #{spec.name}` should fix the problem."
+        "Downloading #{spec.full_name} revealed dependencies not in the API (#{extra_deps.join(", ")})." \
+        "\nRunning `bundle update #{spec.name}` should fix the problem."
     end
 
-    def pretty_dependency(dep, print_source = false)
+    def pretty_dependency(dep)
       msg = String.new(dep.name)
       msg << " (#{dep.requirement})" unless dep.requirement == Gem::Requirement.default
 
@@ -172,7 +177,6 @@ module Bundler
         msg << " " << platform_string if !platform_string.empty? && platform_string != Gem::Platform::RUBY
       end
 
-      msg << " from the `#{dep.source}` source" if print_source && dep.source
       msg
     end
 
@@ -194,8 +198,53 @@ module Bundler
       Digest(name)
     end
 
+    def checksum_for_file(path, digest)
+      return unless path.file?
+      # This must use File.read instead of Digest.file().hexdigest
+      # because we need to preserve \n line endings on windows when calculating
+      # the checksum
+      SharedHelpers.filesystem_access(path, :read) do
+        File.open(path, "rb") do |f|
+          digest = SharedHelpers.digest(digest).new
+          buf = String.new(capacity: 16_384, encoding: Encoding::BINARY)
+          digest << buf while f.read(16_384, buf)
+          digest.hexdigest
+        end
+      end
+    end
+
     def write_to_gemfile(gemfile_path, contents)
       filesystem_access(gemfile_path) {|g| File.open(g, "w") {|file| file.puts contents } }
+    end
+
+    def relative_gemfile_path
+      relative_path_to(Bundler.default_gemfile)
+    end
+
+    def relative_lockfile_path
+      relative_path_to(Bundler.default_lockfile)
+    end
+
+    def relative_path_to(destination, from: pwd)
+      Pathname.new(destination).relative_path_from(from).to_s
+    rescue ArgumentError
+      # on Windows, if source and destination are on different drivers, there's no relative path from one to the other
+      destination
+    end
+
+    # Globs for entries matching +glob+ inside of +base_path+, returning
+    # absolute paths. Glob metacharacters in +base_path+ are not treated as
+    # part of the pattern, and matched entries are joined literally, so an
+    # entry starting with `~` is not expanded into the home directory.
+    #
+    # Bundler runs against whatever RubyGems the host provides, so this cannot
+    # delegate to Gem::Util.glob_files_in_dir, which only gained the literal
+    # join in RubyGems 4.1.
+    def glob_files_in_dir(glob, base_path)
+      expanded_path = nil
+      Dir.glob(glob, base: base_path).map! do |f|
+        File.join(expanded_path ||= File.expand_path(base_path), f)
+      end
     end
 
     private
@@ -236,20 +285,12 @@ module Bundler
 
     def search_up(*names)
       previous = nil
-      current  = File.expand_path(SharedHelpers.pwd).tap{|x| x.untaint if RUBY_VERSION < "2.7" }
+      current  = File.expand_path(SharedHelpers.pwd)
 
       until !File.directory?(current) || current == previous
-        if ENV["BUNDLE_SPEC_RUN"]
+        if ENV["BUNDLER_SPEC_RUN"]
           # avoid stepping above the tmp directory when testing
-          gemspec = if ENV["GEM_COMMAND"]
-            # for Ruby Core
-            "lib/bundler/bundler.gemspec"
-          else
-            "bundler.gemspec"
-          end
-
-          # avoid stepping above the tmp directory when testing
-          return nil if File.file?(File.join(current, gemspec))
+          return nil if File.directory?(File.join(current, "tmp"))
         end
 
         names.each do |name|
@@ -273,18 +314,43 @@ module Bundler
     public :set_env
 
     def set_bundle_variables
+      Bundler::SharedHelpers.set_env "BUNDLE_BIN_PATH", bundle_bin_path
+      Bundler::SharedHelpers.set_env "BUNDLE_GEMFILE", find_gemfile.to_s
+      Bundler::SharedHelpers.set_env "BUNDLE_LOCKFILE", default_lockfile.to_s
+      Bundler::SharedHelpers.set_env "BUNDLER_VERSION", Bundler::VERSION
+      Bundler::SharedHelpers.set_env "BUNDLER_SETUP", File.expand_path("setup", __dir__)
+    end
+
+    def bundle_bin_path
       # bundler exe & lib folders have same root folder, typical gem installation
-      exe_file = File.expand_path("../../../exe/bundle", __FILE__)
+      exe_file = File.join(source_root, "exe/bundle")
 
       # for Ruby core repository testing
-      exe_file = File.expand_path("../../../libexec/bundle", __FILE__) unless File.exist?(exe_file)
+      exe_file = File.join(source_root, "libexec/bundle") unless File.exist?(exe_file)
 
       # bundler is a default gem, exe path is separate
-      exe_file = Bundler.rubygems.bin_path("bundler", "bundle", VERSION) unless File.exist?(exe_file)
+      exe_file = Gem.bin_path("bundler", "bundle", VERSION) unless File.exist?(exe_file)
 
-      Bundler::SharedHelpers.set_env "BUNDLE_BIN_PATH", exe_file
-      Bundler::SharedHelpers.set_env "BUNDLE_GEMFILE", find_gemfile.to_s
-      Bundler::SharedHelpers.set_env "BUNDLER_VERSION", Bundler::VERSION
+      exe_file
+    end
+    public :bundle_bin_path
+
+    def gemspec_path
+      # inside a gem repository, typical gem installation
+      gemspec_file = File.join(source_root, "../../specifications/bundler-#{VERSION}.gemspec")
+
+      # for Ruby core repository testing
+      gemspec_file = File.expand_path("bundler.gemspec", __dir__) unless File.exist?(gemspec_file)
+
+      # bundler is a default gem
+      gemspec_file = File.join(Gem.default_specifications_dir, "bundler-#{VERSION}.gemspec") unless File.exist?(gemspec_file)
+
+      gemspec_file
+    end
+    public :gemspec_path
+
+    def source_root
+      File.expand_path("../..", __dir__)
     end
 
     def set_path
@@ -296,8 +362,13 @@ module Bundler
 
     def set_rubyopt
       rubyopt = [ENV["RUBYOPT"]].compact
-      setup_require = "-r#{File.expand_path("setup", __dir__)}"
-      return if !rubyopt.empty? && rubyopt.first =~ /#{setup_require}/
+      setup_path = File.expand_path("setup", __dir__)
+      # RUBYOPT is split on whitespace with no quoting mechanism, so an
+      # absolute path containing spaces would be torn apart. Fall back to
+      # requiring by feature name; set_rubylib puts our lib directory first
+      # on the child's load path.
+      setup_require = /\s/.match?(setup_path) ? "-rbundler/setup" : "-r#{setup_path}"
+      return if !rubyopt.empty? && rubyopt.first.include?(setup_require)
       rubyopt.unshift setup_require
       Bundler::SharedHelpers.set_env "RUBYOPT", rubyopt.join(" ")
     end
@@ -309,16 +380,15 @@ module Bundler
     end
 
     def bundler_ruby_lib
-      resolve_path File.expand_path("../..", __FILE__)
+      File.expand_path("..", __dir__)
     end
 
     def clean_load_path
-      bundler_lib = bundler_ruby_lib
-
       loaded_gem_paths = Bundler.rubygems.loaded_gem_paths
 
       $LOAD_PATH.reject! do |p|
-        next if resolve_path(p).start_with?(bundler_lib)
+        resolved_path = resolve_path(p)
+        next if $LOADED_FEATURES.any? {|lf| lf.start_with?(resolved_path) }
         loaded_gem_paths.delete(p)
       end
       $LOAD_PATH.uniq!
@@ -326,13 +396,12 @@ module Bundler
 
     def resolve_path(path)
       expanded = File.expand_path(path)
-      return expanded unless File.respond_to?(:realpath) && File.exist?(expanded)
+      return expanded unless File.exist?(expanded)
 
       File.realpath(expanded)
     end
 
     def prints_major_deprecations?
-      require_relative "../bundler"
       return false if Bundler.settings[:silence_deprecations]
       require_relative "deprecate"
       return false if Bundler::Deprecate.skip

@@ -33,6 +33,12 @@ class TestVariable < Test::Unit::TestCase
     end
   end
 
+  Athena = Gods.clone
+
+  def test_cloned_classes_copy_cvar_cache
+    assert_equal "Cronus", Athena.new.ruler0
+  end
+
   def test_setting_class_variable_on_module_through_inheritance
     mod = Module.new
     mod.class_variable_set(:@@foo, 1)
@@ -41,6 +47,49 @@ class TestVariable < Test::Unit::TestCase
     assert_raise(FrozenError) { c.class_variable_set(:@@foo, 2) }
     assert_raise(FrozenError) { c.class_eval("@@foo = 2") }
     assert_equal(1, c.class_variable_get(:@@foo))
+  end
+
+  Zeus = Gods.clone
+  class Zeus
+    def ruler5
+      @@rule
+    end
+  end
+
+  def test_cloned_allows_setting_cvar
+    Zeus.class_variable_set(:@@rule, "Athena")
+
+    god = Gods.new.ruler0
+    zeus = Zeus.new.ruler0
+
+    assert_equal "Cronus", god
+    assert_equal "Cronus", zeus
+
+    assert_equal "Athena", Zeus.new.ruler5
+
+    assert_equal "Cronus", Gods.class_variable_get(:@@rule)
+    assert_equal "Athena", Zeus.class_variable_get(:@@rule)
+  end
+
+  def test_raw_object_smallest_slot
+    assert_separately([], <<-"end;")
+      require 'objspace'
+      base_size = ObjectSpace.memsize_of(Object.new)
+
+      assert_equal base_size, ObjectSpace.memsize_of(Object.new)
+
+      object = Object.new
+      10.times do |i|
+        object.instance_variable_set("@iv_\#{i}", i)
+      end
+
+      assert_equal base_size, ObjectSpace.memsize_of(Object.new)
+
+      class TestClass
+      end
+
+      assert_equal base_size, ObjectSpace.memsize_of(TestClass.new)
+    end;
   end
 
   def test_singleton_class_included_class_variable
@@ -101,6 +150,34 @@ class TestVariable < Test::Unit::TestCase
     TestVariable.send(:remove_const, :Parent) rescue nil
   end
 
+  def test_cvar_cache_invalidated_by_parent_class_variable_set
+    m = Module.new { class_variable_set(:@@x, 1) }
+    a = Class.new
+    b = Class.new(a) do
+      include m
+      class_eval "def self.x; @@x; end"
+    end
+    assert_equal 1, b.x # warm cache
+    a.class_variable_set(:@@x, 2)
+    error = assert_raise(RuntimeError) { b.x }
+    assert_match(/class variable @@x of .+ is overtaken by .+/, error.message)
+  end
+
+  def test_cvar_cache_invalidated_by_module_class_variable_set
+    m = Module.new
+    n = Module.new
+    b = Class.new do
+      include m
+      include n
+      class_eval "def self.x; @@x; end"
+    end
+    m.class_variable_set(:@@x, 1)
+    assert_equal 1, b.x # warm cache
+    n.class_variable_set(:@@x, 2)
+    error = assert_raise(RuntimeError) { b.x }
+    assert_match(/class variable @@x of .+ is overtaken by .+/, error.message)
+  end
+
   def test_cvar_overtaken_by_module
     error = eval <<~EORB
       class ParentForModule
@@ -152,6 +229,21 @@ class TestVariable < Test::Unit::TestCase
   def test_include_refined_module_class_variable
     assert_warning('') do
       IncludeRefinedModuleClassVariableNoWarning.new.t
+    end
+  end
+
+  def test_set_class_variable_on_frozen_object
+    set_cvar = EnvUtil.labeled_class("SetCVar")
+    set_cvar.class_eval "#{<<~"begin;"}\n#{<<~'end;'}"
+    begin;
+      def self.set(val)
+        @@a = val # inline cache
+      end
+    end;
+    set_cvar.set(1) # fill write cache
+    set_cvar.freeze
+    assert_raise(FrozenError, "[Bug #19341]") do
+      set_cvar.set(2) # hit write cache, but should check frozen status
     end
   end
 
@@ -232,6 +324,84 @@ class TestVariable < Test::Unit::TestCase
     assert_include(gv, :$12)
   end
 
+  def prepare_klass_for_test_svar_with_ifunc
+    Class.new do
+      include Enumerable
+      def each(&b)
+        @b = b
+      end
+
+      def check1
+        check2.merge({check1: $1})
+      end
+
+      def check2
+        @b.call('foo')
+        {check2: $1}
+      end
+    end
+  end
+
+  def test_svar_with_ifunc
+    c = prepare_klass_for_test_svar_with_ifunc
+
+    expected_check1_result = {
+      check1: nil, check2: nil
+    }.freeze
+
+    obj = c.new
+    result = nil
+    obj.grep(/(f..)/){
+      result = $1
+    }
+    assert_equal nil, result
+    assert_equal nil, $1
+    assert_equal expected_check1_result, obj.check1
+    assert_equal 'foo', result
+    assert_equal 'foo', $1
+
+    # this frame was escaped so try it again
+    $~ = nil
+    obj = c.new
+    result = nil
+    obj.grep(/(f..)/){
+      result = $1
+    }
+    assert_equal nil, result
+    assert_equal nil, $1
+    assert_equal expected_check1_result, obj.check1
+    assert_equal 'foo', result
+    assert_equal 'foo', $1
+
+    # different context
+    result = nil
+    Fiber.new{
+      obj = c.new
+      obj.grep(/(f..)/){
+        result = $1
+      }
+    }.resume # obj is created in antoher Fiber
+    assert_equal nil, result
+    assert_equal expected_check1_result, obj.check1
+    assert_equal 'foo', result
+    assert_equal 'foo', $1
+
+    # different thread context
+    result = nil
+    Thread.new{
+      obj = c.new
+      obj.grep(/(f..)/){
+        result = $1
+      }
+    }.join # obj is created in another Thread
+
+    assert_equal nil, result
+    assert_equal expected_check1_result, obj.check1
+    assert_equal 'foo', result
+    assert_equal 'foo', $1
+  end
+
+
   def test_global_variable_0
     assert_in_out_err(["-e", "$0='t'*1000;print $0"], "", /\At+\z/, [])
   end
@@ -261,6 +431,12 @@ class TestVariable < Test::Unit::TestCase
         v.instance_variable_set(:@foo, :bar)
       end
 
+      assert_raise_with_message(FrozenError, msg, "[Bug #19339]") do
+        v.instance_eval do
+          @a = 1
+        end
+      end
+
       assert_nil EnvUtil.suppress_warning {v.instance_variable_get(:@foo)}
       assert_not_send([v, :instance_variable_defined?, :@foo])
 
@@ -268,6 +444,61 @@ class TestVariable < Test::Unit::TestCase
         v.remove_instance_variable(:@foo)
       end
     end
+  end
+
+  class RemoveIvar
+    class << self
+      attr_reader :ivar
+
+      def add_ivar
+        @ivar = 1
+      end
+    end
+
+    attr_reader :ivar
+
+    def add_ivar
+      @ivar = 1
+    end
+  end
+
+  def add_and_remove_ivar(obj)
+    assert_nil obj.ivar
+    assert_equal 1, obj.add_ivar
+    assert_equal 1, obj.instance_variable_get(:@ivar)
+    assert_equal 1, obj.ivar
+
+    obj.remove_instance_variable(:@ivar)
+    assert_nil obj.ivar
+
+    assert_raise NameError do
+      obj.remove_instance_variable(:@ivar)
+    end
+  end
+
+  def test_remove_instance_variables_object
+    obj = RemoveIvar.new
+    add_and_remove_ivar(obj)
+    add_and_remove_ivar(obj)
+  end
+
+  def test_remove_instance_variables_class
+    add_and_remove_ivar(RemoveIvar)
+    add_and_remove_ivar(RemoveIvar)
+  end
+
+  class RemoveIvarGeneric < Array
+    attr_reader :ivar
+
+    def add_ivar
+      @ivar = 1
+    end
+  end
+
+  def test_remove_instance_variables_generic
+    obj = RemoveIvarGeneric.new
+    add_and_remove_ivar(obj)
+    add_and_remove_ivar(obj)
   end
 
   class ExIvar < Hash
@@ -289,10 +520,86 @@ class TestVariable < Test::Unit::TestCase
     }
   end
 
+  def test_exivar_resize_with_compaction_stress
+    objs = 10_000.times.map do
+      ExIvar.new
+    end
+    EnvUtil.under_gc_compact_stress do
+      10.times do
+        x = ExIvar.new
+        x.instance_variable_set(:@resize, 1)
+        x
+      end
+    end
+    objs or flunk
+  end
+
   def test_local_variables_with_kwarg
     bug11674 = '[ruby-core:71437] [Bug #11674]'
     v = with_kwargs_11(v1:1,v2:2,v3:3,v4:4,v5:5,v6:6,v7:7,v8:8,v9:9,v10:10,v11:11)
     assert_equal(%i(v1 v2 v3 v4 v5 v6 v7 v8 v9 v10 v11), v, bug11674)
+  end
+
+  def test_many_instance_variables
+    objects = [Object.new, Hash.new, Module.new]
+    objects.each do |obj|
+      1000.times do |i|
+        obj.instance_variable_set("@var#{i}", i)
+      end
+      1000.times do |i|
+        assert_equal(i, obj.instance_variable_get("@var#{i}"))
+      end
+    end
+  end
+
+  def test_local_variables_encoding
+    α = 1 or flunk
+    b = binding
+    b.eval("".encode("us-ascii"))
+    assert_equal(%i[α b], b.local_variables)
+  end
+
+  def test_genivar_cache
+    bug21547 = '[Bug #21547]'
+    klass = Class.new(Array)
+    instance = klass.new
+    instance.instance_variable_set(:@a1, 1)
+    instance.instance_variable_set(:@a2, 2)
+    Fiber.new do
+      instance.instance_variable_set(:@a3, 3)
+      instance.instance_variable_set(:@a4, 4)
+    end.resume
+    assert_equal 4, instance.instance_variable_get(:@a4), bug21547
+  end
+
+  def test_genivar_cache_free
+    str = +"hello"
+    str.instance_variable_set(:@x, :old_value)
+
+    str.instance_variable_get(:@x) # populate cache
+
+    Fiber.new {
+      str.remove_instance_variable(:@x)
+      str.instance_variable_set(:@x, :new_value)
+    }.resume
+
+    assert_equal :new_value, str.instance_variable_get(:@x)
+  end
+
+  def test_genivar_cache_invalidated_by_gc
+    str = +"hello"
+    str.instance_variable_set(:@x, :old_value)
+
+    str.instance_variable_get(:@x) # populate cache
+
+    Fiber.new {
+      str.remove_instance_variable(:@x)
+      str.instance_variable_set(:@x, :new_value)
+    }.resume
+
+    GC.start
+
+    assert_equal :new_value, str.instance_variable_get(:@x)
   end
 
   private

@@ -7,12 +7,12 @@ describe "StringScanner#initialize" do
   end
 
   it "is a private method" do
-    StringScanner.should have_private_instance_method(:initialize)
+    StringScanner.private_instance_methods(false).should.include?(:initialize)
   end
 
   it "returns an instance of StringScanner" do
-    @s.should be_kind_of(StringScanner)
-    @s.eos?.should be_false
+    @s.should.is_a?(StringScanner)
+    @s.eos?.should == false
   end
 
   it "converts the argument into a string using #to_str" do
@@ -23,5 +23,10 @@ describe "StringScanner#initialize" do
 
     scan = StringScanner.new(m)
     scan.string.should == s
+  end
+
+  it "accepts a fixed_anchor keyword argument" do
+    s = StringScanner.new("foo", fixed_anchor: true)
+    s.should.fixed_anchor?
   end
 end

@@ -224,6 +224,9 @@ description:
 
       # http://yaml.org/type/bool.html
       def test_boolean_true
+        # yes/on are booleans only under YAML 1.1; test_boolean covers the
+        # 1.2 behavior of the libfyaml backend.
+        omit 'yes/on are strings on the YAML 1.2 libfyaml backend' if libfyaml?
         %w{ yes Yes YES true True TRUE on On ON }.each do |t|
           i = Nodes::Scalar.new(t, nil, 'tag:yaml.org,2002:bool')
           assert_equal true, i.to_ruby
@@ -233,6 +236,9 @@ description:
 
       # http://yaml.org/type/bool.html
       def test_boolean_false
+        # no/off are booleans only under YAML 1.1; test_boolean covers the
+        # 1.2 behavior of the libfyaml backend.
+        omit 'no/off are strings on the YAML 1.2 libfyaml backend' if libfyaml?
         %w{ no No NO false False FALSE off Off OFF }.each do |t|
           i = Nodes::Scalar.new(t, nil, 'tag:yaml.org,2002:bool')
           assert_equal false, i.to_ruby
@@ -319,7 +325,7 @@ description:
 
         list = seq.to_ruby
         assert_equal %w{ foo foo }, list
-        assert_equal list[0].object_id, list[1].object_id
+        assert_same list[0], list[1]
       end
 
       def test_mapping_with_str_tag
@@ -327,6 +333,12 @@ description:
         mapping.children << Nodes::Scalar.new('foo')
         mapping.children << Nodes::Scalar.new('bar')
         assert_equal({'foo' => 'bar'}, mapping.to_ruby)
+      end
+
+      def test_parse_symbols
+        node = Nodes::Scalar.new(':foo')
+        assert_equal :foo, node.to_ruby
+        assert_equal ':foo', node.to_ruby(parse_symbols: false)
       end
     end
   end

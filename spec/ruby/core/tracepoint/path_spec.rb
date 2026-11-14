@@ -13,7 +13,7 @@ describe 'TracePoint#path' do
     path.should == "#{__FILE__}"
   end
 
-  it 'equals (eval) inside an eval for :end event' do
+  it 'equals "(eval at __FILE__:__LINE__)" inside an eval for :end event' do
     path = nil
     TracePoint.new(:end) { |tp|
       next unless TracePointSpec.target_thread?
@@ -21,6 +21,6 @@ describe 'TracePoint#path' do
     }.enable do
       eval("module TracePointSpec; end")
     end
-    path.should == '(eval)'
+    path.should == "(eval at #{__FILE__}:#{__LINE__ - 2})"
   end
 end

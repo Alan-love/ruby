@@ -10,6 +10,7 @@
  */
 #include "ruby/internal/config.h"      /* for HAVE_LONG_LONG */
 #include <limits.h>             /* for CHAR_BIT */
+#include "internal/bits.h"      /* for MUL_OVERFLOW_FIXNUM_P */
 #include "internal/compilers.h" /* for __has_builtin */
 #include "ruby/internal/stdbool.h"     /* for bool */
 #include "ruby/intern.h"        /* for rb_big_mul */
@@ -18,7 +19,7 @@
 #if HAVE_LONG_LONG && SIZEOF_LONG * 2 <= SIZEOF_LONG_LONG
 # define DLONG LONG_LONG
 # define DL2NUM(x) LL2NUM(x)
-#elif defined(HAVE_INT128_T)
+#elif defined(HAVE_INT128_T) && !(defined(__OpenBSD__) && defined(__mips64__))
 # define DLONG int128_t
 # define DL2NUM(x) (RB_FIXABLE(x) ? LONG2FIX(x) : rb_int128t2big(x))
 VALUE rb_int128t2big(int128_t n); /* in bignum.c */

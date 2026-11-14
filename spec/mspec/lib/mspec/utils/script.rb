@@ -37,6 +37,17 @@ class MSpecScript
     config[key]
   end
 
+  class << self
+    attr_accessor :child_process
+  end
+
+  # True if the current process is the one going to run the specs with `MSpec.process`.
+  # False for e.g. `mspec` which exec's to `mspec-run`.
+  # This is useful in .mspec config files.
+  def self.child_process?
+    MSpecScript.child_process
+  end
+
   def initialize
     check_version!
 
@@ -148,8 +159,14 @@ class MSpecScript
     end
 
     if config[:formatter]
-      config[:formatter].new(config[:output])
+      config[:formatter] = config[:formatter].new(config[:output])
     end
+
+    if config[:launchable]
+      config[:formatter].extend config[:launchable]
+    end
+
+    config[:formatter]
   end
 
   # Callback for enabling custom actions, etc. This version is a
@@ -267,10 +284,11 @@ class MSpecScript
 
   # Instantiates an instance and calls the series of methods to
   # invoke the script.
-  def self.main
+  def self.main(child_process = true)
+    MSpecScript.child_process = child_process
+
     script = new
     script.load_default
-    script.try_load '~/.mspecrc'
     script.options
     script.signals
     script.register

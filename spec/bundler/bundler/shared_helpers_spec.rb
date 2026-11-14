@@ -1,12 +1,8 @@
 # frozen_string_literal: true
 
 RSpec.describe Bundler::SharedHelpers do
-  let(:ext_lock_double) { double(:ext_lock) }
-
   before do
     pwd_stub
-    allow(Bundler.rubygems).to receive(:ext_lock).and_return(ext_lock_double)
-    allow(ext_lock_double).to receive(:synchronize) {|&block| block.call }
   end
 
   let(:pwd_stub) { allow(subject).to receive(:pwd).and_return(bundled_app) }
@@ -63,7 +59,7 @@ RSpec.describe Bundler::SharedHelpers do
 
       before { allow(subject).to receive(:default_gemfile).and_return(gemfile_path) }
 
-      it "returns the lock file path" do
+      it "returns the lockfile path" do
         expect(subject.default_lockfile).to eq(expected_lockfile_path)
       end
     end
@@ -72,6 +68,7 @@ RSpec.describe Bundler::SharedHelpers do
   describe "#default_bundle_dir" do
     context ".bundle does not exist" do
       it "returns nil" do
+        skip "temp dir is on a different drive than the source tree" if tmp_and_source_on_different_drives?
         expect(subject.default_bundle_dir).to be_nil
       end
     end
@@ -163,7 +160,7 @@ RSpec.describe Bundler::SharedHelpers do
     let(:pwd_stub) { nil }
 
     it "returns the current absolute path" do
-      expect(subject.pwd).to eq(source_root)
+      expect(subject.pwd).to eq(git_root.to_s)
     end
   end
 
@@ -242,7 +239,14 @@ RSpec.describe Bundler::SharedHelpers do
     shared_examples_for "ENV['RUBYOPT'] gets set correctly" do
       it "ensures -rbundler/setup is at the beginning of ENV['RUBYOPT']" do
         subject.set_bundle_environment
-        expect(ENV["RUBYOPT"].split(" ")).to start_with("-r#{source_lib_dir}/bundler/setup")
+        expect(ENV["RUBYOPT"].split(" ")).to start_with("-r#{install_path}/bundler/setup")
+      end
+    end
+
+    shared_examples_for "ENV['BUNDLER_SETUP'] gets set correctly" do
+      it "ensures bundler/setup is set in ENV['BUNDLER_SETUP']" do
+        subject.set_bundle_environment
+        expect(ENV["BUNDLER_SETUP"]).to eq("#{source_lib_dir}/bundler/setup")
       end
     end
 
@@ -255,8 +259,7 @@ RSpec.describe Bundler::SharedHelpers do
 
       it "ensures bundler's ruby version lib path is in ENV['RUBYLIB']" do
         subject.set_bundle_environment
-        paths = (ENV["RUBYLIB"]).split(File::PATH_SEPARATOR)
-        expect(paths).to include(ruby_lib_path)
+        expect(rubylib).to include(ruby_lib_path)
       end
     end
 
@@ -273,15 +276,14 @@ RSpec.describe Bundler::SharedHelpers do
 
       subject.set_bundle_environment
 
-      paths = (ENV["RUBYLIB"]).split(File::PATH_SEPARATOR)
-      expect(paths.count(RbConfig::CONFIG["rubylibdir"])).to eq(0)
+      expect(rubylib.count(RbConfig::CONFIG["rubylibdir"])).to eq(0)
     end
 
     it "exits if bundle path contains the unix-like path separator" do
       if Gem.respond_to?(:path_separator)
         allow(Gem).to receive(:path_separator).and_return(":")
       else
-        stub_const("File::PATH_SEPARATOR", ":".freeze)
+        stub_const("File::PATH_SEPARATOR", ":")
       end
       allow(Bundler).to receive(:bundle_path) { Pathname.new("so:me/dir/bin") }
       expect { subject.send(:validate_bundle_path) }.to raise_error(
@@ -353,27 +355,81 @@ RSpec.describe Bundler::SharedHelpers do
 
       it "ENV['PATH'] should only contain one instance of bundle bin path" do
         subject.set_bundle_environment
-        paths = (ENV["PATH"]).split(File::PATH_SEPARATOR)
+        paths = ENV["PATH"].split(File::PATH_SEPARATOR)
         expect(paths.count(bundle_path)).to eq(1)
       end
     end
 
-    context "ENV['RUBYOPT'] does not exist" do
-      before { ENV.delete("RUBYOPT") }
+    context "when bundler install path is standard" do
+      let(:install_path) { source_lib_dir }
+
+      context "ENV['RUBYOPT'] does not exist" do
+        before { ENV.delete("RUBYOPT") }
+
+        it_behaves_like "ENV['RUBYOPT'] gets set correctly"
+      end
+
+      context "ENV['RUBYOPT'] exists without -rbundler/setup" do
+        before { ENV["RUBYOPT"] = "-I/some_app_path/lib" }
+
+        it_behaves_like "ENV['RUBYOPT'] gets set correctly"
+      end
+
+      context "ENV['RUBYOPT'] exists and contains -rbundler/setup" do
+        before { ENV["RUBYOPT"] = "-rbundler/setup" }
+
+        it_behaves_like "ENV['RUBYOPT'] gets set correctly"
+      end
+    end
+
+    context "when bundler install path contains special characters" do
+      let(:install_path) { "/opt/ruby3.3.0-preview2/lib/ruby/3.3.0+0" }
+
+      before do
+        ENV["RUBYOPT"] = "-r#{install_path}/bundler/setup"
+        # Only fake the resolution of bundler/setup itself. A blanket stub
+        # breaks unrelated RubyGems path lookups triggered lazily inside the
+        # example, see #set_rubyopt.
+        allow(File).to receive(:expand_path).and_call_original
+        allow(File).to receive(:expand_path).with("setup", anything).and_return("#{install_path}/bundler/setup")
+        allow(Gem).to  receive(:bin_path).and_return("#{install_path}/bundler/setup")
+      end
+
+      it "ensures -rbundler/setup is not duplicated" do
+        subject.set_bundle_environment
+        expect(ENV["RUBYOPT"].split(" ").grep(%r{-r.*/bundler/setup}).length).to eq(1)
+      end
 
       it_behaves_like "ENV['RUBYOPT'] gets set correctly"
     end
 
-    context "ENV['RUBYOPT'] exists without -rbundler/setup" do
-      before { ENV["RUBYOPT"] = "-I/some_app_path/lib" }
+    context "when bundler install path contains whitespace" do
+      let(:install_path) { "/opt/ruby with space/lib" }
 
-      it_behaves_like "ENV['RUBYOPT'] gets set correctly"
-    end
+      before do
+        allow(File).to receive(:expand_path).and_call_original
+        allow(File).to receive(:expand_path).with("setup", anything).and_return("#{install_path}/bundler/setup")
+        allow(Gem).to receive(:bin_path).and_return("#{install_path}/bundler/setup")
+      end
 
-    context "ENV['RUBYOPT'] exists and contains -rbundler/setup" do
-      before { ENV["RUBYOPT"] = "-rbundler/setup" }
+      # RUBYOPT is split on whitespace with no quoting mechanism, so an
+      # absolute -r path containing spaces would make every child ruby fail
+      # to boot with "invalid switch in RUBYOPT".
+      it "requires bundler/setup by feature name instead of absolute path" do
+        subject.set_bundle_environment
+        expect(ENV["RUBYOPT"].split(" ")).to start_with("-rbundler/setup")
+      end
 
-      it_behaves_like "ENV['RUBYOPT'] gets set correctly"
+      it "does not inject the space-containing path into RUBYOPT" do
+        subject.set_bundle_environment
+        expect(ENV["RUBYOPT"]).not_to include(install_path)
+      end
+
+      it "is idempotent" do
+        subject.set_bundle_environment
+        subject.set_bundle_environment
+        expect(ENV["RUBYOPT"].split(" ").grep(%r{\A-r.*bundler/setup\z}).length).to eq(1)
+      end
     end
 
     context "ENV['RUBYLIB'] does not exist" do
@@ -401,7 +457,7 @@ RSpec.describe Bundler::SharedHelpers do
       it "sets BUNDLE_BIN_PATH to the bundle executable file" do
         subject.set_bundle_environment
         bin_path = ENV["BUNDLE_BIN_PATH"]
-        expect(bin_path).to eq(bindir.join("bundle").to_s)
+        expect(bin_path).to eq(exedir.join("bundle").to_s)
         expect(File.exist?(bin_path)).to be true
       end
     end
@@ -417,8 +473,7 @@ RSpec.describe Bundler::SharedHelpers do
 
       it "ENV['RUBYLIB'] should only contain one instance of bundler's ruby version lib path" do
         subject.set_bundle_environment
-        paths = (ENV["RUBYLIB"]).split(File::PATH_SEPARATOR)
-        expect(paths.count(ruby_lib_path)).to eq(1)
+        expect(rubylib.count(ruby_lib_path)).to eq(1)
       end
     end
   end
@@ -434,7 +489,7 @@ RSpec.describe Bundler::SharedHelpers do
     end
 
     context "system throws Errno::EACESS" do
-      let(:file_op_block) { proc {|_path| raise Errno::EACCES } }
+      let(:file_op_block) { proc {|_path| raise Errno::EACCES.new("/path") } }
 
       it "raises a PermissionError" do
         expect { subject.filesystem_access("/path", &file_op_block) }.to raise_error(
@@ -489,7 +544,7 @@ RSpec.describe Bundler::SharedHelpers do
 
       it "raises a GenericSystemCallError" do
         expect { subject.filesystem_access("/path", &file_op_block) }.to raise_error(
-          Bundler::GenericSystemCallError, /error accessing.+underlying.+Shields down/m
+          Bundler::GenericSystemCallError, /error creating.+underlying.+Shields down/m
         )
       end
     end

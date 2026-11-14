@@ -3,7 +3,8 @@ require_relative 'fixtures/classes'
 
 describe "IO#close_write" do
   before :each do
-    @io = IO.popen 'cat', 'r+'
+    cmd = platform_is(:windows) ? 'rem' : 'cat'
+    @io = IO.popen cmd, 'r+'
     @path = tmp('io.close.txt')
   end
 
@@ -15,26 +16,26 @@ describe "IO#close_write" do
   it "closes the write end of a duplex I/O stream" do
     @io.close_write
 
-    -> { @io.write "attempt to write" }.should raise_error(IOError)
+    -> { @io.write "attempt to write" }.should.raise(IOError)
   end
 
   it "does nothing on subsequent invocations" do
     @io.close_write
 
-    @io.close_write.should be_nil
+    @io.close_write.should == nil
   end
 
   it "allows subsequent invocation of close" do
     @io.close_write
 
-    -> { @io.close }.should_not raise_error
+    -> { @io.close }.should_not.raise
   end
 
   it "raises an IOError if the stream is readable and not duplexed" do
     io = File.open @path, 'w+'
 
     begin
-      -> { io.close_write }.should raise_error(IOError)
+      -> { io.close_write }.should.raise(IOError)
     ensure
       io.close unless io.closed?
     end
@@ -48,17 +49,20 @@ describe "IO#close_write" do
     io.should.closed?
   end
 
-  it "flushes and closes the write stream" do
-    @io.puts '12345'
+  # Windows didn't have command like cat
+  platform_is_not :windows do
+    it "flushes and closes the write stream" do
+      @io.puts '12345'
 
-    @io.close_write
+      @io.close_write
 
-    @io.read.should == "12345\n"
+      @io.read.should == "12345\n"
+    end
   end
 
   it "does nothing on closed stream" do
     @io.close
 
-    @io.close_write.should be_nil
+    @io.close_write.should == nil
   end
 end

@@ -9,7 +9,7 @@ describe "SignalException.new" do
   end
 
   it "raises an exception with an invalid signal number" do
-    -> { SignalException.new(100000) }.should raise_error(ArgumentError)
+    -> { SignalException.new(100000) }.should.raise(ArgumentError)
   end
 
   it "takes a signal name without SIG prefix as the first argument" do
@@ -27,11 +27,11 @@ describe "SignalException.new" do
   end
 
   it "raises an exception with an invalid signal name" do
-    -> { SignalException.new("NONEXISTENT") }.should raise_error(ArgumentError)
+    -> { SignalException.new("NONEXISTENT") }.should.raise(ArgumentError)
   end
 
   it "raises an exception with an invalid first argument type" do
-    -> { SignalException.new(Object.new) }.should raise_error(ArgumentError)
+    -> { SignalException.new(Object.new) }.should.raise(ArgumentError)
   end
 
   it "takes a signal symbol without SIG prefix as the first argument" do
@@ -49,7 +49,7 @@ describe "SignalException.new" do
   end
 
   it "raises an exception with an invalid signal name" do
-    -> { SignalException.new(:NONEXISTENT) }.should raise_error(ArgumentError)
+    -> { SignalException.new(:NONEXISTENT) }.should.raise(ArgumentError)
   end
 
   it "takes an optional message argument with a signal number" do
@@ -60,7 +60,7 @@ describe "SignalException.new" do
   end
 
   it "raises an exception for an optional argument with a signal name" do
-    -> { SignalException.new("INT","name") }.should raise_error(ArgumentError)
+    -> { SignalException.new("INT","name") }.should.raise(ArgumentError)
   end
 end
 
@@ -93,7 +93,7 @@ describe "SignalException" do
 
   platform_is_not :windows do
     it "runs after at_exit" do
-      output = ruby_exe(<<-RUBY, exit_status: nil)
+      output = ruby_exe(<<-RUBY, exit_status: :SIGKILL)
         at_exit do
           puts "hello"
           $stdout.flush
@@ -107,7 +107,7 @@ describe "SignalException" do
     end
 
     it "cannot be trapped with Signal.trap" do
-      ruby_exe(<<-RUBY, exit_status: nil)
+      ruby_exe(<<-RUBY, exit_status: :SIGPROF)
         Signal.trap("PROF") {}
         raise(SignalException, "PROF")
       RUBY
@@ -116,7 +116,7 @@ describe "SignalException" do
     end
 
     it "self-signals for USR1" do
-      ruby_exe("raise(SignalException, 'USR1')", exit_status: nil)
+      ruby_exe("raise(SignalException, 'USR1')", exit_status: :SIGUSR1)
       $?.termsig.should == Signal.list.fetch('USR1')
     end
   end

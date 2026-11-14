@@ -2,9 +2,18 @@
 
 require "bundler/shared_helpers"
 require "shellwords"
+require "fileutils"
+require "rubygems/package"
+
+require_relative "build_metadata"
 
 module Spec
   module Builders
+    def self.extended(mod)
+      mod.extend Path
+      mod.extend Helpers
+    end
+
     def self.constantize(name)
       name.delete("-").upcase
     end
@@ -17,21 +26,7 @@ module Spec
       Gem::Platform.new(platform)
     end
 
-    # Returns a number smaller than the size of the index. Useful for specs that
-    # need the API request limit to be reached for some reason.
-    def low_api_request_limit_for(gem_repo)
-      all_gems = Dir[gem_repo.join("gems/*.gem")]
-
-      all_gem_names = all_gems.map do |file|
-        File.basename(file, ".gem").match(/\A(?<gem_name>[^-]+)-.*\z/)[:gem_name]
-      end.uniq
-
-      (all_gem_names - ["bundler"]).size
-    end
-
     def build_repo1
-      rake_path = Dir["#{Path.base_system_gems}/**/rake*.gem"].first
-
       build_repo gem_repo1 do
         FileUtils.cp rake_path, "#{gem_repo1}/gems/"
 
@@ -40,28 +35,28 @@ module Spec
         build_gem "puma"
         build_gem "minitest"
 
-        build_gem "rack", %w[0.9.1 1.0.0] do |s|
-          s.executables = "rackup"
-          s.post_install_message = "Rack's post install message"
+        build_gem "myrack", %w[0.9.1 1.0.0] do |s|
+          s.executables = "myrackup"
+          s.post_install_message = "Myrack's post install message"
         end
 
         build_gem "thin" do |s|
-          s.add_dependency "rack"
+          s.add_dependency "myrack"
           s.post_install_message = "Thin's post install message"
         end
 
-        build_gem "rack-obama" do |s|
-          s.add_dependency "rack"
-          s.post_install_message = "Rack-obama's post install message"
+        build_gem "myrack-obama" do |s|
+          s.add_dependency "myrack"
+          s.post_install_message = "Myrack-obama's post install message"
         end
 
-        build_gem "rack_middleware", "1.0" do |s|
-          s.add_dependency "rack", "0.9.1"
+        build_gem "myrack_middleware", "1.0" do |s|
+          s.add_dependency "myrack", "0.9.1"
         end
 
         build_gem "rails", "2.3.2" do |s|
           s.executables = "rails"
-          s.add_dependency "rake",           "13.0.1"
+          s.add_dependency "rake",           rake_version
           s.add_dependency "actionpack",     "2.3.2"
           s.add_dependency "activerecord",   "2.3.2"
           s.add_dependency "actionmailer",   "2.3.2"
@@ -85,32 +80,28 @@ module Spec
           s.add_dependency "activesupport", ">= 2.0.0"
         end
 
-        build_gem "rspec", "1.2.7", :no_default => true do |s|
+        build_gem "rspec", "1.2.7", no_default: true do |s|
           s.write "lib/spec.rb", "SPEC = '1.2.7'"
         end
 
-        build_gem "rack-test", :no_default => true do |s|
-          s.write "lib/rack/test.rb", "RACK_TEST = '1.0'"
-        end
-
-        build_gem "platform_specific" do |s|
-          s.platform = Bundler.local_platform
-          s.write "lib/platform_specific.rb", "PLATFORM_SPECIFIC = '1.0.0 #{Bundler.local_platform}'"
+        build_gem "myrack-test", no_default: true do |s|
+          s.write "lib/myrack/test.rb", "MYRACK_TEST = '1.0'"
         end
 
         build_gem "platform_specific" do |s|
           s.platform = "java"
-          s.write "lib/platform_specific.rb", "PLATFORM_SPECIFIC = '1.0.0 JAVA'"
         end
 
         build_gem "platform_specific" do |s|
           s.platform = "ruby"
-          s.write "lib/platform_specific.rb", "PLATFORM_SPECIFIC = '1.0.0 RUBY'"
         end
 
         build_gem "platform_specific" do |s|
           s.platform = "x86-mswin32"
-          s.write "lib/platform_specific.rb", "PLATFORM_SPECIFIC = '1.0.0 MSWIN'"
+        end
+
+        build_gem "platform_specific" do |s|
+          s.platform = "x64-mswin64"
         end
 
         build_gem "platform_specific" do |s|
@@ -118,39 +109,37 @@ module Spec
         end
 
         build_gem "platform_specific" do |s|
-          s.platform = "x64-mingw32"
+          s.platform = "x64-mingw-ucrt"
+        end
+
+        build_gem "platform_specific" do |s|
+          s.platform = "aarch64-mingw-ucrt"
         end
 
         build_gem "platform_specific" do |s|
           s.platform = "x86-darwin-100"
-          s.write "lib/platform_specific.rb", "PLATFORM_SPECIFIC = '1.0.0 x86-darwin-100'"
         end
 
         build_gem "only_java", "1.0" do |s|
           s.platform = "java"
-          s.write "lib/only_java.rb", "ONLY_JAVA = '1.0.0 JAVA'"
         end
 
         build_gem "only_java", "1.1" do |s|
           s.platform = "java"
-          s.write "lib/only_java.rb", "ONLY_JAVA = '1.1.0 JAVA'"
         end
 
         build_gem "nokogiri", "1.4.2"
         build_gem "nokogiri", "1.4.2" do |s|
           s.platform = "java"
-          s.write "lib/nokogiri.rb", "NOKOGIRI = '1.4.2 JAVA'"
           s.add_dependency "weakling", ">= 0.0.3"
         end
 
         build_gem "laduradura", "5.15.2"
         build_gem "laduradura", "5.15.2" do |s|
           s.platform = "java"
-          s.write "lib/laduradura.rb", "LADURADURA = '5.15.2 JAVA'"
         end
         build_gem "laduradura", "5.15.3" do |s|
           s.platform = "java"
-          s.write "lib/laduradura.rb", "LADURADURA = '5.15.2 JAVA'"
         end
 
         build_gem "weakling", "0.0.3"
@@ -164,7 +153,7 @@ module Spec
 
         build_gem "bundler", "0.9" do |s|
           s.executables = "bundle"
-          s.write "bin/bundle", "puts 'FAIL'"
+          s.write "bin/bundle", "#!/usr/bin/env ruby\nputs 'FAIL'"
         end
 
         # The bundler 0.8 gem has a rubygems plugin that always loads :(
@@ -191,32 +180,45 @@ module Spec
       end
     end
 
-    def build_repo2(&blk)
-      FileUtils.rm_rf gem_repo2
-      FileUtils.cp_r gem_repo1, gem_repo2
-      update_repo2(&blk) if block_given?
+    def build_repo2(**kwargs, &blk)
+      FileUtils.cp_r gem_repo1, gem_repo2, remove_destination: true
+      update_repo2(**kwargs, &blk) if block_given?
     end
 
     # A repo that has no pre-installed gems included. (The caller completely
     # determines the contents with the block.)
-    def build_repo4(&blk)
-      FileUtils.rm_rf gem_repo4
-      build_repo(gem_repo4, &blk)
-    end
-
-    def update_repo4(&blk)
-      update_repo(gem_repo4, &blk)
-    end
-
-    def update_repo2
-      update_repo gem_repo2 do
-        yield if block_given?
+    #
+    # If the repo already exists, `#update_repo` will be called.
+    def build_repo3(**kwargs, &blk)
+      if File.exist?(gem_repo3)
+        update_repo(gem_repo3, &blk)
+      else
+        build_repo gem_repo3, **kwargs, &blk
       end
+    end
+
+    # Like build_repo3, this is a repo that has no pre-installed gems included.
+    #
+    # If the repo already exists, `#udpate_repo` will be called
+    def build_repo4(**kwargs, &blk)
+      if File.exist?(gem_repo4)
+        update_repo gem_repo4, &blk
+      else
+        build_repo gem_repo4, **kwargs, &blk
+      end
+    end
+
+    def update_repo2(**kwargs, &blk)
+      update_repo(gem_repo2, **kwargs, &blk)
+    end
+
+    def update_repo3(&blk)
+      update_repo(gem_repo3, &blk)
     end
 
     def build_security_repo
       build_repo security_repo do
-        build_gem "rack"
+        build_gem "myrack"
 
         build_gem "signed_gem" do |s|
           cert = "signing-cert.pem"
@@ -229,39 +231,60 @@ module Spec
       end
     end
 
-    def build_repo(path, &blk)
+    # A minimal fake irb console
+    def build_dummy_irb(version = "9.9.9")
+      build_gem "irb", version do |s|
+        s.write "lib/irb.rb", <<-RUBY
+          class IRB
+            class << self
+              def toplevel_binding
+                unless defined?(@toplevel_binding) && @toplevel_binding
+                  TOPLEVEL_BINDING.eval %{
+                    def self.__irb__; binding; end
+                    IRB.instance_variable_set(:@toplevel_binding, __irb__)
+                    class << self; undef __irb__; end
+                  }
+                end
+                @toplevel_binding.eval('private')
+                @toplevel_binding
+              end
+
+              def __irb__
+                while line = gets
+                  begin
+                    puts eval(line, toplevel_binding).inspect.sub(/^"(.*)"$/, '=> \\1')
+                  rescue Exception => e
+                    puts "\#{e.class}: \#{e.message}"
+                    puts e.backtrace.first
+                  end
+                end
+              end
+              alias start __irb__
+            end
+          end
+        RUBY
+      end
+    end
+
+    def build_repo(path, **kwargs, &blk)
       return if File.directory?(path)
 
       FileUtils.mkdir_p("#{path}/gems")
 
-      update_repo(path, &blk)
+      update_repo(path,**kwargs, &blk)
     end
 
-    def check_test_gems!
-      rake_path = Dir["#{Path.base_system_gems}/**/rake*.gem"].first
-
-      if rake_path.nil?
-        FileUtils.rm_rf(Path.base_system_gems)
-        Spec::Rubygems.install_test_deps
-        rake_path = Dir["#{Path.base_system_gems}/**/rake*.gem"].first
-      end
-
-      if rake_path.nil?
-        abort "Your test gems are missing! Run `rm -rf #{tmp}` and try again."
-      end
-    end
-
-    def update_repo(path)
-      if path == gem_repo1 && caller.first.split(" ").last == "`build_repo`"
+    def update_repo(path, build_compact_index: true)
+      exempted_caller = Gem.ruby_version >= Gem::Version.new("3.4.0.dev") && RUBY_ENGINE != "jruby" ? "#{Module.nesting.first}#build_repo" : "build_repo"
+      if path == gem_repo1 && caller_locations(1, 1).first.label != exempted_caller
         raise "Updating gem_repo1 is unsupported -- use gem_repo2 instead"
       end
       return unless block_given?
       @_build_path = "#{path}/gems"
       @_build_repo = File.basename(path)
       yield
-      with_gem_path_as Path.base_system_gems do
-        gem_command :generate_index, :dir => path
-      end
+      options = { build_compact: build_compact_index }
+      Gem::Indexer.new(path, options).generate_index
     ensure
       @_build_path = nil
       @_build_repo = nil
@@ -286,12 +309,12 @@ module Spec
       end
     end
 
-    def build_dep(name, requirements = Gem::Requirement.default, type = :runtime)
-      Bundler::Dependency.new(name, :version => requirements)
-    end
-
     def build_lib(name, *args, &blk)
       build_with(LibBuilder, name, args, &blk)
+    end
+
+    def build_bundler(*args, &blk)
+      build_with(BundlerBuilder, "bundler", args, &blk)
     end
 
     def build_gem(name, *args, &blk)
@@ -399,6 +422,60 @@ module Spec
       alias_method :dep, :runtime
     end
 
+    class BundlerBuilder
+      RELEASED_BUILT_AT = "2100-01-01"
+
+      def initialize(context, name, version)
+        @context = context
+        @spec = Spec::Path.loaded_gemspec.dup
+        @spec.version = version || Bundler::VERSION
+      end
+
+      def required_ruby_version
+        @spec.required_ruby_version
+      end
+
+      def required_ruby_version=(x)
+        @spec.required_ruby_version = x
+      end
+
+      def _build(options = {})
+        full_name = "bundler-#{@spec.version}"
+        build_path = (options[:build_path] || @context.tmp) + full_name
+        bundler_path = build_path + "#{full_name}.gem"
+
+        FileUtils.mkdir_p build_path
+
+        @context.shipped_files.each do |shipped_file|
+          target_shipped_file = shipped_file
+          target_shipped_file = shipped_file.sub(/\Alibexec/, "exe") if @context.ruby_core?
+          target_shipped_file = build_path + target_shipped_file
+          target_shipped_dir = File.dirname(target_shipped_file)
+          FileUtils.mkdir_p target_shipped_dir unless File.directory?(target_shipped_dir)
+          FileUtils.cp File.expand_path(shipped_file, @context.source_root), target_shipped_file, preserve: true
+        end
+
+        @context.replace_version_file(@spec.version, dir: build_path)
+
+        built_at = options[:released] ? RELEASED_BUILT_AT : nil
+        Spec::BuildMetadata.write_build_metadata(dir: build_path, built_at: built_at)
+
+        Dir.chdir build_path do
+          Gem::DefaultUserInteraction.use_ui(Gem::SilentUI.new) do
+            Gem::Package.build(@spec)
+          end
+        end
+
+        if block_given?
+          yield(bundler_path)
+        else
+          FileUtils.mv bundler_path, options[:path]
+        end
+      ensure
+        FileUtils.rm_rf build_path
+      end
+    end
+
     class LibBuilder
       def initialize(context, name, version)
         @context = context
@@ -412,6 +489,7 @@ module Spec
           s.email       = "foo@bar.baz"
           s.homepage    = "http://example.com"
           s.license     = "MIT"
+          s.required_ruby_version = ">= 3.0"
         end
         @files = {}
       end
@@ -428,24 +506,16 @@ module Spec
         @spec.executables = Array(val)
         @spec.executables.each do |file|
           executable = "#{@spec.bindir}/#{file}"
-          shebang = if Bundler.current_ruby.jruby?
-            "#!/usr/bin/env jruby\n"
-          else
-            "#!/usr/bin/env ruby\n"
-          end
+          shebang = "#!/usr/bin/env ruby\n"
           @spec.files << executable
           write executable, "#{shebang}require_relative '../lib/#{@name}' ; puts #{Builders.constantize(@name)}"
         end
       end
 
       def add_c_extension
-        require_paths << "ext"
         extensions << "ext/extconf.rb"
         write "ext/extconf.rb", <<-RUBY
           require "mkmf"
-
-
-          # exit 1 unless with_config("simple")
 
           extension_name = "#{name}_c"
           if extra_lib_dir = with_config("ext-lib")
@@ -460,7 +530,7 @@ module Spec
         write "ext/#{name}.c", <<-C
           #include "ruby.h"
 
-          void Init_#{name}_c() {
+          void Init_#{name}_c(void) {
             rb_define_module("#{Builders.constantize(name)}_IN_C");
           }
         C
@@ -471,7 +541,6 @@ module Spec
 
         if options[:rubygems_version]
           @spec.rubygems_version = options[:rubygems_version]
-          def @spec.mark_version; end
 
           def @spec.validate(*); end
         end
@@ -484,24 +553,22 @@ module Spec
         end
 
         @spec.authors = ["no one"]
-        @spec.files = @files.keys
+        @spec.files += @files.keys
 
         case options[:gemspec]
         when false
           # do nothing
         when :yaml
-          @spec.files << "#{name}.gemspec"
           @files["#{name}.gemspec"] = @spec.to_yaml
         else
-          @spec.files << "#{name}.gemspec"
           @files["#{name}.gemspec"] = @spec.to_ruby
         end
 
         @files.each do |file, source|
-          file = Pathname.new(path).join(file)
-          FileUtils.mkdir_p(file.dirname)
-          File.open(file, "w") {|f| f.puts source }
-          File.chmod("+x", file) if @spec.executables.map {|exe| "#{@spec.bindir}/#{exe}" }.include?(file)
+          full_path = Pathname.new(path).join(file)
+          FileUtils.mkdir_p(full_path.dirname)
+          File.open(full_path, "w") {|f| f.puts source }
+          FileUtils.chmod("+x", full_path) if @spec.executables.map {|exe| "#{@spec.bindir}/#{exe}" }.include?(file)
         end
         path
       end
@@ -525,10 +592,10 @@ module Spec
 
     class GitBuilder < LibBuilder
       def _build(options)
-        default_branch = options[:default_branch] || "master"
+        default_branch = options[:default_branch] || "main"
         path = options[:path] || _default_path
         source = options[:source] || "git@#{path}"
-        super(options.merge(:path => path, :source => source))
+        super(options.merge(path: path, source: source))
         @context.git("config --global init.defaultBranch #{default_branch}", path)
         @context.git("init", path)
         @context.git("add *", path)
@@ -542,7 +609,7 @@ module Spec
     class GitBareBuilder < LibBuilder
       def _build(options)
         path = options[:path] || _default_path
-        super(options.merge(:path => path))
+        super(options.merge(path: path))
         @context.git("init --bare", path)
       end
     end
@@ -567,7 +634,7 @@ module Spec
         _default_files.keys.each do |path|
           _default_files[path] += "\n#{Builders.constantize(name)}_PREV_REF = '#{current_ref}'"
         end
-        super(options.merge(:path => libpath, :gemspec => update_gemspec, :source => source))
+        super(options.merge(path: libpath, gemspec: update_gemspec, source: source))
         @context.git("commit -am BUMP", libpath)
       end
     end
@@ -589,25 +656,29 @@ module Spec
 
     class GemBuilder < LibBuilder
       def _build(opts)
-        lib_path = super(opts.merge(:path => @context.tmp(".tmp/#{@spec.full_name}"), :no_default => opts[:no_default]))
+        lib_path = opts[:lib_path] || @context.tmp(".tmp/#{@spec.full_name}")
+        lib_path = super(opts.merge(path: lib_path, no_default: opts[:no_default]))
         destination = opts[:path] || _default_path
         FileUtils.mkdir_p(lib_path.join(destination))
 
-        if opts[:gemspec] == :yaml || opts[:gemspec] == false
-          Dir.chdir(lib_path) do
-            Bundler.rubygems.build(@spec, opts[:skip_validation])
+        built_gem =
+          if opts[:content_addressable]
+            Dir.chdir(lib_path) { Gem::Package.build(@spec, content_addressable: true) }
+          elsif [:yaml, false].include?(opts[:gemspec])
+            Dir.chdir(lib_path) do
+              Bundler.rubygems.build(@spec, opts[:skip_validation])
+            end
+          elsif opts[:skip_validation]
+            Dir.chdir(lib_path) { Gem::Package.build(@spec, true) }
+          else
+            Dir.chdir(lib_path) { Gem::Package.build(@spec) }
           end
-        elsif opts[:skip_validation]
-          @context.gem_command "build --force #{@spec.name}", :dir => lib_path
-        else
-          @context.gem_command "build #{@spec.name}", :dir => lib_path
-        end
 
-        gem_path = File.expand_path("#{@spec.full_name}.gem", lib_path)
+        gem_path = File.expand_path(built_gem || "#{@spec.full_name}.gem", lib_path)
         if opts[:to_system]
-          @context.system_gems gem_path, :default => opts[:default]
+          @context.system_gems gem_path, default: opts[:default]
         elsif opts[:to_bundle]
-          @context.system_gems gem_path, :path => @context.default_bundle_path
+          @context.system_gems gem_path, path: @context.default_bundle_path
         else
           FileUtils.mv(gem_path, destination)
         end
@@ -627,56 +698,56 @@ module Spec
       end
     end
 
-    TEST_CERT = <<-CERT.gsub(/^\s*/, "")
+    TEST_CERT = <<~CERT
       -----BEGIN CERTIFICATE-----
-      MIIDMjCCAhqgAwIBAgIBATANBgkqhkiG9w0BAQUFADAnMQwwCgYDVQQDDAN5b3Ux
+      MIIDNTCCAh2gAwIBAgIBATANBgkqhkiG9w0BAQsFADAnMQwwCgYDVQQDDAN5b3Ux
       FzAVBgoJkiaJk/IsZAEZFgdleGFtcGxlMB4XDTE1MDIwODAwMTIyM1oXDTQyMDYy
       NTAwMTIyM1owJzEMMAoGA1UEAwwDeW91MRcwFQYKCZImiZPyLGQBGRYHZXhhbXBs
-      ZTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBANlvFdpN43c4DMS9Jo06
-      m0a7k3bQ3HWQ1yrYhZMi77F1F73NpBknYHIzDktQpGn6hs/4QFJT4m4zNEBF47UL
-      jHU5nTK5rjkS3niGYUjvh3ZEzVeo9zHUlD/UwflDo4ALl3TSo2KY/KdPS/UTdLXL
-      ajkQvaVJtEDgBPE3DPhlj5whp+Ik3mDHej7qpV6F502leAwYaFyOtlEG/ZGNG+nZ
-      L0clH0j77HpP42AylHDi+vakEM3xcjo9BeWQ6Vkboic93c9RTt6CWBWxMQP7Nol1
-      MOebz9XOSQclxpxWteXNfPRtMdAhmRl76SMI8ywzThNPpa4EH/yz34ftebVOgKyM
-      nd0CAwEAAaNpMGcwCQYDVR0TBAIwADALBgNVHQ8EBAMCBLAwHQYDVR0OBBYEFA7D
-      n9qo0np23qi3aOYuAAPn/5IdMBYGA1UdEQQPMA2BC3lvdUBleGFtcGxlMBYGA1Ud
-      EgQPMA2BC3lvdUBleGFtcGxlMA0GCSqGSIb3DQEBBQUAA4IBAQA7Gyk62sWOUX/N
-      vk4tJrgKESph6Ns8+E36A7n3jt8zCep8ldzMvwTWquf9iqhsC68FilEoaDnUlWw7
-      d6oNuaFkv7zfrWGLlvqQJC+cu2X5EpcCksg5oRp8VNbwJysJ6JgwosxzROII8eXc
-      R+j1j6mDvQYqig2QOnzf480pjaqbP+tspfDFZbhKPrgM3Blrb3ZYuFpv4zkqI7aB
-      6fuk2DUhNO1CuwrJA84TqC+jGo73bDKaT5hrIDiaJRrN5+zcWja2uEWrj5jSbep4
-      oXdEdyH73hOHMBP40uds3PqnUsxEJhzjB2sCCe1geV24kw9J4m7EQXPVkUKDgKrt
-      LlpDmOoo
+      ZTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMkupYkg3Nd1oXM3fo0d
+      mVJBWNrni88lKDuIIQXwcKe6XCgiloZG708ecLTOws9+o9MkTl9Wtpf/WGXT98NK
+      EPUYakd2Fv1SuD1jWYlP7iDR6hB3RkWBm5ziujYftVJ4ZrPD42PLjDASvlh75Tvr
+      MeM7yq/qkcgNsd9dQyUvMNPks3tla9je7Dt7Auli2IN3CNXys7gIOfwJH0Bb/M6t
+      y7oUfpoUKAfLzwe61abztgDu1lSNgdFBM1kcxYflyh/FkX5TlAcWeAXzLrnxAXGR
+      UxXrxW4oPC+kZi/pDRBd7X4zQDx7bCmr1+FsS3M05i3w5E08Tt9iKRk4V8nCmE4i
+      k6UCAwEAAaNsMGowCQYDVR0TBAIwADAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0OBBYE
+      FOOOFw5TNAqt/TcRRZEU3Dg/58XuMBYGA1UdEQQPMA2BC3lvdUBleGFtcGxlMBYG
+      A1UdEgQPMA2BC3lvdUBleGFtcGxlMA0GCSqGSIb3DQEBCwUAA4IBAQAy3xnmobxU
+      1SyhHvoIXTJmG0wt1DQ/Dqwjy362LpEf1UHt29wtg1Mph58eVtl93z5Vd2t4/O77
+      E2BHpSu9ujc6/Br4+2uA/Qk/xRyLBtZAwty6J4uFvOOg985HonN+RCUZbKSUTmtA
+      TZvNtIDAZFQ8Tu75K4gIBxDcz7biGi4i1VJ3F3GNCNeossr9IQwKvb+UWFq14U5R
+      IzUnGgMIzcjUG2kKQvddRD1CjS+egtcLvShbOfm5bs4w4rfQ2FPF+Aaf9v7fxa/c
+      Jrf3K+cB19eAy7O4nlPG1xurvnZd0QpqRk++werrBuKe1Pgga7YBLePfJhzwqcZv
+      wVOSsB870yeO
       -----END CERTIFICATE-----
     CERT
 
-    TEST_PKEY = <<-PKEY.gsub(/^\s*/, "")
+    TEST_PKEY = <<~PKEY
       -----BEGIN RSA PRIVATE KEY-----
-      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
+      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
       -----END RSA PRIVATE KEY-----
     PKEY
   end

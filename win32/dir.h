@@ -1,13 +1,14 @@
 #ifndef RUBY_WIN32_DIR_H
 #define RUBY_WIN32_DIR_H
 #include <stdint.h>             /* for uint8_t */
-#include <esent.h>              /* for WCHAR */
+#include <basetsd.h>            /* for WCHAR */
 #include "ruby/encoding.h"      /* for rb_encoding */
 
 #define DT_UNKNOWN 0
 #define DT_DIR (S_IFDIR>>12)
 #define DT_REG (S_IFREG>>12)
 #define DT_LNK 10
+#define IFTODT(m) (((m) & S_IFMT) >> 12)
 
 struct direct
 {
@@ -36,7 +37,7 @@ struct direct* rb_w32_ureaddir(DIR *);
 long           rb_w32_telldir(DIR *);
 void           rb_w32_seekdir(DIR *, long);
 void           rb_w32_rewinddir(DIR *);
-void           rb_w32_closedir(DIR *);
+int            rb_w32_closedir(DIR *);
 char          *rb_w32_ugetcwd(char *, int);
 
 #define opendir(s)   rb_w32_uopendir((s))

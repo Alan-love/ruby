@@ -1,4 +1,4 @@
-# -*- encoding: binary -*-
+# encoding: binary
 require_relative 'spec_helper'
 
 load_extension("integer")
@@ -139,6 +139,23 @@ describe "CApiIntegerSpecs" do
                   CApiIntegerSpecs::NATIVE|CApiIntegerSpecs::PACK_2COMP)
               result.should == -1
               @words.should == "\x11\x32\x54\x76\x98\xBA\xDC\xFE"
+            end
+
+            it "converts numbers near the fixnum limit successfully" do
+              result = @s.rb_integer_pack(0x7123_4567_89ab_cdef, @words, 1, 8, 0,
+                CApiIntegerSpecs::NATIVE|CApiIntegerSpecs::PACK_2COMP)
+              result.should == 1
+              @words.should == "\xEF\xCD\xAB\x89\x67\x45\x23\x71"
+
+              result = @s.rb_integer_pack(2**62-1, @words, 1, 8, 0,
+                CApiIntegerSpecs::NATIVE|CApiIntegerSpecs::PACK_2COMP)
+              result.should == 1
+              @words.should == "\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x3F"
+
+              result = @s.rb_integer_pack(2**63-1, @words, 1, 8, 0,
+                CApiIntegerSpecs::NATIVE|CApiIntegerSpecs::PACK_2COMP)
+              result.should == 1
+              @words.should == "\xFF\xFF\xFF\xFF\xFF\xFF\xFF\x7F"
             end
           end
         end
@@ -285,6 +302,14 @@ describe "CApiIntegerSpecs" do
 
     it "overflows for large inputs" do
       @s.rb_int_positive_pow(8, 23).should == 590295810358705651712
+    end
+  end
+
+  ruby_version_is "4.1" do
+    describe "rb_int_parse_cstr" do
+      it "returns the parsed integer, end position, and digit count" do
+        @s.rb_int_parse_cstr("123x", nil, 10, 0).should == [123, 3, 3]
+      end
     end
   end
 end

@@ -92,6 +92,31 @@ module Psych
       assert_equal X, x.class
     end
 
+    class NotAHash
+      def init_with(coder)
+        @string = coder.map["string"].to_s
+      end
+    end
+
+    def test_hash_with_ivars_rejects_non_hash_class
+      assert_raise(ArgumentError) do
+        Psych.unsafe_load <<~eoyml
+          --- !ruby/hash-with-ivars:#{NotAHash}
+          ivars:
+            '@string': ["a surprise array!"]
+        eoyml
+      end
+    end
+
+    def test_hash_tag_rejects_non_hash_class
+      assert_raise(ArgumentError) do
+        Psych.unsafe_load "--- !ruby/hash:#{NotAHash} {}\n"
+      end
+      assert_raise(ArgumentError) do
+        Psych.unsafe_load "--- !map:#{NotAHash} {}\n"
+      end
+    end
+
     def test_self_referential
       @hash['self'] = @hash
       assert_cycle(@hash)
@@ -102,14 +127,54 @@ module Psych
     end
 
     def test_ref_append
-      hash = Psych.unsafe_load(<<-eoyml)
----
-foo: &foo
-  hello: world
-bar:
-  <<: *foo
-eoyml
+      hash = Psych.unsafe_load(<<~eoyml)
+        ---
+        foo: &foo
+          hello: world
+        bar:
+          <<: *foo
+      eoyml
       assert_equal({"foo"=>{"hello"=>"world"}, "bar"=>{"hello"=>"world"}}, hash)
+    end
+
+    def test_anchor_reuse
+      hash = Psych.unsafe_load(<<~eoyml)
+        ---
+        foo: &foo
+          hello: world
+        bar: *foo
+      eoyml
+      assert_equal({"foo"=>{"hello"=>"world"}, "bar"=>{"hello"=>"world"}}, hash)
+      assert_same(hash.fetch("foo"), hash.fetch("bar"))
+    end
+
+    def test_raises_if_anchor_not_defined
+      assert_raise(Psych::AnchorNotDefined) do
+        Psych.unsafe_load(<<~eoyml)
+          ---
+          foo: &foo
+            hello: world
+          bar: *not_foo
+        eoyml
+      end
+    end
+
+    def test_recursive_hash
+      h = { }
+      h["recursive_reference"] = h
+
+      loaded = Psych.load(Psych.dump(h), aliases: true)
+
+      assert_same loaded, loaded.fetch("recursive_reference")
+    end
+
+    def test_recursive_hash_uses_alias
+      h = { }
+      h["recursive_reference"] = h
+
+      assert_raise(AliasesNotEnabled) do
+        Psych.load(Psych.dump(h), aliases: false)
+      end
     end
 
     def test_key_deduplication
@@ -117,11 +182,11 @@ eoyml
         pend "This Ruby implementation doesn't support string deduplication"
       end
 
-      hashes = Psych.load(<<-eoyml)
----
-- unique_identifier: 1
-- unique_identifier: 2
-eoyml
+      hashes = Psych.load(<<~eoyml)
+        ---
+        - unique_identifier: 1
+        - unique_identifier: 2
+      eoyml
 
       assert_same hashes[0].keys.first, hashes[1].keys.first
     end

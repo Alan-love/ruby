@@ -22,6 +22,8 @@ describe "CApiModule" do
     it "sets a new constant on a module" do
       @m.rb_const_set(CApiModuleSpecs::C, :W, 7)
       CApiModuleSpecs::C::W.should == 7
+    ensure
+      CApiModuleSpecs::C.send(:remove_const, :W)
     end
 
     it "sets an existing constant's value" do
@@ -34,15 +36,15 @@ describe "CApiModule" do
     it "allows arbitrary names, including constant names not valid in Ruby" do
       -> {
         CApiModuleSpecs::C.const_set(:_INVALID, 1)
-      }.should raise_error(NameError, /wrong constant name/)
+      }.should.raise(NameError, /wrong constant name/)
 
-      @m.rb_const_set(CApiModuleSpecs::C, :_INVALID, 2)
+      suppress_warning { @m.rb_const_set(CApiModuleSpecs::C, :_INVALID, 2) }
       @m.rb_const_get(CApiModuleSpecs::C, :_INVALID).should == 2
 
       # Ruby-level should still not allow access
       -> {
         CApiModuleSpecs::C.const_get(:_INVALID)
-      }.should raise_error(NameError, /wrong constant name/)
+      }.should.raise(NameError, /wrong constant name/)
     end
   end
 
@@ -54,15 +56,15 @@ describe "CApiModule" do
 
     it "raises a TypeError if the constant is not a module" do
       ::CApiModuleSpecsGlobalConst = 7
-      -> { @m.rb_define_module("CApiModuleSpecsGlobalConst") }.should raise_error(TypeError)
+      -> { @m.rb_define_module("CApiModuleSpecsGlobalConst") }.should.raise(TypeError)
       Object.send :remove_const, :CApiModuleSpecsGlobalConst
     end
 
     it "defines a new module at toplevel" do
       mod = @m.rb_define_module("CApiModuleSpecsModuleB")
-      mod.should be_kind_of(Module)
+      mod.should.is_a?(Module)
       mod.name.should == "CApiModuleSpecsModuleB"
-      ::CApiModuleSpecsModuleB.should be_kind_of(Module)
+      ::CApiModuleSpecsModuleB.should.is_a?(Module)
       Object.send :remove_const, :CApiModuleSpecsModuleB
     end
   end
@@ -70,7 +72,7 @@ describe "CApiModule" do
   describe "rb_define_module_under" do
     it "creates a new module inside the inner class" do
       mod = @m.rb_define_module_under(CApiModuleSpecs, "ModuleSpecsModuleUnder1")
-      mod.should be_kind_of(Module)
+      mod.should.is_a?(Module)
     end
 
     it "sets the module name" do
@@ -93,6 +95,8 @@ describe "CApiModule" do
     it "defines a new constant on a module" do
       @m.rb_define_const(CApiModuleSpecs::C, "V", 7)
       CApiModuleSpecs::C::V.should == 7
+    ensure
+      CApiModuleSpecs::C.send(:remove_const, :V)
     end
 
     it "sets an existing constant's value" do
@@ -106,26 +110,26 @@ describe "CApiModule" do
   describe "rb_const_defined" do
     # The fixture converts C boolean test to Ruby 'true' / 'false'
     it "returns C non-zero if a constant is defined" do
-      @m.rb_const_defined(CApiModuleSpecs::A, :X).should be_true
+      @m.rb_const_defined(CApiModuleSpecs::A, :X).should == true
     end
 
     it "returns C non-zero if a constant is defined in Object" do
-      @m.rb_const_defined(CApiModuleSpecs::A, :Module).should be_true
+      @m.rb_const_defined(CApiModuleSpecs::A, :Module).should == true
     end
   end
 
   describe "rb_const_defined_at" do
     # The fixture converts C boolean test to Ruby 'true' / 'false'
     it "returns C non-zero if a constant is defined" do
-      @m.rb_const_defined_at(CApiModuleSpecs::A, :X).should be_true
+      @m.rb_const_defined_at(CApiModuleSpecs::A, :X).should == true
     end
 
     it "does not search in ancestors for the constant" do
-      @m.rb_const_defined_at(CApiModuleSpecs::B, :X).should be_false
+      @m.rb_const_defined_at(CApiModuleSpecs::B, :X).should == false
     end
 
     it "does not search in Object" do
-      @m.rb_const_defined_at(CApiModuleSpecs::A, :Module).should be_false
+      @m.rb_const_defined_at(CApiModuleSpecs::A, :Module).should == false
     end
   end
 
@@ -162,11 +166,11 @@ describe "CApiModule" do
     it "allows arbitrary names, including constant names not valid in Ruby" do
       -> {
         CApiModuleSpecs::A.const_get(:_INVALID)
-      }.should raise_error(NameError, /wrong constant name/)
+      }.should.raise(NameError, /wrong constant name/)
 
       -> {
         @m.rb_const_get(CApiModuleSpecs::A, :_INVALID)
-      }.should raise_error(NameError, /uninitialized constant/)
+      }.should.raise(NameError, /uninitialized constant/)
     end
   end
 
@@ -233,7 +237,7 @@ describe "CApiModule" do
   describe "rb_define_global_function" do
     it "defines a method on Kernel" do
       @m.rb_define_global_function("module_specs_global_function")
-      Kernel.should have_method(:module_specs_global_function)
+      Kernel.should.respond_to?(:module_specs_global_function)
       module_specs_global_function.should == :test_method
     end
   end
@@ -242,7 +246,7 @@ describe "CApiModule" do
     it "defines a method on a class" do
       cls = Class.new
       @m.rb_define_method(cls, "test_method")
-      cls.should have_instance_method(:test_method)
+      cls.should.method_defined?(:test_method, false)
       cls.new.test_method.should == :test_method
     end
 
@@ -252,28 +256,36 @@ describe "CApiModule" do
       cls.new.method(:test_method).arity.should == 0
     end
 
-    it "returns the correct arity when argc of the method in class is -1" do
-      cls = Class.new
-      @m.rb_define_method_c_array(cls, "test_method_c_array")
-      cls.new.method(:test_method_c_array).arity.should == -1
-    end
-
-    it "returns the correct arity when argc of the method in class is -2" do
-      cls = Class.new
-      @m.rb_define_method_ruby_array(cls, "test_method_ruby_array")
-      cls.new.method(:test_method_ruby_array).arity.should == -1
+    it "returns the correct arity when argc of the method in class is 1" do
+      @m.rb_define_method_1required(42).should == 42
+      @m.method(:rb_define_method_1required).arity.should == 1
     end
 
     it "returns the correct arity when argc of the method in class is 2" do
-      cls = Class.new
-      @m.rb_define_method_2required(cls, "test_method_2required")
-      cls.new.method(:test_method_2required).arity.should == 2
+      @m.rb_define_method_2required(1, 2).should == 2
+      @m.method(:rb_define_method_2required).arity.should == 2
+    end
+
+    it "defines a method taking variable arguments as a C array if the argument count is -1" do
+      @m.rb_define_method_varargs_1(1, 3, 7, 4).should == [1, 3, 7, 4]
+    end
+
+    it "returns the correct arity when argc of the method in class is -1" do
+      @m.method(:rb_define_method_varargs_1).arity.should == -1
+    end
+
+    it "defines a method taking variable arguments as a Ruby array if the argument count is -2" do
+      @m.rb_define_method_varargs_2(1, 3, 7, 4).should == [1, 3, 7, 4]
+    end
+
+    it "returns the correct arity when argc of the method in class is -2" do
+      @m.method(:rb_define_method_varargs_2).arity.should == -1
     end
 
     it "defines a method on a module" do
       mod = Module.new
       @m.rb_define_method(mod, "test_method")
-      mod.should have_instance_method(:test_method)
+      mod.should.method_defined?(:test_method, false)
     end
 
     it "returns the correct arity of the method in module" do
@@ -301,7 +313,7 @@ describe "CApiModule" do
       cls = Class.new
       cls.include(@mod)
 
-      cls.should have_private_instance_method(:test_module_function)
+      cls.private_instance_methods(true).should.include?(:test_module_function)
     end
 
     it "returns the correct arity for private instance method" do
@@ -316,14 +328,14 @@ describe "CApiModule" do
     it "defines a private method on a class" do
       cls = Class.new
       @m.rb_define_private_method(cls, "test_method")
-      cls.should have_private_instance_method(:test_method)
+      cls.private_instance_methods(false).should.include?(:test_method)
       cls.new.send(:test_method).should == :test_method
     end
 
     it "defines a private method on a module" do
       mod = Module.new
       @m.rb_define_private_method(mod, "test_method")
-      mod.should have_private_instance_method(:test_method)
+      mod.private_instance_methods(false).should.include?(:test_method)
     end
   end
 
@@ -331,14 +343,14 @@ describe "CApiModule" do
     it "defines a protected method on a class" do
       cls = Class.new
       @m.rb_define_protected_method(cls, "test_method")
-      cls.should have_protected_instance_method(:test_method)
+      cls.protected_instance_methods(false).should.include?(:test_method)
       cls.new.send(:test_method).should == :test_method
     end
 
     it "defines a protected method on a module" do
       mod = Module.new
       @m.rb_define_protected_method(mod, "test_method")
-      mod.should have_protected_instance_method(:test_method)
+      mod.protected_instance_methods(false).should.include?(:test_method)
     end
   end
 
@@ -348,7 +360,7 @@ describe "CApiModule" do
       a = cls.new
       @m.rb_define_singleton_method a, "module_specs_singleton_method"
       a.module_specs_singleton_method.should == :test_method
-      -> { cls.new.module_specs_singleton_method }.should raise_error(NoMethodError)
+      -> { cls.new.module_specs_singleton_method }.should.raise(NoMethodError)
     end
   end
 
@@ -364,16 +376,16 @@ describe "CApiModule" do
     it "undef'ines a method on a class" do
       @class.new.ruby_test_method.should == :ruby_test_method
       @m.rb_undef_method @class, "ruby_test_method"
-      @class.should_not have_instance_method(:ruby_test_method)
+      @class.should_not.method_defined?(:ruby_test_method)
     end
 
     it "undefines private methods also" do
       @m.rb_undef_method @class, "initialize_copy"
-      -> { @class.new.dup }.should raise_error(NoMethodError)
+      -> { @class.new.dup }.should.raise(NoMethodError)
     end
 
     it "does not raise exceptions when passed a missing name" do
-      -> { @m.rb_undef_method @class, "not_exist" }.should_not raise_error
+      -> { @m.rb_undef_method @class, "not_exist" }.should_not.raise
     end
 
     describe "when given a frozen Class" do
@@ -382,11 +394,11 @@ describe "CApiModule" do
       end
 
       it "raises a FrozenError when passed a name" do
-        -> { @m.rb_undef_method @frozen, "ruby_test_method" }.should raise_error(FrozenError)
+        -> { @m.rb_undef_method @frozen, "ruby_test_method" }.should.raise(FrozenError)
       end
 
       it "raises a FrozenError when passed a missing name" do
-        -> { @m.rb_undef_method @frozen, "not_exist" }.should raise_error(FrozenError)
+        -> { @m.rb_undef_method @frozen, "not_exist" }.should.raise(FrozenError)
       end
     end
   end
@@ -401,7 +413,7 @@ describe "CApiModule" do
 
       cls.new.ruby_test_method.should == :ruby_test_method
       @m.rb_undef cls, :ruby_test_method
-      cls.should_not have_instance_method(:ruby_test_method)
+      cls.should_not.method_defined?(:ruby_test_method)
     end
   end
 

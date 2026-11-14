@@ -3,8 +3,6 @@
 # include "coroutine/amd64/Context.S"
 #elif defined __i386__
 # include "coroutine/x86/Context.S"
-#elif defined __ppc64__
-# include "coroutine/ppc64le/Context.S"
 #elif defined __arm64__
 # include "coroutine/arm64/Context.S"
 #else

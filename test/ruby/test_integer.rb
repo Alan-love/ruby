@@ -2,16 +2,9 @@
 require 'test/unit'
 
 class TestInteger < Test::Unit::TestCase
-  BDSIZE = 0x4000000000000000.coerce(0)[0].size
-  def self.bdsize(x)
-    ((x + 1) / 8 + BDSIZE) / BDSIZE * BDSIZE
-  end
-  def bdsize(x)
-    self.class.bdsize(x)
-  end
-
   FIXNUM_MIN = RbConfig::LIMITS['FIXNUM_MIN']
   FIXNUM_MAX = RbConfig::LIMITS['FIXNUM_MAX']
+  LONG_MAX = RbConfig::LIMITS['LONG_MAX']
 
   def test_aref
 
@@ -64,20 +57,19 @@ class TestInteger < Test::Unit::TestCase
                           nil
                         end, "[ruby-dev:32084] [ruby-dev:34547]")
 
-    x = EnvUtil.suppress_warning {2 ** -0x4000000000000000}
-    assert_in_delta(0.0, (x / 2), Float::EPSILON)
+    assert_raise(ArgumentError) {2 ** -0x4000000000000000}
 
     <<~EXPRS.each_line.with_index(__LINE__+1) do |expr, line|
       crash01: 111r+11**-11111161111111
       crash02: 1118111111111**-1111111111111111**1+1==11111
-      crash03: -1111111**-1111*11 - -1111111** -111111111
+      crash03: -1111111**-1111*11 - -11** -1111111
       crash04: 1118111111111** -1111111111111111**1+11111111111**1 ===111
       crash05: 11** -111155555555555555  -55   !=5-555
       crash07: 1 + 111111111**-1111811111
       crash08: 18111111111**-1111111111111111**1 + 1111111111**-1111**1
       crash10: -7 - -1111111** -1111**11
       crash12: 1118111111111** -1111111111111111**1 + 1111 - -1111111** -1111*111111111119
-      crash13: 1.0i - -1111111** -111111111
+      crash13: 1.0i - -11** -1111111
       crash14: 11111**111111111**111111 * -11111111111111111111**-111111111111
       crash15: ~1**1111 + -~1**~1**111
       crash17: 11** -1111111**1111 /11i
@@ -87,7 +79,7 @@ class TestInteger < Test::Unit::TestCase
       crash21: 11**-10111111119-1i -1r
     EXPRS
       name, expr = expr.split(':', 2)
-      assert_ruby_status(%w"-W0", expr, name)
+      assert_ruby_status(%w"-W0", "begin; #{ expr }; rescue ArgumentError; end", name)
     end
   end
 
@@ -96,11 +88,16 @@ class TestInteger < Test::Unit::TestCase
     assert_equal(0, 1 << -0x40000001)
     assert_equal(0, 1 << -0x80000000)
     assert_equal(0, 1 << -0x80000001)
-    # assert_equal(bdsize(0x80000000), (1 << 0x80000000).size)
+
+    char_bit = RbConfig::LIMITS["UCHAR_MAX"].bit_length
+    size_max = RbConfig::LIMITS["SIZE_MAX"]
+    size_bit_max = size_max * char_bit
+    assert_raise_with_message(RangeError, /shift width/) {
+      1 << size_bit_max
+    }
   end
 
   def test_rshift
-    # assert_equal(bdsize(0x40000001), (1 >> -0x40000001).size)
     assert_predicate((1 >> 0x80000000), :zero?)
     assert_predicate((1 >> 0xffffffff), :zero?)
     assert_predicate((1 >> 0x100000000), :zero?)
@@ -140,20 +137,6 @@ class TestInteger < Test::Unit::TestCase
     assert_equal(1234, Integer(1234))
     assert_equal(1, Integer(1.234))
 
-    # base argument
-    assert_equal(1234, Integer("1234", 10))
-    assert_equal(668, Integer("1234", 8))
-    assert_equal(4660, Integer("1234", 16))
-    assert_equal(49360, Integer("1234", 36))
-    # decimal, not octal
-    assert_equal(1234, Integer("01234", 10))
-    assert_raise(ArgumentError) { Integer("0x123", 10) }
-    assert_raise(ArgumentError) { Integer(1234, 10) }
-    assert_raise(ArgumentError) { Integer(12.34, 10) }
-    assert_raise(ArgumentError) { Integer(Object.new, 1) }
-
-    assert_raise(ArgumentError) { Integer(1, 1, 1) }
-
     assert_equal(2 ** 50, Integer(2.0 ** 50))
     assert_raise(TypeError) { Integer(nil) }
 
@@ -175,7 +158,9 @@ class TestInteger < Test::Unit::TestCase
     assert_raise(Encoding::CompatibilityError, bug6192) {Integer("0".encode("utf-32le"))}
     assert_raise(Encoding::CompatibilityError, bug6192) {Integer("0".encode("iso-2022-jp"))}
 
-    assert_raise_with_message(ArgumentError, /\u{1f4a1}/) {Integer("\u{1f4a1}")}
+    EnvUtil.with_default_internal(Encoding::UTF_8) do
+      assert_raise_with_message(ArgumentError, /\u{1f4a1}/) {Integer("\u{1f4a1}")}
+    end
 
     obj = Struct.new(:s).new(%w[42 not-an-integer])
     def obj.to_str; s.shift; end
@@ -247,6 +232,39 @@ class TestInteger < Test::Unit::TestCase
     end;
   end
 
+  def test_Integer_when_to_str
+    def (obj = Object.new).to_str
+      "0x10"
+    end
+    assert_equal(16, Integer(obj))
+  end
+
+  def test_Integer_with_base
+    assert_equal(1234, Integer("1234", 10))
+    assert_equal(668, Integer("1234", 8))
+    assert_equal(4660, Integer("1234", 16))
+    assert_equal(49360, Integer("1234", 36))
+    # decimal, not octal
+    assert_equal(1234, Integer("01234", 10))
+    assert_raise(ArgumentError) { Integer("0x123", 10) }
+    assert_raise(ArgumentError) { Integer(1234, 10) }
+    assert_raise(ArgumentError) { Integer(12.34, 10) }
+    assert_raise(ArgumentError) { Integer(Object.new, 1) }
+
+    assert_raise(ArgumentError) { Integer(1, 1, 1) }
+
+    def (base = Object.new).to_int
+      8
+    end
+    assert_equal(8, Integer("10", base))
+
+    assert_raise(TypeError) { Integer("10", "8") }
+    def (base = Object.new).to_int
+      "8"
+    end
+    assert_raise(TypeError) { Integer("10", base) }
+  end
+
   def test_int_p
     assert_not_predicate(1.0, :integer?)
     assert_predicate(1, :integer?)
@@ -265,31 +283,49 @@ class TestInteger < Test::Unit::TestCase
 
   def test_upto
     a = []
-    1.upto(3) {|x| a << x }
+    assert_equal(1, 1.upto(3) {|x| a << x })
     assert_equal([1, 2, 3], a)
 
     a = []
-    1.upto(0) {|x| a << x }
+    assert_equal(1, 1.upto(0) {|x| a << x })
     assert_equal([], a)
 
     y = 2**30 - 1
     a = []
-    y.upto(y+2) {|x| a << x }
+    assert_equal(y, y.upto(y+2) {|x| a << x })
     assert_equal([y, y+1, y+2], a)
+
+    a = []
+    1.upto(Float::NAN) {|x| a << x; break if a.size == 3 }
+    assert_equal([1, 2, 3], a)
+  end
+
+  def test_upto_comparator_returns_nil
+    assert_separately([], "#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      $VERBOSE = nil
+      class Integer
+        def >(other)
+          nil
+        end
+      end
+      assert_raise_with_message(ArgumentError, /comparator returned nil/) { 1.upto(3.5) {} }
+      assert_raise_with_message(ArgumentError, /comparator returned nil/) { (2**64).upto(2**64+1) {} }
+    end;
   end
 
   def test_downto
     a = []
-    -1.downto(-3) {|x| a << x }
+    assert_equal(-1, -1.downto(-3) {|x| a << x })
     assert_equal([-1, -2, -3], a)
 
     a = []
-    1.downto(2) {|x| a << x }
+    assert_equal(1, 1.downto(2) {|x| a << x })
     assert_equal([], a)
 
     y = -(2**30)
     a = []
-    y.downto(y-2) {|x| a << x }
+    assert_equal(y, y.downto(y-2) {|x| a << x })
     assert_equal([y, y-1, y-2], a)
   end
 
@@ -297,6 +333,42 @@ class TestInteger < Test::Unit::TestCase
     (2**32).times do |i|
       break if i == 2
     end
+  end
+
+  def test_times_bignum_redefine_plus_lt
+    assert_separately([], "#{<<-"begin;"}\n#{<<~"end;"}")
+    begin;
+      called = false
+      Integer.class_eval do
+        alias old_succ succ
+        undef succ
+        define_method(:succ){|x| called = true; x+1}
+        alias old_lt <
+        undef <
+        define_method(:<){|x| called = true}
+      end
+
+      fix = 1
+      fix.times{break 0}
+      fix_called = called
+
+      called = false
+
+      big = 2**65
+      big.times{break 0}
+      big_called = called
+
+      Integer.class_eval do
+        undef succ
+        alias succ old_succ
+        undef <
+        alias < old_lt
+      end
+
+      # Asssert that Fixnum and Bignum behave consistently
+      bug18377 = "[ruby-core:106361]"
+      assert_equal(fix_called, big_called, bug18377)
+    end;
   end
 
   def assert_int_equal(expected, result, mesg = nil)
@@ -412,6 +484,10 @@ class TestInteger < Test::Unit::TestCase
 
     assert_int_equal(1111_1111_1111_1111_1111_1111_1111_1111, 1111_1111_1111_1111_1111_1111_1111_1111.floor(1))
     assert_int_equal(10**400, (10**400).floor(1))
+
+    assert_int_equal(-10000000000, -1.floor(-10), "[Bug #20654]")
+    assert_int_equal(-100000000000000000000, -1.floor(-20), "[Bug #20654]")
+    assert_int_equal(-100000000000000000000000000000000000000000000000000, -1.floor(-50), "[Bug #20654]")
   end
 
   def test_ceil
@@ -440,6 +516,10 @@ class TestInteger < Test::Unit::TestCase
 
     assert_int_equal(1111_1111_1111_1111_1111_1111_1111_1111, 1111_1111_1111_1111_1111_1111_1111_1111.ceil(1))
     assert_int_equal(10**400, (10**400).ceil(1))
+
+    assert_int_equal(10000000000, 1.ceil(-10), "[Bug #20654]")
+    assert_int_equal(100000000000000000000, 1.ceil(-20), "[Bug #20654]")
+    assert_int_equal(100000000000000000000000000000000000000000000000000, 1.ceil(-50), "[Bug #20654]")
   end
 
   def test_truncate
@@ -570,6 +650,41 @@ class TestInteger < Test::Unit::TestCase
     }
   end
 
+  def test_bit_count
+    assert_equal(0, 0.bit_count)
+    assert_equal(1, 1.bit_count)
+    assert_equal(1, 2.bit_count)
+    assert_equal(2, 3.bit_count)
+    assert_equal(3, 7.bit_count)
+    assert_equal(3, 0b10101.bit_count)
+    assert_equal(8, 0xff.bit_count)
+    assert_equal(1, 0x100.bit_count)
+
+    # Fixnum boundaries
+    assert_equal(1, (2**30).bit_count)
+    assert_equal(1, (2**62).bit_count)
+
+    # Bignum
+    assert_equal(1, (2**64).bit_count)
+    assert_equal(64, (2**64-1).bit_count)
+    assert_equal(1, (2**1000).bit_count)
+    assert_equal(1000, (2**1000-1).bit_count)
+    assert_equal(2, (2**1000 + 2**500).bit_count)
+
+    0.upto(1000) {|i|
+      n = 2**i
+      assert_equal(1, n.bit_count, "(#{n}).bit_count")
+      assert_equal(i, (n-1).bit_count, "(#{n-1}).bit_count")
+      assert_equal(2, (n+1).bit_count, "(#{n+1}).bit_count") if i >= 1
+    }
+  end
+
+  def test_bit_count_for_negative_numbers
+    assert_raise(ArgumentError) { -1.bit_count }
+    assert_raise(ArgumentError) { -19.bit_count }
+    assert_raise(ArgumentError) { (-2**1000).bit_count }
+  end
+
   def test_digits
     assert_equal([0], 0.digits)
     assert_equal([1], 1.digits)
@@ -648,9 +763,21 @@ class TestInteger < Test::Unit::TestCase
     assert_equal(x, Integer.sqrt(x ** 2), "[ruby-core:95453]")
   end
 
+  def test_bug_21217
+    assert_equal(0x10000 * 2**10, Integer.sqrt(0x100000008 * 2**20))
+  end
+
   def test_fdiv
     assert_equal(1.0, 1.fdiv(1))
     assert_equal(0.5, 1.fdiv(2))
+
+    m = 50 << Float::MANT_DIG
+    prev = 1.0
+    (1..100).each do |i|
+      val = (m + i).fdiv(m)
+      assert_operator val, :>=, prev, "1+epsilon*(#{i}/100)"
+      prev = val
+    end
   end
 
   def test_obj_fdiv
@@ -677,6 +804,27 @@ class TestInteger < Test::Unit::TestCase
 
     o = Object.new
     def o.to_int; Object.new; end
-    assert_raise_with_message(TypeError, /can't convert Object to Integer/) {Integer.try_convert(o)}
+    assert_raise_with_message(TypeError, /can't convert Object into Integer/) {Integer.try_convert(o)}
+  end
+
+  def test_ceildiv
+    assert_equal(0, 0.ceildiv(3))
+    assert_equal(1, 1.ceildiv(3))
+    assert_equal(1, 3.ceildiv(3))
+    assert_equal(2, 4.ceildiv(3))
+
+    assert_equal(-1, 4.ceildiv(-3))
+    assert_equal(-1, -4.ceildiv(3))
+    assert_equal(2, -4.ceildiv(-3))
+
+    assert_equal(3, 3.ceildiv(1.2))
+    assert_equal(3, 3.ceildiv(6/5r))
+
+    assert_equal(10, (10**100-11).ceildiv(10**99-1))
+    assert_equal(11, (10**100-9).ceildiv(10**99-1))
+
+    o = Object.new
+    def o.coerce(other); [other, 10]; end
+    assert_equal(124, 1234.ceildiv(o))
   end
 end

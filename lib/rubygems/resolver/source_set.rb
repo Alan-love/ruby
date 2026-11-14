@@ -1,3 +1,5 @@
+# frozen_string_literal: true
+
 ##
 # The SourceSet chooses the best available method to query a remote index.
 #
@@ -40,6 +42,6 @@ class Gem::Resolver::SourceSet < Gem::Resolver::Set
 
   def get_set(name)
     link = @links[name]
-    @sets[link] ||= Gem::Source.new(link).dependency_resolver_set if link
+    @sets[link] ||= Gem::Source.new(link).dependency_resolver_set(@prerelease) if link
   end
 end

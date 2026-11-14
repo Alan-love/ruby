@@ -6,7 +6,7 @@ if defined?(OpenSSL)
 class  OpenSSL::TestASN1 < OpenSSL::TestCase
   def test_decode_x509_certificate
     subj = OpenSSL::X509::Name.parse("/DC=org/DC=ruby-lang/CN=TestCA")
-    key = Fixtures.pkey("rsa1024")
+    key = Fixtures.pkey("rsa-1")
     now = Time.at(Time.now.to_i) # suppress usec
     s = 0xdeadbeafdeadbeafdeadbeafdeadbeaf
     exts = [
@@ -14,7 +14,7 @@ class  OpenSSL::TestASN1 < OpenSSL::TestCase
       ["keyUsage","keyCertSign, cRLSign",true],
       ["subjectKeyIdentifier","hash",false],
     ]
-    dgst = OpenSSL::Digest.new('SHA1')
+    dgst = OpenSSL::Digest.new('SHA256')
     cert = OpenSSL::TestUtils.issue_cert(
       subj, key, s, exts, nil, nil, digest: dgst, not_before: now, not_after: now+3600)
 
@@ -42,7 +42,7 @@ class  OpenSSL::TestASN1 < OpenSSL::TestCase
     assert_equal(OpenSSL::ASN1::Sequence, sig.class)
     assert_equal(2, sig.value.size)
     assert_equal(OpenSSL::ASN1::ObjectId, sig.value[0].class)
-    assert_equal("1.2.840.113549.1.1.5", sig.value[0].oid)
+    assert_equal("1.2.840.113549.1.1.11", sig.value[0].oid)
     assert_equal(OpenSSL::ASN1::Null, sig.value[1].class)
 
     dn = tbs_cert.value[3] # issuer
@@ -189,7 +189,7 @@ class  OpenSSL::TestASN1 < OpenSSL::TestCase
     assert_equal(OpenSSL::ASN1::Null, pkey.value[0].value[1].class)
 
     assert_equal(OpenSSL::ASN1::BitString, sig_val.class)
-    cululated_sig = key.sign(OpenSSL::Digest.new('SHA1'), tbs_cert.to_der)
+    cululated_sig = key.sign(OpenSSL::Digest.new('SHA256'), tbs_cert.to_der)
     assert_equal(cululated_sig, sig_val.value)
   end
 
@@ -306,7 +306,11 @@ class  OpenSSL::TestASN1 < OpenSSL::TestCase
   end
 
   def test_object_identifier
-    encode_decode_test B(%w{ 06 01 00 }), OpenSSL::ASN1::ObjectId.new("0.0".b)
+    obj = encode_decode_test B(%w{ 06 01 00 }), OpenSSL::ASN1::ObjectId.new("0.0".b)
+    assert_equal "0.0", obj.oid
+    assert_nil obj.sn
+    assert_nil obj.ln
+    assert_equal obj.oid, obj.value
     encode_decode_test B(%w{ 06 01 28 }), OpenSSL::ASN1::ObjectId.new("1.0".b)
     encode_decode_test B(%w{ 06 03 88 37 03 }), OpenSSL::ASN1::ObjectId.new("2.999.3".b)
     encode_decode_test B(%w{ 06 05 2A 22 83 BB 55 }), OpenSSL::ASN1::ObjectId.new("1.2.34.56789".b)
@@ -314,6 +318,7 @@ class  OpenSSL::TestASN1 < OpenSSL::TestCase
     assert_equal "2.16.840.1.101.3.4.2.1", obj.oid
     assert_equal "SHA256", obj.sn
     assert_equal "sha256", obj.ln
+    assert_equal obj.sn, obj.value
     assert_raise(OpenSSL::ASN1::ASN1Error) {
       OpenSSL::ASN1.decode(B(%w{ 06 00 }))
     }
@@ -323,15 +328,17 @@ class  OpenSSL::TestASN1 < OpenSSL::TestCase
     assert_raise(OpenSSL::ASN1::ASN1Error) { OpenSSL::ASN1::ObjectId.new("3.0".b).to_der }
     assert_raise(OpenSSL::ASN1::ASN1Error) { OpenSSL::ASN1::ObjectId.new("0.40".b).to_der }
 
-    begin
-      oid = (0...100).to_a.join(".").b
-      obj = OpenSSL::ASN1::ObjectId.new(oid)
-      assert_equal oid, obj.oid
-    rescue OpenSSL::ASN1::ASN1Error
-      pend "OBJ_obj2txt() not working (LibreSSL?)" if $!.message =~ /OBJ_obj2txt/
-      raise
-    end
+    oid = (0...100).to_a.join(".").b
+    obj = OpenSSL::ASN1::ObjectId.new(oid)
+    assert_equal oid, obj.oid
+    oid = "1.3.6.1" + ".1" * 60
+    assert_equal 127, oid.length
+    decoded = OpenSSL::ASN1.decode(OpenSSL::ASN1::ObjectId.new(oid).to_der)
+    assert_equal oid, decoded.value
+    assert_equal oid, decoded.oid
+  end
 
+  def test_object_identifier_equality
     aki = [
       OpenSSL::ASN1::ObjectId.new("authorityKeyIdentifier"),
       OpenSSL::ASN1::ObjectId.new("X509v3 Authority Key Identifier"),
@@ -346,17 +353,22 @@ class  OpenSSL::TestASN1 < OpenSSL::TestCase
 
     aki.each do |a|
       aki.each do |b|
-        assert a == b
+        assert_equal true, a == b
       end
 
       ski.each do |b|
-        refute a == b
+        assert_equal false, a == b
       end
     end
 
-    assert_raise(TypeError) {
-      OpenSSL::ASN1::ObjectId.new("authorityKeyIdentifier") == nil
-    }
+    obj1 = OpenSSL::ASN1::ObjectId.new("1.2.34.56789.10")
+    obj2 = OpenSSL::ASN1::ObjectId.new("1.2.34.56789.10")
+    obj3 = OpenSSL::ASN1::ObjectId.new("1.2.34.56789.11")
+    omit "OID 1.2.34.56789.10 is registered" if obj1.sn
+    assert_equal true, obj1 == obj2
+    assert_equal false, obj1 == obj3
+
+    assert_equal false, OpenSSL::ASN1::ObjectId.new("authorityKeyIdentifier") == nil
   end
 
   def test_sequence
@@ -387,6 +399,11 @@ class  OpenSSL::TestASN1 < OpenSSL::TestCase
     ])
     expected.indefinite_length = true
     encode_test B(%w{ 30 80 04 01 00 00 00 }), expected
+
+    # Missing EOC at the end of contents octets
+    assert_raise(OpenSSL::ASN1::ASN1Error) {
+      OpenSSL::ASN1.decode(B(%w{ 30 80 01 01 FF }))
+    }
   end
 
   def test_set
@@ -404,27 +421,38 @@ class  OpenSSL::TestASN1 < OpenSSL::TestCase
   def test_utctime
     encode_decode_test B(%w{ 17 0D }) + "160908234339Z".b,
       OpenSSL::ASN1::UTCTime.new(Time.utc(2016, 9, 8, 23, 43, 39))
-    # Seconds is omitted
-    decode_test B(%w{ 17 0B }) + "1609082343Z".b,
-      OpenSSL::ASN1::UTCTime.new(Time.utc(2016, 9, 8, 23, 43, 0))
-    begin
-      # possible range of UTCTime is 1969-2068 currently
-      encode_decode_test B(%w{ 17 0D }) + "690908234339Z".b,
-        OpenSSL::ASN1::UTCTime.new(Time.utc(1969, 9, 8, 23, 43, 39))
-    rescue OpenSSL::ASN1::ASN1Error
-      pend "No negative time_t support?"
-    end
-    # not implemented
+
+    # 1950-2049 range is assumed to match RFC 5280's expectation
+    encode_decode_test B(%w{ 17 0D }) + "490908234339Z".b,
+      OpenSSL::ASN1::UTCTime.new(Time.utc(2049, 9, 8, 23, 43, 39))
+    encode_decode_test B(%w{ 17 0D }) + "500908234339Z".b,
+      OpenSSL::ASN1::UTCTime.new(Time.utc(1950, 9, 8, 23, 43, 39))
+    assert_raise(OpenSSL::ASN1::ASN1Error) {
+      OpenSSL::ASN1::UTCTime.new(Time.new(2049, 12, 31, 23, 0, 0, "-04:00")).to_der
+    }
+
+    # UTC offset (BER): ASN1_TIME_to_tm() may or may not support it
     # decode_test B(%w{ 17 11 }) + "500908234339+0930".b,
     #   OpenSSL::ASN1::UTCTime.new(Time.new(1950, 9, 8, 23, 43, 39, "+09:30"))
     # decode_test B(%w{ 17 0F }) + "5009082343-0930".b,
     #   OpenSSL::ASN1::UTCTime.new(Time.new(1950, 9, 8, 23, 43, 0, "-09:30"))
-    # assert_raise(OpenSSL::ASN1::ASN1Error) {
-    #   OpenSSL::ASN1.decode(B(%w{ 17 0C }) + "500908234339".b)
-    # }
-    # assert_raise(OpenSSL::ASN1::ASN1Error) {
-    #   OpenSSL::ASN1.decode(B(%w{ 17 0D }) + "500908234339Y".b)
-    # }
+
+    # Seconds is omitted (BER)
+    # decode_test B(%w{ 18 0D }) + "201612081934Z".b,
+    #   OpenSSL::ASN1::GeneralizedTime.new(Time.utc(2016, 12, 8, 19, 34, 0))
+
+    # Fractional seconds is not allowed in UTCTime
+    assert_raise(OpenSSL::ASN1::ASN1Error) {
+      OpenSSL::ASN1.decode(B(%w{ 17 0F }) + "160908234339.5Z".b)
+    }
+
+    # Missing "Z"
+    assert_raise(OpenSSL::ASN1::ASN1Error) {
+      OpenSSL::ASN1.decode(B(%w{ 17 0C }) + "500908234339".b)
+    }
+    assert_raise(OpenSSL::ASN1::ASN1Error) {
+      OpenSSL::ASN1.decode(B(%w{ 17 0D }) + "500908234339Y".b)
+    }
   end
 
   def test_generalizedtime
@@ -432,26 +460,46 @@ class  OpenSSL::TestASN1 < OpenSSL::TestCase
       OpenSSL::ASN1::GeneralizedTime.new(Time.utc(2016, 12, 8, 19, 34, 29))
     encode_decode_test B(%w{ 18 0F }) + "99990908234339Z".b,
       OpenSSL::ASN1::GeneralizedTime.new(Time.utc(9999, 9, 8, 23, 43, 39))
-    decode_test B(%w{ 18 0D }) + "201612081934Z".b,
-      OpenSSL::ASN1::GeneralizedTime.new(Time.utc(2016, 12, 8, 19, 34, 0))
-    # not implemented
+
+    # Fractional seconds (DER). Not supported by ASN1_TIME_to_tm()
+    # because struct tm cannot store it.
+    # encode_decode_test B(%w{ 18 11 }) + "20161208193439.5Z".b,
+    #   OpenSSL::ASN1::GeneralizedTime.new(Time.utc(2016, 12, 8, 19, 34, 39.5))
+
+    # UTC offset (BER): ASN1_TIME_to_tm() may or may not support it
     # decode_test B(%w{ 18 13 }) + "20161208193439+0930".b,
     #   OpenSSL::ASN1::GeneralizedTime.new(Time.new(2016, 12, 8, 19, 34, 39, "+09:30"))
     # decode_test B(%w{ 18 11 }) + "201612081934-0930".b,
     #   OpenSSL::ASN1::GeneralizedTime.new(Time.new(2016, 12, 8, 19, 34, 0, "-09:30"))
     # decode_test B(%w{ 18 11 }) + "201612081934-09".b,
     #   OpenSSL::ASN1::GeneralizedTime.new(Time.new(2016, 12, 8, 19, 34, 0, "-09:00"))
+
+    # Minutes and seconds are omitted (BER)
+    # decode_test B(%w{ 18 0B }) + "2016120819Z".b,
+    #   OpenSSL::ASN1::GeneralizedTime.new(Time.utc(2016, 12, 8, 19, 0, 0))
+    # Fractional hours (BER)
     # decode_test B(%w{ 18 0D }) + "2016120819.5Z".b,
     #   OpenSSL::ASN1::GeneralizedTime.new(Time.utc(2016, 12, 8, 19, 30, 0))
+    # Fractional hours with "," as the decimal separator (BER)
     # decode_test B(%w{ 18 0D }) + "2016120819,5Z".b,
     #   OpenSSL::ASN1::GeneralizedTime.new(Time.utc(2016, 12, 8, 19, 30, 0))
+
+    # Seconds is omitted (BER)
+    # decode_test B(%w{ 18 0D }) + "201612081934Z".b,
+    #   OpenSSL::ASN1::GeneralizedTime.new(Time.utc(2016, 12, 8, 19, 34, 0))
+    # Fractional minutes (BER)
     # decode_test B(%w{ 18 0F }) + "201612081934.5Z".b,
     #   OpenSSL::ASN1::GeneralizedTime.new(Time.utc(2016, 12, 8, 19, 34, 30))
-    # decode_test B(%w{ 18 11 }) + "20161208193439.5Z".b,
-    #   OpenSSL::ASN1::GeneralizedTime.new(Time.utc(2016, 12, 8, 19, 34, 39.5))
-    # assert_raise(OpenSSL::ASN1::ASN1Error) {
-    #   OpenSSL::ASN1.decode(B(%w{ 18 0D }) + "201612081934Y".b)
-    # }
+
+    # Missing "Z"
+    assert_raise(OpenSSL::ASN1::ASN1Error) {
+      OpenSSL::ASN1.decode(B(%w{ 18 0F }) + "20161208193429Y".b)
+    }
+
+    # Encoding year out of range
+    assert_raise(OpenSSL::ASN1::ASN1Error) {
+      OpenSSL::ASN1::GeneralizedTime.new(Time.utc(10000, 9, 8, 23, 43, 39)).to_der
+    }
   end
 
   def test_basic_asn1data
@@ -461,7 +509,7 @@ class  OpenSSL::TestASN1 < OpenSSL::TestCase
     encode_decode_test B(%w{ 81 00 }), OpenSSL::ASN1::ASN1Data.new(B(%w{}), 1, :CONTEXT_SPECIFIC)
     encode_decode_test B(%w{ C1 00 }), OpenSSL::ASN1::ASN1Data.new(B(%w{}), 1, :PRIVATE)
     encode_decode_test B(%w{ 1F 20 00 }), OpenSSL::ASN1::ASN1Data.new(B(%w{}), 32, :UNIVERSAL)
-    encode_decode_test B(%w{ 1F C0 20 00 }), OpenSSL::ASN1::ASN1Data.new(B(%w{}), 8224, :UNIVERSAL)
+    encode_decode_test B(%w{ 9F C0 20 00 }), OpenSSL::ASN1::ASN1Data.new(B(%w{}), 8224, :CONTEXT_SPECIFIC)
     encode_decode_test B(%w{ 41 02 AB CD }), OpenSSL::ASN1::ASN1Data.new(B(%w{ AB CD }), 1, :APPLICATION)
     encode_decode_test B(%w{ 41 81 80 } + %w{ AB CD } * 64), OpenSSL::ASN1::ASN1Data.new(B(%w{ AB CD } * 64), 1, :APPLICATION)
     encode_decode_test B(%w{ 41 82 01 00 } + %w{ AB CD } * 128), OpenSSL::ASN1::ASN1Data.new(B(%w{ AB CD } * 128), 1, :APPLICATION)
@@ -651,6 +699,20 @@ class  OpenSSL::TestASN1 < OpenSSL::TestCase
     }
     assert_equal 1, ret.size
     assert_equal 17, ret[0][6]
+  end
+
+  def test_decode_constructed_deeply_nested
+    bool = OpenSSL::ASN1::Boolean.new(true)
+    nested_100 = B(%w{ 30 80 }) * 100 + bool.to_der + B(%w{ 00 00 }) * 100
+    decoded = OpenSSL::ASN1.decode(nested_100)
+    assert_equal(nested_100, decoded.to_der)
+    content = 100.times.inject(decoded) { |a,| a.value[0] }
+    assert_kind_of(OpenSSL::ASN1::Boolean, content)
+
+    nested_500 = B(%w{ 30 80 }) * 500 + bool.to_der + B(%w{ 00 00 }) * 500
+    assert_raise_with_message(OpenSSL::ASN1::ASN1Error, /nesting depth/) {
+      OpenSSL::ASN1.decode(nested_500)
+    }
   end
 
   def test_constructive_each

@@ -21,7 +21,7 @@ module Bundler
 
       def gemspec(&block)
         gemspec = instance.gemspec
-        block.call(gemspec) if block
+        block&.call(gemspec)
         gemspec
       end
     end
@@ -32,7 +32,7 @@ module Bundler
 
     def initialize(base = nil, name = nil)
       @base = File.expand_path(base || SharedHelpers.pwd)
-      gemspecs = name ? [File.join(@base, "#{name}.gemspec")] : Gem::Util.glob_files_in_dir("{,*}.gemspec", @base)
+      gemspecs = name ? [File.join(@base, "#{name}.gemspec")] : SharedHelpers.glob_files_in_dir("{,*}.gemspec", @base)
       raise "Unable to determine name from existing gemspec. Use :name => 'gemname' in #install_tasks to manually set it." unless gemspecs.size == 1
       @spec_path = gemspecs.first
       @gemspec = Bundler.load_gemspec(@spec_path)
@@ -47,7 +47,7 @@ module Bundler
         built_gem_path = build_gem
       end
 
-      desc "Generate SHA512 checksum if #{name}-#{version}.gem into the checksums directory."
+      desc "Generate SHA512 checksum of #{name}-#{version}.gem into the checksums directory."
       task "build:checksum" => "build" do
         build_checksum(built_gem_path)
       end
@@ -107,9 +107,9 @@ module Bundler
       SharedHelpers.filesystem_access(File.join(base, "checksums")) {|p| FileUtils.mkdir_p(p) }
       file_name = "#{File.basename(built_gem_path)}.sha512"
       require "digest/sha2"
-      checksum = ::Digest::SHA512.new.hexdigest(built_gem_path.to_s)
+      checksum = ::Digest::SHA512.file(built_gem_path).hexdigest
       target = File.join(base, "checksums", file_name)
-      File.write(target, checksum)
+      File.write(target, checksum + "\n")
       Bundler.ui.confirm "#{name} #{version} checksum written to checksums/#{file_name}."
     end
 
@@ -124,7 +124,7 @@ module Bundler
     end
 
     def built_gem_path
-      Gem::Util.glob_files_in_dir("#{name}-*.gem", base).sort_by {|f| File.mtime(f) }.last
+      SharedHelpers.glob_files_in_dir("#{name}-*.gem", base).sort_by {|f| File.mtime(f) }.last
     end
 
     def git_push(remote = nil)
@@ -152,8 +152,7 @@ module Bundler
 
     def gem_push_host
       env_rubygems_host = ENV["RUBYGEMS_HOST"]
-      env_rubygems_host = nil if
-        env_rubygems_host && env_rubygems_host.empty?
+      env_rubygems_host = nil if env_rubygems_host&.empty?
 
       allowed_push_host || env_rubygems_host || "rubygems.org"
     end
@@ -216,9 +215,9 @@ module Bundler
     def sh_with_status(cmd, &block)
       Bundler.ui.debug(cmd)
       SharedHelpers.chdir(base) do
-        outbuf = IO.popen(cmd, :err => [:child, :out], &:read)
-        status = $?
-        block.call(outbuf) if status.success? && block
+        outbuf = IO.popen(cmd, err: [:child, :out], &:read)
+        status = Process.last_status
+        block&.call(outbuf) if status.success?
         [outbuf, status]
       end
     end

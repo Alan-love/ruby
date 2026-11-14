@@ -15,6 +15,7 @@
 #include "internal/imemo.h"
 #include "internal/compilers.h"
 #include "internal/static_assert.h"
+#include "ruby/atomic.h"
 
 #ifndef END_OF_ENUMERATION
 # if defined(__GNUC__) &&! defined(__STRICT_ANSI__)
@@ -44,7 +45,7 @@ typedef struct rb_scope_visi_struct {
 typedef struct rb_cref_struct {
     VALUE flags;
     VALUE refinements;
-    VALUE klass;
+    VALUE klass_or_self;
     struct rb_cref_struct * next;
     const rb_scope_visibility_t scope_visi;
 } rb_cref_t;
@@ -72,10 +73,16 @@ typedef struct rb_callable_method_entry_struct { /* same fields with rb_method_e
 #define METHOD_ENTRY_COMPLEMENTED(me)        ((me)->flags & IMEMO_FL_USER3)
 #define METHOD_ENTRY_COMPLEMENTED_SET(me)    ((me)->flags |= IMEMO_FL_USER3)
 #define METHOD_ENTRY_CACHED(me)              ((me)->flags & IMEMO_FL_USER4)
-#define METHOD_ENTRY_CACHED_SET(me)          ((me)->flags |= IMEMO_FL_USER4)
 #define METHOD_ENTRY_INVALIDATED(me)         ((me)->flags & IMEMO_FL_USER5)
 #define METHOD_ENTRY_INVALIDATED_SET(me)     ((me)->flags |= IMEMO_FL_USER5)
-#define METHOD_ENTRY_CACHEABLE(me)           !(METHOD_ENTRY_VISI(me) == METHOD_VISI_PROTECTED)
+
+static inline void
+METHOD_ENTRY_CACHED_SET(rb_callable_method_entry_t *me)
+{
+    if (!METHOD_ENTRY_CACHED(me)) {
+        me->flags |= IMEMO_FL_USER4;
+    }
+}
 
 static inline void
 METHOD_ENTRY_VISI_SET(rb_method_entry_t *me, rb_method_visibility_t visi)
@@ -102,8 +109,9 @@ static inline void
 METHOD_ENTRY_FLAGS_COPY(rb_method_entry_t *dst, const rb_method_entry_t *src)
 {
     dst->flags =
-      (dst->flags & ~(IMEMO_FL_USER0|IMEMO_FL_USER1|IMEMO_FL_USER2)) |
-        (src->flags & (IMEMO_FL_USER0|IMEMO_FL_USER1|IMEMO_FL_USER2));
+      (dst->flags & ~(IMEMO_FL_USER0|IMEMO_FL_USER1|IMEMO_FL_USER2
+      |IMEMO_FL_USER3)) |
+        (src->flags & (IMEMO_FL_USER0|IMEMO_FL_USER1|IMEMO_FL_USER2|IMEMO_FL_USER3));
 }
 
 typedef enum {
@@ -134,11 +142,11 @@ typedef struct rb_iseq_struct rb_iseq_t;
 typedef struct rb_method_iseq_struct {
     const rb_iseq_t * iseqptr; /*!< iseq pointer, should be separated from iseqval */
     rb_cref_t * cref;          /*!< class reference, should be marked */
-    const rb_callable_method_entry_t *mandatory_only_cme;
 } rb_method_iseq_t; /* check rb_add_method_iseq() when modify the fields */
 
+typedef VALUE (*rb_cfunc_t)(ANYARGS);
 typedef struct rb_method_cfunc_struct {
-    VALUE (*func)(ANYARGS);
+    rb_cfunc_t func;
     VALUE (*invoker)(VALUE recv, int argc, const VALUE *argv, VALUE (*func)(ANYARGS));
     int argc;
 } rb_method_cfunc_t;
@@ -154,13 +162,12 @@ typedef struct rb_method_alias_struct {
 
 typedef struct rb_method_refined_struct {
     struct rb_method_entry_struct * orig_me;
-    VALUE owner;
 } rb_method_refined_t;
 
 typedef struct rb_method_bmethod_struct {
     VALUE proc; /* should be marked */
-    struct rb_hook_list_struct *hooks;
-    VALUE defined_ractor;
+    rb_serial_t defined_ractor_id;
+    unsigned int local_hooks_cnt;
 } rb_method_bmethod_t;
 
 enum method_optimized_type {
@@ -180,8 +187,11 @@ typedef struct rb_method_optimized {
 struct rb_method_definition_struct {
     BITFIELD(rb_method_type_t, type, VM_METHOD_TYPE_MINIMUM_BITS);
     unsigned int iseq_overload: 1;
-    int alias_count : 27;
-    int complemented_count : 28;
+    unsigned int no_redef_warning: 1;
+    unsigned int aliased : 1;
+    unsigned int uncached : 1;
+
+    rb_atomic_t reference_count;
 
     union {
         rb_method_iseq_t iseq;
@@ -194,13 +204,33 @@ struct rb_method_definition_struct {
     } body;
 
     ID original_id;
+    VALUE original_module; /* module in which the method definition is; see location_original_module() */
     uintptr_t method_serial;
+    const rb_box_t *box;
 };
 
 struct rb_id_table;
+struct rb_ractor_struct;
+struct rb_hook_list_struct;
 
 typedef struct rb_method_definition_struct rb_method_definition_t;
-STATIC_ASSERT(sizeof_method_def, offsetof(rb_method_definition_t, body)==8);
+STATIC_ASSERT(sizeof_method_def, offsetof(rb_method_definition_t, body) <= 8);
+
+/* Resolving an alias (aliased_callable_method_entry) republishes me->def or
+ * def->body.alias.original_me while other ractors read them without the VM lock.
+ * Both are written with release stores, so unlocked readers on the alias paths
+ * load them with acquire to see a fully built definition or entry. */
+static inline rb_method_definition_t *
+rb_method_entry_def_acquire(const rb_method_entry_t *me)
+{
+    return (rb_method_definition_t *)rbimpl_atomic_ptr_load((void **)&me->def, RBIMPL_ATOMIC_ACQUIRE);
+}
+
+static inline const rb_method_entry_t *
+rb_method_alias_original_me(const rb_method_definition_t *def)
+{
+    return (const rb_method_entry_t *)rbimpl_atomic_ptr_load((void **)&def->body.alias.original_me, RBIMPL_ATOMIC_ACQUIRE);
+}
 
 #define UNDEFINED_METHOD_ENTRY_P(me) (!(me) || !(me)->def || (me)->def->type == VM_METHOD_TYPE_UNDEF)
 #define UNDEFINED_REFINED_METHOD_P(def) \
@@ -214,7 +244,7 @@ void rb_add_method_optimized(VALUE klass, ID mid, enum method_optimized_type, un
 void rb_add_refined_method_entry(VALUE refined_class, ID mid);
 
 rb_method_entry_t *rb_method_entry_set(VALUE klass, ID mid, const rb_method_entry_t *, rb_method_visibility_t noex);
-rb_method_entry_t *rb_method_entry_create(ID called_id, VALUE klass, rb_method_visibility_t visi, const rb_method_definition_t *def);
+rb_method_entry_t *rb_method_entry_create(ID called_id, VALUE klass, rb_method_visibility_t visi, rb_method_definition_t *def);
 
 const rb_method_entry_t *rb_method_entry_at(VALUE obj, ID id);
 
@@ -226,7 +256,10 @@ RUBY_SYMBOL_EXPORT_BEGIN
 const rb_method_entry_t *rb_resolve_me_location(const rb_method_entry_t *, VALUE[5]);
 RUBY_SYMBOL_EXPORT_END
 
+void rb_vm_coverage_record_me(const rb_method_entry_t *me);
+
 const rb_callable_method_entry_t *rb_callable_method_entry(VALUE klass, ID id);
+const rb_callable_method_entry_t *rb_callable_method_entry_or_negative(VALUE klass, ID id);
 const rb_callable_method_entry_t *rb_callable_method_entry_with_refinements(VALUE klass, ID id, VALUE *defined_class);
 const rb_callable_method_entry_t *rb_callable_method_entry_without_refinements(VALUE klass, ID id, VALUE *defined_class);
 
@@ -236,6 +269,7 @@ st_index_t rb_hash_method_entry(st_index_t hash, const rb_method_entry_t *me);
 
 VALUE rb_method_entry_location(const rb_method_entry_t *me);
 
+void rb_free_method_entry_vm_weak_references(const rb_method_entry_t *me);
 void rb_free_method_entry(const rb_method_entry_t *me);
 
 const rb_method_entry_t *rb_method_entry_clone(const rb_method_entry_t *me);
@@ -243,12 +277,20 @@ const rb_callable_method_entry_t *rb_method_entry_complement_defined_class(const
 void rb_method_entry_copy(rb_method_entry_t *dst, const rb_method_entry_t *src);
 
 void rb_method_table_insert(VALUE klass, struct rb_id_table *table, ID method_id, const rb_method_entry_t *me);
+void rb_method_table_insert0(VALUE klass, struct rb_id_table *table, ID method_id, const rb_method_entry_t *me, bool iclass_shared_mtbl);
 
 void rb_scope_visibility_set(rb_method_visibility_t);
+void rb_add_alias(VALUE klass, ID alias_name, ID original_name, rb_method_visibility_t visi);
 
 VALUE rb_unnamed_parameters(int arity);
 
+void rb_vm_insert_cc_refinement(const struct rb_callcache *cc);
+
 void rb_clear_method_cache(VALUE klass_or_module, ID mid);
-void rb_clear_method_cache_all(void);
+void rb_clear_all_refinement_method_cache(void);
+void rb_invalidate_method_caches(struct rb_id_table *cm_tbl, VALUE cc_tbl);
+struct rb_hook_list_struct *rb_method_def_local_hooks(rb_method_definition_t *def, struct rb_ractor_struct *cr, bool create);
+void rb_method_definition_addref(rb_method_definition_t *def);
+void rb_method_definition_release(rb_method_definition_t *def);
 
 #endif /* RUBY_METHOD_H */

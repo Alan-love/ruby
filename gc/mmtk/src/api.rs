@@ -1,0 +1,599 @@
+// Functions in this module are unsafe for one reason:
+// They are called by C functions and they need to pass raw pointers to Rust.
+#![allow(clippy::missing_safety_doc)]
+
+use mmtk::util::alloc::BumpPointer;
+use mmtk::util::alloc::ImmixAllocator;
+use mmtk::util::conversions;
+use mmtk::util::options::PlanSelector;
+use std::str::FromStr;
+
+use crate::Ruby;
+use crate::RubySlot;
+use crate::abi::RawVecOfObjRef;
+use crate::abi::RubyBindingOptions;
+use crate::binding;
+use crate::binding::RubyBinding;
+use crate::heap::CPU_HEAP_TRIGGER_CONFIG;
+use crate::heap::CpuHeapTriggerConfig;
+use crate::heap::RUBY_HEAP_TRIGGER_CONFIG;
+use crate::heap::RubyHeapTriggerConfig;
+use crate::mmtk;
+use crate::utils::default_heap_max;
+use crate::utils::parse_capacity;
+use mmtk::AllocationSemantics;
+use mmtk::MMTKBuilder;
+use mmtk::Mutator;
+use mmtk::memory_manager;
+use mmtk::memory_manager::mmtk_init;
+use mmtk::plan::BarrierSelector;
+use mmtk::util::Address;
+use mmtk::util::ObjectReference;
+use mmtk::util::VMMutatorThread;
+use mmtk::util::VMThread;
+use mmtk::util::constants::MIN_OBJECT_SIZE;
+use mmtk::util::options::GCTriggerSelector;
+
+pub type RubyMutator = Mutator<Ruby>;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_is_live_object(object: ObjectReference) -> bool {
+    memory_manager::is_live_object(object)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_is_reachable(object: ObjectReference) -> bool {
+    object.is_reachable()
+}
+
+// =============== Bootup ===============
+
+fn parse_env_var_with<T, F: FnOnce(&str) -> Option<T>>(key: &str, parse: F) -> Option<T> {
+    let val = match std::env::var(key) {
+        Ok(val) => val,
+        Err(std::env::VarError::NotPresent) => return None,
+        Err(std::env::VarError::NotUnicode(os_string)) => {
+            eprintln!("[FATAL] Invalid {key} {os_string:?}");
+            std::process::exit(1);
+        }
+    };
+
+    let parsed = parse(&val).unwrap_or_else(|| {
+        eprintln!("[FATAL] Invalid {key} {val}");
+        std::process::exit(1);
+    });
+
+    Some(parsed)
+}
+
+fn parse_env_var<T: FromStr>(key: &str) -> Option<T> {
+    parse_env_var_with(key, |s| s.parse().ok())
+}
+
+fn mmtk_builder_default_parse_threads() -> Option<usize> {
+    parse_env_var("MMTK_THREADS")
+}
+
+fn mmtk_builder_default_parse_heap_min() -> usize {
+    const DEFAULT_HEAP_MIN: usize = 1 << 20;
+    parse_env_var_with("MMTK_HEAP_MIN", parse_capacity).unwrap_or(DEFAULT_HEAP_MIN)
+}
+
+fn mmtk_builder_default_parse_heap_max() -> usize {
+    parse_env_var_with("MMTK_HEAP_MAX", parse_capacity).unwrap_or_else(default_heap_max)
+}
+
+fn parse_float_env_var(key: &str, default: f64, min: f64, max: f64) -> f64 {
+    parse_env_var_with(key, |s| {
+        let mut float = f64::from_str(s).unwrap_or(default);
+
+        if float <= min {
+            eprintln!(
+                "{key} has value {float} which must be greater than {min}, using default instead"
+            );
+            float = default;
+        }
+
+        if float >= max {
+            eprintln!(
+                "{key} has value {float} which must be less than {max}, using default instead"
+            );
+            float = default;
+        }
+
+        Some(float)
+    })
+    .unwrap_or(default)
+}
+
+fn mmtk_builder_default_parse_heap_mode(heap_min: usize, heap_max: usize) -> GCTriggerSelector {
+    let make_fixed = || GCTriggerSelector::FixedHeapSize(heap_max);
+    let make_dynamic = || GCTriggerSelector::DynamicHeapSize(heap_min, heap_max);
+
+    parse_env_var_with("MMTK_HEAP_MODE", |s| match s {
+        "fixed" => Some(make_fixed()),
+        "dynamic" => Some(make_dynamic()),
+        "ruby" => {
+            let min_ratio = parse_float_env_var("RUBY_GC_HEAP_FREE_SLOTS_MIN_RATIO", 0.2, 0.0, 1.0);
+            let goal_ratio =
+                parse_float_env_var("RUBY_GC_HEAP_FREE_SLOTS_GOAL_RATIO", 0.4, min_ratio, 1.0);
+            let max_ratio =
+                parse_float_env_var("RUBY_GC_HEAP_FREE_SLOTS_MAX_RATIO", 0.65, goal_ratio, 1.0);
+
+            crate::heap::RUBY_HEAP_TRIGGER_CONFIG
+                .set(RubyHeapTriggerConfig {
+                    min_heap_pages: conversions::bytes_to_pages_up(heap_min),
+                    max_heap_pages: conversions::bytes_to_pages_up(heap_max),
+                    heap_pages_min_ratio: min_ratio,
+                    heap_pages_goal_ratio: goal_ratio,
+                    heap_pages_max_ratio: max_ratio,
+                })
+                .unwrap_or_else(|_| panic!("RUBY_HEAP_TRIGGER_CONFIG is already set"));
+
+            Some(GCTriggerSelector::Delegated)
+        }
+        "cpu" => {
+            // CPU-overhead-driven heap sizing based on Tavakolisomeh et al.,
+            // "Heap Size Adjustment with CPU Control", MPLR '23.
+            //
+            // Target is expressed as a percentage (0, 100) via
+            // `MMTK_GC_CPU_TARGET`. The paper recommends 15 for ZGC (a
+            // concurrent collector); we default to 5 for MMTk-Ruby. With
+            // MMTk's stop-the-world Immix, every percent of GC CPU is also
+            // a percent of wall-clock the mutator is blocked on, so a much
+            // smaller budget is appropriate. An empirical sweep across
+            // ruby-bench (railsbench, lobsters, psych-load, liquid-render,
+            // lee) found target=5 to be Pareto-optimal: ~6% geomean speedup
+            // vs. the `ruby` heap mode with effectively identical geomean
+            // peak RSS.
+            let target_percent = parse_float_env_var("MMTK_GC_CPU_TARGET", 5.0, 0.0, 100.0);
+            let window_size = parse_env_var::<usize>("MMTK_GC_CPU_WINDOW").unwrap_or(3);
+            let window_size = window_size.max(1);
+
+            let min_heap_pages = conversions::bytes_to_pages_up(heap_min);
+            let max_heap_pages = conversions::bytes_to_pages_up(heap_max);
+            // Start at the min heap size, as the other delegated triggers do.
+            // The control loop will adjust from here after the first GC cycle.
+            let initial_heap_pages = min_heap_pages;
+
+            CPU_HEAP_TRIGGER_CONFIG
+                .set(CpuHeapTriggerConfig {
+                    min_heap_pages,
+                    max_heap_pages,
+                    initial_heap_pages,
+                    target_gc_cpu: target_percent / 100.0,
+                    window_size,
+                })
+                .unwrap_or_else(|_| panic!("CPU_HEAP_TRIGGER_CONFIG is already set"));
+
+            Some(GCTriggerSelector::Delegated)
+        }
+        _ => None,
+    })
+    .unwrap_or_else(make_dynamic)
+}
+
+fn mmtk_builder_default_parse_plan() -> PlanSelector {
+    parse_env_var_with("MMTK_PLAN", |s| match s {
+        "NoGC" => Some(PlanSelector::NoGC),
+        "MarkSweep" => Some(PlanSelector::MarkSweep),
+        "Immix" => Some(PlanSelector::Immix),
+        "StickyImmix" => Some(PlanSelector::StickyImmix),
+        _ => None,
+    })
+    .unwrap_or(PlanSelector::StickyImmix)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_builder_default() -> *mut MMTKBuilder {
+    let mut builder = MMTKBuilder::new_no_env_vars();
+    builder.options.no_finalizer.set(true);
+
+    if let Some(threads) = mmtk_builder_default_parse_threads()
+        && !builder.options.threads.set(threads)
+    {
+        // MMTk will validate it and reject 0.
+        eprintln!("[FATAL] Failed to set the number of MMTk threads to {threads}");
+        std::process::exit(1);
+    }
+
+    let heap_min = mmtk_builder_default_parse_heap_min();
+
+    let heap_max = mmtk_builder_default_parse_heap_max();
+
+    if heap_min >= heap_max {
+        eprintln!("[FATAL] MMTK_HEAP_MIN({heap_min}) >= MMTK_HEAP_MAX({heap_max})");
+        std::process::exit(1);
+    }
+
+    builder
+        .options
+        .gc_trigger
+        .set(mmtk_builder_default_parse_heap_mode(heap_min, heap_max));
+
+    builder.options.plan.set(mmtk_builder_default_parse_plan());
+
+    Box::into_raw(Box::new(builder))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mmtk_init_binding(
+    builder: *mut MMTKBuilder,
+    binding_options: *const RubyBindingOptions,
+) {
+    crate::set_panic_hook();
+
+    let builder: Box<MMTKBuilder> = unsafe { Box::from_raw(builder) };
+    let binding_options = unsafe { (*binding_options).clone() };
+    let mmtk_boxed = mmtk_init(&builder);
+    let mmtk_static = Box::leak(Box::new(mmtk_boxed));
+
+    let mut binding = RubyBinding::new(mmtk_static, &binding_options);
+    binding
+        .weak_proc
+        .init_parallel_obj_free_candidates(memory_manager::num_of_workers(binding.mmtk));
+
+    crate::BINDING
+        .set(binding)
+        .unwrap_or_else(|_| panic!("Binding is already initialized"));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_get_vo_bit_log_region_size() -> usize {
+    mmtk::util::is_mmtk_object::VO_BIT_REGION_SIZE.trailing_zeros() as usize
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_get_vo_bit_base_addr() -> usize {
+    mmtk::util::metadata::side_metadata::vo_bit_side_metadata_addr().as_usize()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_initialize_collection(tls: VMThread) {
+    memory_manager::initialize_collection(mmtk(), tls);
+    crate::binding().gc_disable.on_collection_initialized();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_bind_mutator(tls: VMMutatorThread) -> *mut RubyMutator {
+    Box::into_raw(memory_manager::bind_mutator(mmtk(), tls))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mmtk_get_bump_pointer_allocator(m: *mut RubyMutator) -> *mut BumpPointer {
+    match *crate::BINDING.get().unwrap().mmtk.get_options().plan {
+        PlanSelector::Immix | PlanSelector::StickyImmix => {
+            let mutator: &mut Mutator<Ruby> = unsafe { &mut *m };
+            let allocator =
+                unsafe { mutator.allocator_mut(mmtk::util::alloc::AllocatorSelector::Immix(0)) };
+
+            if let Some(immix_allocator) = allocator.downcast_mut::<ImmixAllocator<Ruby>>() {
+                &mut immix_allocator.bump_pointer as *mut BumpPointer
+            } else {
+                panic!("Failed to get bump pointer allocator");
+            }
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mmtk_destroy_mutator(mutator: *mut RubyMutator) {
+    // notify mmtk-core about destroyed mutator
+    memory_manager::destroy_mutator(unsafe { &mut *mutator });
+    // turn the ptr back to a box, and let Rust properly reclaim it
+    let _ = unsafe { Box::from_raw(mutator) };
+}
+
+// =============== GC ===============
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_handle_user_collection_request(
+    tls: VMMutatorThread,
+    force: bool,
+    exhaustive: bool,
+) {
+    crate::binding()
+        .gc_disable
+        .handle_user_collection_request(tls, force, exhaustive);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_set_gc_enabled(enable: bool) {
+    crate::binding().gc_disable.set_internal_disabled(!enable);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_gc_enabled_p() -> bool {
+    !crate::binding().gc_disable.internal_disabled()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_set_user_gc_disabled(disable: bool) -> bool {
+    crate::binding().gc_disable.set_user_disabled(disable)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_user_gc_disabled_p() -> bool {
+    crate::binding().gc_disable.user_disabled()
+}
+
+// =============== Object allocation ===============
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_max_non_los_default_alloc_bytes() -> usize {
+    mmtk()
+        .get_plan()
+        .constraints()
+        .max_non_los_default_alloc_bytes
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_plan_has_write_barrier() -> bool {
+    mmtk().get_plan().constraints().barrier != BarrierSelector::NoBarrier
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mmtk_alloc(
+    mutator: *mut RubyMutator,
+    size: usize,
+    align: usize,
+    offset: usize,
+    semantics: AllocationSemantics,
+) -> Address {
+    let clamped_size = size.max(MIN_OBJECT_SIZE);
+    memory_manager::alloc::<Ruby>(
+        unsafe { &mut *mutator },
+        clamped_size,
+        align,
+        offset,
+        semantics,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mmtk_post_alloc(
+    mutator: *mut RubyMutator,
+    refer: ObjectReference,
+    bytes: usize,
+    semantics: AllocationSemantics,
+) {
+    memory_manager::post_alloc::<Ruby>(unsafe { &mut *mutator }, refer, bytes, semantics)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mmtk_add_obj_free_candidates(
+    objects: *const ObjectReference,
+    count: usize,
+    can_parallel_free: bool,
+) {
+    let objects = unsafe { std::slice::from_raw_parts(objects, count) };
+    binding()
+        .weak_proc
+        .add_obj_free_candidates_batch(objects, can_parallel_free)
+}
+
+// =============== Weak references ===============
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_declare_weak_references(object: ObjectReference) {
+    binding().weak_proc.add_weak_reference(object);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_weak_references_alive_p(object: ObjectReference) -> bool {
+    object.is_reachable()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_weak_references_count() -> usize {
+    binding().weak_proc.weak_references_count()
+}
+
+// =============== Compaction ===============
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_register_pinning_obj(obj: ObjectReference) {
+    crate::binding().pinning_registry.register(obj);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_is_pinned(object: ObjectReference) -> bool {
+    memory_manager::is_pinned(object)
+}
+
+// =============== Write barriers ===============
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mmtk_object_reference_write_post(
+    mutator: *mut RubyMutator,
+    object: ObjectReference,
+) {
+    let ignored_slot = RubySlot::from_address(Address::ZERO);
+    let ignored_target = ObjectReference::from_raw_address(Address::ZERO);
+    mmtk::memory_manager::object_reference_write_post(
+        unsafe { &mut *mutator },
+        object,
+        ignored_slot,
+        ignored_target,
+    )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_register_wb_unprotected_object(object: ObjectReference) {
+    crate::binding().register_wb_unprotected_object(object)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_object_wb_unprotected_p(object: ObjectReference) -> bool {
+    crate::binding().object_wb_unprotected_p(object)
+}
+
+// =============== Heap walking ===============
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_enumerate_objects(
+    callback: extern "C" fn(ObjectReference, *mut libc::c_void),
+    data: *mut libc::c_void,
+) {
+    crate::mmtk().enumerate_objects(|object| {
+        callback(object, data);
+    })
+}
+
+// =============== Finalizers ===============
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_get_all_obj_free_candidates() -> RawVecOfObjRef {
+    let vec = binding().weak_proc.get_all_obj_free_candidates();
+    RawVecOfObjRef::from_vec(vec)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_free_raw_vec_of_obj_ref(raw_vec: RawVecOfObjRef) {
+    unsafe { raw_vec.into_vec() };
+}
+
+// =============== Forking ===============
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_before_fork() {
+    mmtk().prepare_to_fork();
+    binding().join_all_gc_threads();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_after_fork(tls: VMThread) {
+    mmtk().after_fork(tls);
+}
+
+// =============== Statistics ===============
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_total_bytes() -> usize {
+    memory_manager::total_bytes(mmtk())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_used_bytes() -> usize {
+    memory_manager::used_bytes(mmtk())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_free_bytes() -> usize {
+    memory_manager::free_bytes(mmtk())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_starting_heap_address() -> Address {
+    memory_manager::starting_heap_address()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_last_heap_address() -> Address {
+    memory_manager::last_heap_address()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_worker_count() -> usize {
+    memory_manager::num_of_workers(mmtk())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_plan() -> *const u8 {
+    static NO_GC: &[u8] = b"NoGC\0";
+    static MARK_SWEEP: &[u8] = b"MarkSweep\0";
+    static IMMIX: &[u8] = b"Immix\0";
+    static STICKY_IMMIX: &[u8] = b"StickyImmix\0";
+
+    match *crate::BINDING.get().unwrap().mmtk.get_options().plan {
+        PlanSelector::NoGC => NO_GC.as_ptr(),
+        PlanSelector::MarkSweep => MARK_SWEEP.as_ptr(),
+        PlanSelector::Immix => IMMIX.as_ptr(),
+        PlanSelector::StickyImmix => STICKY_IMMIX.as_ptr(),
+        _ => panic!("Unknown plan"),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_heap_mode() -> *const u8 {
+    static FIXED_HEAP: &[u8] = b"fixed\0";
+    static DYNAMIC_HEAP: &[u8] = b"dynamic\0";
+    static RUBY_HEAP: &[u8] = b"ruby\0";
+    static CPU_HEAP: &[u8] = b"cpu\0";
+
+    match *crate::BINDING.get().unwrap().mmtk.get_options().gc_trigger {
+        GCTriggerSelector::FixedHeapSize(_) => FIXED_HEAP.as_ptr(),
+        GCTriggerSelector::DynamicHeapSize(_, _) => DYNAMIC_HEAP.as_ptr(),
+        GCTriggerSelector::Delegated => {
+            // Two delegated triggers exist; disambiguate via the populated
+            // config singleton.
+            if CPU_HEAP_TRIGGER_CONFIG.get().is_some() {
+                CPU_HEAP.as_ptr()
+            } else {
+                RUBY_HEAP.as_ptr()
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_heap_min() -> usize {
+    match *crate::BINDING.get().unwrap().mmtk.get_options().gc_trigger {
+        GCTriggerSelector::FixedHeapSize(_) => 0,
+        GCTriggerSelector::DynamicHeapSize(min_size, _) => min_size,
+        GCTriggerSelector::Delegated => {
+            if let Some(cfg) = CPU_HEAP_TRIGGER_CONFIG.get() {
+                conversions::pages_to_bytes(cfg.min_heap_pages)
+            } else {
+                conversions::pages_to_bytes(
+                    RUBY_HEAP_TRIGGER_CONFIG
+                        .get()
+                        .expect("RUBY_HEAP_TRIGGER_CONFIG not set")
+                        .min_heap_pages,
+                )
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_heap_max() -> usize {
+    match *crate::BINDING.get().unwrap().mmtk.get_options().gc_trigger {
+        GCTriggerSelector::FixedHeapSize(max_size) => max_size,
+        GCTriggerSelector::DynamicHeapSize(_, max_size) => max_size,
+        GCTriggerSelector::Delegated => {
+            if let Some(cfg) = CPU_HEAP_TRIGGER_CONFIG.get() {
+                conversions::pages_to_bytes(cfg.max_heap_pages)
+            } else {
+                conversions::pages_to_bytes(
+                    RUBY_HEAP_TRIGGER_CONFIG
+                        .get()
+                        .expect("RUBY_HEAP_TRIGGER_CONFIG not set")
+                        .max_heap_pages,
+                )
+            }
+        }
+    }
+}
+
+// =============== Measurement ===============
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_harness_begin(tls: VMMutatorThread) {
+    memory_manager::harness_begin::<Ruby>(crate::BINDING.get().unwrap().mmtk, tls);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_harness_end() {
+    memory_manager::harness_end::<Ruby>(crate::BINDING.get().unwrap().mmtk);
+}
+
+// =============== Miscellaneous ===============
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mmtk_is_mmtk_object(addr: Address) -> bool {
+    debug_assert!(!addr.is_zero());
+    debug_assert!(addr.is_aligned_to(mmtk::util::is_mmtk_object::VO_BIT_REGION_SIZE));
+    memory_manager::is_mmtk_object(addr).is_some()
+}

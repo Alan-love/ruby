@@ -1,5 +1,7 @@
-require_relative 'helper'
-require 'rubygems/uri'
+# frozen_string_literal: true
+
+require_relative "helper"
+require "rubygems/uri"
 
 class TestUri < Gem::TestCase
   def test_to_s_not_string
@@ -18,8 +20,12 @@ class TestUri < Gem::TestCase
     assert_equal "https://REDACTED@example.com", Gem::Uri.new("https://token@example.com").redacted.to_s
   end
 
+  def test_redacted_with_token_and_empty_password
+    assert_equal "https://REDACTED@example.com", Gem::Uri.new("https://token:@example.com").redacted.to_s
+  end
+
   def test_redacted_with_user_x_oauth_basic
-    assert_equal "https://REDACTED:x-oauth-basic@example.com", Gem::Uri.new("https://token:x-oauth-basic@example.com").redacted.to_s
+    assert_equal "https://REDACTED@example.com", Gem::Uri.new("https://token:x-oauth-basic@example.com").redacted.to_s
   end
 
   def test_redacted_without_credential
@@ -31,9 +37,9 @@ class TestUri < Gem::TestCase
   end
 
   def test_redacted_does_not_modify_uri
-    url = 'https://user:password@example.com'
+    url = "https://user:password@example.com"
     uri = Gem::Uri.new(url)
-    assert_equal 'https://user:REDACTED@example.com', uri.redacted.to_s
+    assert_equal "https://user:REDACTED@example.com", uri.redacted.to_s
     assert_equal url, uri.to_s
   end
 end

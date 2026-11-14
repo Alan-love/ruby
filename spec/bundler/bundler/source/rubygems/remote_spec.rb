@@ -11,8 +11,8 @@ RSpec.describe Bundler::Source::Rubygems::Remote do
     allow(Digest(:MD5)).to receive(:hexdigest).with(duck_type(:to_s)) {|string| "MD5HEX(#{string})" }
   end
 
-  let(:uri_no_auth) { Bundler::URI("https://gems.example.com") }
-  let(:uri_with_auth) { Bundler::URI("https://#{credentials}@gems.example.com") }
+  let(:uri_no_auth) { Gem::URI("https://gems.example.com") }
+  let(:uri_with_auth) { Gem::URI("https://#{credentials}@gems.example.com") }
   let(:credentials) { "username:password" }
 
   context "when the original URI has no credentials" do
@@ -89,11 +89,11 @@ RSpec.describe Bundler::Source::Rubygems::Remote do
   end
 
   context "when the original URI has only a username" do
-    let(:uri) { Bundler::URI("https://SeCrEt-ToKeN@gem.fury.io/me/") }
+    let(:uri) { Gem::URI("https://SeCrEt-ToKeN@gem.fury.io/me/") }
 
     describe "#anonymized_uri" do
       it "returns the URI without username and password" do
-        expect(remote(uri).anonymized_uri).to eq(Bundler::URI("https://gem.fury.io/me/"))
+        expect(remote(uri).anonymized_uri).to eq(Gem::URI("https://gem.fury.io/me/"))
       end
     end
 
@@ -105,9 +105,9 @@ RSpec.describe Bundler::Source::Rubygems::Remote do
   end
 
   context "when a mirror with inline credentials is configured for the URI" do
-    let(:uri) { Bundler::URI("https://rubygems.org/") }
-    let(:mirror_uri_with_auth) { Bundler::URI("https://username:password@rubygems-mirror.org/") }
-    let(:mirror_uri_no_auth) { Bundler::URI("https://rubygems-mirror.org/") }
+    let(:uri) { Gem::URI("https://rubygems.org/") }
+    let(:mirror_uri_with_auth) { Gem::URI("https://username:password@example-mirror.rubygems.org/") }
+    let(:mirror_uri_no_auth) { Gem::URI("https://example-mirror.rubygems.org/") }
 
     before { Bundler.settings.temporary("mirror.https://rubygems.org/" => mirror_uri_with_auth.to_s) }
 
@@ -131,9 +131,9 @@ RSpec.describe Bundler::Source::Rubygems::Remote do
   end
 
   context "when a mirror with configured credentials is configured for the URI" do
-    let(:uri) { Bundler::URI("https://rubygems.org/") }
-    let(:mirror_uri_with_auth) { Bundler::URI("https://#{credentials}@rubygems-mirror.org/") }
-    let(:mirror_uri_no_auth) { Bundler::URI("https://rubygems-mirror.org/") }
+    let(:uri) { Gem::URI("https://rubygems.org/") }
+    let(:mirror_uri_with_auth) { Gem::URI("https://#{credentials}@example-mirror.rubygems.org/") }
+    let(:mirror_uri_no_auth) { Gem::URI("https://example-mirror.rubygems.org/") }
 
     before do
       Bundler.settings.temporary("mirror.https://rubygems.org/" => mirror_uri_no_auth.to_s)
@@ -167,6 +167,57 @@ RSpec.describe Bundler::Source::Rubygems::Remote do
       it "is not set" do
         expect(remote(uri_no_auth).original_uri).to be_nil
       end
+    end
+  end
+
+  describe "#cooldown" do
+    it "is nil by default" do
+      expect(remote(uri_no_auth).cooldown).to be_nil
+    end
+
+    it "returns the value passed to the constructor" do
+      r = Bundler::Source::Rubygems::Remote.new(uri_no_auth, cooldown: 7)
+      expect(r.cooldown).to eq(7)
+    end
+  end
+
+  describe "#effective_cooldown" do
+    it "returns the per-remote value when no override is set" do
+      r = Bundler::Source::Rubygems::Remote.new(uri_no_auth, cooldown: 7)
+      expect(r.effective_cooldown).to eq(7)
+    end
+
+    it "returns nil when neither override nor per-remote value is set" do
+      expect(remote(uri_no_auth).effective_cooldown).to be_nil
+    end
+
+    it "settings override per-remote value" do
+      r = Bundler::Source::Rubygems::Remote.new(uri_no_auth, cooldown: 7)
+      Bundler.settings.temporary(cooldown: 14) do
+        expect(r.effective_cooldown).to eq(14)
+      end
+    end
+
+    it "settings override even when per-remote value is absent" do
+      Bundler.settings.temporary(cooldown: 14) do
+        expect(remote(uri_no_auth).effective_cooldown).to eq(14)
+      end
+    end
+
+    it "reads the settings only once, however many candidates ask" do
+      r = Bundler::Source::Rubygems::Remote.new(uri_no_auth, cooldown: 7)
+      expect(Bundler.settings).to receive(:cooldown_for).with(7).once.and_return(14)
+
+      expect(r.effective_cooldown).to eq(14)
+      expect(r.effective_cooldown).to eq(14)
+    end
+
+    it "memoizes an absent cooldown without re-reading the settings" do
+      r = Bundler::Source::Rubygems::Remote.new(uri_no_auth, cooldown: 7)
+      expect(Bundler.settings).to receive(:cooldown_for).with(7).once.and_return(nil)
+
+      expect(r.effective_cooldown).to be_nil
+      expect(r.effective_cooldown).to be_nil
     end
   end
 end

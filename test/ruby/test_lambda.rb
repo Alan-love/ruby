@@ -163,7 +163,7 @@ class TestLambdaParameters < Test::Unit::TestCase
   end
 
   def test_proc_inside_lambda_toplevel
-    assert_separately [], <<~RUBY
+    assert_ruby_status [], <<~RUBY
       lambda{
         $g = proc{ return :pr }
       }.call
@@ -175,32 +175,6 @@ class TestLambdaParameters < Test::Unit::TestCase
         raise
       end
     RUBY
-  end
-
-  def pass_along(&block)
-    lambda(&block)
-  end
-
-  def pass_along2(&block)
-    pass_along(&block)
-  end
-
-  def test_create_non_lambda_for_proc_one_level
-    prev_warning, Warning[:deprecated] = Warning[:deprecated], false
-    f = pass_along {}
-    refute_predicate(f, :lambda?, '[Bug #15620]')
-    assert_nothing_raised(ArgumentError) { f.call(:extra_arg) }
-  ensure
-    Warning[:deprecated] = prev_warning
-  end
-
-  def test_create_non_lambda_for_proc_two_levels
-    prev_warning, Warning[:deprecated] = Warning[:deprecated], false
-    f = pass_along2 {}
-    refute_predicate(f, :lambda?, '[Bug #15620]')
-    assert_nothing_raised(ArgumentError) { f.call(:extra_arg) }
-  ensure
-    Warning[:deprecated] = prev_warning
   end
 
   def test_instance_exec

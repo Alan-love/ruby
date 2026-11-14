@@ -1,4 +1,14 @@
-*.md
-*.rdoc
-NEWS-*
+[^_]*.md
+[^_]*.rb
+[^_]*.rdoc
+contributing
+distribution
+NEWS
 syntax
+optparse
+jit
+security
+language
+strscan
+file
+

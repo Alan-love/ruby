@@ -9,7 +9,7 @@ describe "C-API Debug function" do
 
   describe "rb_debug_inspector_open" do
     it "creates a debug context and calls the given callback" do
-      @o.rb_debug_inspector_open(42).should be_kind_of(Array)
+      @o.rb_debug_inspector_open(42).should.is_a?(Array)
       @o.debug_spec_callback_data.should == 42
     end
   end
@@ -17,6 +17,7 @@ describe "C-API Debug function" do
   describe "rb_debug_inspector_frame_self_get" do
     it "returns self" do
       @o.rb_debug_inspector_frame_self_get(0).should == @o
+      @o.rb_debug_inspector_frame_self_get(1).should == self
     end
   end
 
@@ -30,15 +31,22 @@ describe "C-API Debug function" do
     it "returns the current binding" do
       a = "test"
       b = @o.rb_debug_inspector_frame_binding_get(1)
-      b.should be_an_instance_of(Binding)
+      b.should.instance_of?(Binding)
       b.local_variable_get(:a).should == "test"
     end
 
     it "matches the locations in rb_debug_inspector_backtrace_locations" do
-      frames = @o.rb_debug_inspector_open(42);
-      frames.each do |_s, _klass, binding, _iseq, backtrace_location|
+      frames = @o.rb_debug_inspector_open(42)
+      frames.each do |_s, klass, binding, iseq, backtrace_location|
         if binding
-          "#{backtrace_location.path}:#{backtrace_location.lineno}".should == "#{binding.source_location[0]}:#{binding.source_location[1]}"
+          # YJIT modifies Array#each backtraces but leaves its source_location as is
+          unless defined?(RubyVM::YJIT) && klass == Array && iseq.label == "each"
+            binding.source_location.should == [backtrace_location.path, backtrace_location.lineno]
+          end
+          method_name = binding.eval('__method__')
+          if method_name
+            method_name.should == backtrace_location.base_label.to_sym
+          end
         end
       end
     end
@@ -47,7 +55,7 @@ describe "C-API Debug function" do
   describe "rb_debug_inspector_frame_iseq_get" do
     it "returns an InstructionSequence" do
       if defined?(RubyVM::InstructionSequence)
-        @o.rb_debug_inspector_frame_iseq_get(1).should be_an_instance_of(RubyVM::InstructionSequence)
+        @o.rb_debug_inspector_frame_iseq_get(1).should.instance_of?(RubyVM::InstructionSequence)
       else
         @o.rb_debug_inspector_frame_iseq_get(1).should == nil
       end
@@ -58,9 +66,9 @@ describe "C-API Debug function" do
     it "returns an array of Thread::Backtrace::Location" do
       bts = @o.rb_debug_inspector_backtrace_locations
       bts.should_not.empty?
-      bts.each { |bt| bt.should be_kind_of(Thread::Backtrace::Location) }
+      bts.each { |bt| bt.should.is_a?(Thread::Backtrace::Location) }
       location = "#{__FILE__}:#{__LINE__ - 3}"
-      bts[1].to_s.should include(location)
+      bts[1].to_s.should.include?(location)
     end
   end
 end

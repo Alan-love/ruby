@@ -14,7 +14,7 @@ describe "Kernel#warn" do
   end
 
   it "is a private method" do
-    Kernel.should have_private_instance_method(:warn)
+    Kernel.private_instance_methods(false).should.include?(:warn)
   end
 
   it "accepts multiple arguments" do
@@ -112,6 +112,12 @@ describe "Kernel#warn" do
       ruby_exe(file, options: "-rrubygems", args: "2>&1").should == "#{file}:2: warning: warn-require-warning\n"
     end
 
+    it "doesn't show the caller when the uplevel is `nil`" do
+      w = KernelSpecs::WarnInNestedCall.new
+
+      -> { w.f4("foo", nil) }.should output(nil, "foo\n")
+    end
+
     guard -> { Kernel.instance_method(:tap).source_location } do
       it "skips <internal: core library methods defined in Ruby" do
         file, line = Kernel.instance_method(:tap).source_location
@@ -128,36 +134,34 @@ describe "Kernel#warn" do
       end
     end
 
-    ruby_version_is "3.0" do
-      it "accepts :category keyword with a symbol" do
-        -> {
-          $VERBOSE = true
-          warn("message", category: :deprecated)
-        }.should output(nil, "message\n")
-      end
+    it "accepts :category keyword with a symbol" do
+      -> {
+        $VERBOSE = true
+        warn("message", category: :deprecated)
+      }.should output(nil, "message\n")
+    end
 
-      it "accepts :category keyword with nil" do
-        -> {
-          $VERBOSE = true
-          warn("message", category: nil)
-        }.should output(nil, "message\n")
-      end
+    it "accepts :category keyword with nil" do
+      -> {
+        $VERBOSE = true
+        warn("message", category: nil)
+      }.should output(nil, "message\n")
+    end
 
-      it "accepts :category keyword with object convertible to symbol" do
-        o = Object.new
-        def o.to_sym; :deprecated; end
-        -> {
-          $VERBOSE = true
-          warn("message", category: o)
-        }.should output(nil, "message\n")
-      end
+    it "accepts :category keyword with object convertible to symbol" do
+      o = Object.new
+      def o.to_sym; :deprecated; end
+      -> {
+        $VERBOSE = true
+        warn("message", category: o)
+      }.should output(nil, "message\n")
+    end
 
-      it "raises if :category keyword is not nil and not convertible to symbol" do
-        -> {
-          $VERBOSE = true
-          warn("message", category: Object.new)
-        }.should raise_error(TypeError)
-      end
+    it "raises if :category keyword is not nil and not convertible to symbol" do
+      -> {
+        $VERBOSE = true
+        warn("message", category: Object.new)
+      }.should.raise(TypeError)
     end
 
     it "converts first arg using to_s" do
@@ -190,19 +194,19 @@ describe "Kernel#warn" do
     end
 
     it "raises ArgumentError if passed negative value" do
-      -> { warn "", uplevel: -2 }.should raise_error(ArgumentError)
-      -> { warn "", uplevel: -100 }.should raise_error(ArgumentError)
+      -> { warn "", uplevel: -2 }.should.raise(ArgumentError)
+      -> { warn "", uplevel: -100 }.should.raise(ArgumentError)
     end
 
     it "raises ArgumentError if passed -1" do
-      -> { warn "", uplevel: -1 }.should raise_error(ArgumentError)
+      -> { warn "", uplevel: -1 }.should.raise(ArgumentError)
     end
 
     it "raises TypeError if passed not Integer" do
-      -> { warn "", uplevel: "" }.should raise_error(TypeError)
-      -> { warn "", uplevel: [] }.should raise_error(TypeError)
-      -> { warn "", uplevel: {} }.should raise_error(TypeError)
-      -> { warn "", uplevel: Object.new }.should raise_error(TypeError)
+      -> { warn "", uplevel: "" }.should.raise(TypeError)
+      -> { warn "", uplevel: [] }.should.raise(TypeError)
+      -> { warn "", uplevel: {} }.should.raise(TypeError)
+      -> { warn "", uplevel: Object.new }.should.raise(TypeError)
     end
   end
 
@@ -210,6 +214,55 @@ describe "Kernel#warn" do
     h = {}
     -> { warn(**h) }.should_not complain(verbose: true)
     -> { warn('foo', **h) }.should complain("foo\n")
+  end
+
+  it "calls Warning.warn without keyword arguments if Warning.warn does not accept keyword arguments" do
+    verbose = $VERBOSE
+    $VERBOSE = false
+    class << Warning
+      alias_method :_warn, :warn
+      def warn(message)
+        ScratchPad.record(message)
+      end
+    end
+
+    begin
+      ScratchPad.clear
+      warn("Chunky bacon!")
+      ScratchPad.recorded.should == "Chunky bacon!\n"
+
+      warn("Deprecated bacon!", category: :deprecated)
+      ScratchPad.recorded.should == "Deprecated bacon!\n"
+    ensure
+      class << Warning
+        remove_method :warn
+        alias_method :warn, :_warn
+        remove_method :_warn
+      end
+      $VERBOSE = verbose
+    end
+  end
+
+  it "calls Warning.warn with category: nil if Warning.warn accepts keyword arguments" do
+    Warning.should_receive(:warn).with("Chunky bacon!\n", category: nil)
+    verbose = $VERBOSE
+    $VERBOSE = false
+    begin
+      warn("Chunky bacon!")
+    ensure
+      $VERBOSE = verbose
+    end
+  end
+
+  it "calls Warning.warn with given category keyword converted to a symbol" do
+    Warning.should_receive(:warn).with("Chunky bacon!\n", category: :deprecated)
+    verbose = $VERBOSE
+    $VERBOSE = false
+    begin
+      warn("Chunky bacon!", category: 'deprecated')
+    ensure
+      $VERBOSE = verbose
+    end
   end
 
   it "does not call Warning.warn if self is the Warning module" do
@@ -241,5 +294,11 @@ describe "Kernel#warn" do
     out = ruby_exe(code, args: "2>&1", options: "--disable-gems")
     out.should == "avoid infinite recursion\n"
     $?.should.success?
+  end
+end
+
+describe "Kernel.warn" do
+  it "is a public method" do
+    Kernel.public_methods(false).should.include?(:warn)
   end
 end

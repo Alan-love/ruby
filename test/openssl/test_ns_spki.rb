@@ -17,34 +17,34 @@ class OpenSSL::TestNSSPI < OpenSSL::TestCase
   end
 
   def test_build_data
-    key1 = Fixtures.pkey("rsa1024")
-    key2 = Fixtures.pkey("rsa2048")
+    key1 = Fixtures.pkey("rsa-1")
+    key2 = Fixtures.pkey("rsa-2")
     spki = OpenSSL::Netscape::SPKI.new
     spki.challenge = "RandomString"
-    spki.public_key = key1.public_key
-    spki.sign(key1, OpenSSL::Digest.new('SHA1'))
-    assert(spki.verify(spki.public_key))
-    assert(spki.verify(key1.public_key))
-    assert(!spki.verify(key2.public_key))
+    spki.public_key = key1
+    spki.sign(key1, OpenSSL::Digest.new('SHA256'))
+    assert_true(spki.verify(spki.public_key))
+    assert_true(spki.verify(OpenSSL::PKey.read(key1.public_to_der)))
+    assert_false(spki.verify(OpenSSL::PKey.read(key2.public_to_der)))
 
     der = spki.to_der
     spki = OpenSSL::Netscape::SPKI.new(der)
     assert_equal("RandomString", spki.challenge)
-    assert_equal(key1.public_key.to_der, spki.public_key.to_der)
-    assert(spki.verify(spki.public_key))
+    assert_equal(key1.public_to_der, spki.public_key.public_to_der)
+    assert_true(spki.verify(spki.public_key))
     assert_not_nil(spki.to_text)
   end
 
   def test_decode_data
     spki = OpenSSL::Netscape::SPKI.new(@b64)
     assert_equal(@b64, spki.to_pem)
-    assert_equal(@b64.unpack("m").first, spki.to_der)
+    assert_equal(@b64.unpack1("m"), spki.to_der)
     assert_equal("MozillaIsMyFriend", spki.challenge)
     assert_equal(OpenSSL::PKey::RSA, spki.public_key.class)
 
-    spki = OpenSSL::Netscape::SPKI.new(@b64.unpack("m").first)
+    spki = OpenSSL::Netscape::SPKI.new(@b64.unpack1("m"))
     assert_equal(@b64, spki.to_pem)
-    assert_equal(@b64.unpack("m").first, spki.to_der)
+    assert_equal(@b64.unpack1("m"), spki.to_der)
     assert_equal("MozillaIsMyFriend", spki.challenge)
     assert_equal(OpenSSL::PKey::RSA, spki.public_key.class)
   end

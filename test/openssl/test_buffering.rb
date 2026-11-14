@@ -10,7 +10,7 @@ class OpenSSL::TestBuffering < OpenSSL::TestCase
     attr_accessor :sync
 
     def initialize
-      @io = Buffer.new
+      @io = String.new
       def @io.sync
         true
       end

@@ -15,14 +15,14 @@ while line = gets()
     if out_stdout
       out = STDOUT
     else
-      out = open($file, "w") if $file != ""
+      out = File.open($file, "w") if $file != ""
     end
     out.binmode
     break
   end
 end
 
-raise "missing begin" unless $sawbegin
+raise "missing begin" unless $sawbegin > 0
 
 out.binmode
 while line = gets()

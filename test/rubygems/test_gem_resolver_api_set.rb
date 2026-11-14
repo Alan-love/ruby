@@ -1,84 +1,99 @@
 # frozen_string_literal: true
-require_relative 'helper'
+
+require_relative "helper"
 
 class TestGemResolverAPISet < Gem::TestCase
   def setup
     super
 
-    @DR = Gem::Resolver
-    @dep_uri = URI "#{@gem_repo}info/"
+    @dep_uri = Gem::URI "#{@gem_repo}info/"
   end
 
   def test_initialize
-    set = @DR::APISet.new
+    set = Gem::Resolver::APISet.new
 
-    assert_equal URI('https://index.rubygems.org/info/'),            set.dep_uri
-    assert_equal URI('https://index.rubygems.org/'),                 set.uri
-    assert_equal Gem::Source.new(URI('https://index.rubygems.org')), set.source
+    assert_equal Gem::URI("https://index.rubygems.org/info/"),            set.dep_uri
+    assert_equal Gem::URI("https://index.rubygems.org/"),                 set.uri
+    assert_equal Gem::Source.new(Gem::URI("https://index.rubygems.org")), set.source
   end
 
   def test_initialize_deeper_uri
-    set = @DR::APISet.new 'https://rubygemsserver.com/mygems/info'
+    set = Gem::Resolver::APISet.new "https://rubygemsserver.com/mygems/info"
 
-    assert_equal URI('https://rubygemsserver.com/mygems/info'),       set.dep_uri
-    assert_equal URI('https://rubygemsserver.com/'),                  set.uri
-    assert_equal Gem::Source.new(URI('https://rubygemsserver.com/')), set.source
+    assert_equal Gem::URI("https://rubygemsserver.com/mygems/info"),       set.dep_uri
+    assert_equal Gem::URI("https://rubygemsserver.com/"),                  set.uri
+    assert_equal Gem::Source.new(Gem::URI("https://rubygemsserver.com/")), set.source
   end
 
   def test_initialize_uri
-    set = @DR::APISet.new @dep_uri
+    set = Gem::Resolver::APISet.new @dep_uri
 
-    assert_equal URI("#{@gem_repo}info/"), set.dep_uri
-    assert_equal URI("#{@gem_repo}"), set.uri
+    assert_equal Gem::URI("#{@gem_repo}info/"), set.dep_uri
+    assert_equal Gem::URI(@gem_repo.to_s), set.uri
   end
 
   def test_find_all
     spec_fetcher
 
     data = [
-      { :name         => 'a',
-        :number       => '1',
-        :platform     => 'ruby',
-        :dependencies => [] },
+      { name: "a",
+        number: "1",
+        suffix: "ruby",
+        dependencies: [] },
     ]
 
-    @fetcher.data["#{@dep_uri}a"] = "---\n1  "
+    @fetcher.data["#{@dep_uri}a"] = util_compact_index_response("---\n1  ")
 
-    set = @DR::APISet.new @dep_uri
+    set = Gem::Resolver::APISet.new @dep_uri
 
-    a_dep = @DR::DependencyRequest.new dep('a'), nil
+    a_dep = Gem::Resolver::DependencyRequest.new dep("a"), nil
 
     expected = [
-      @DR::APISpecification.new(set, data.first),
+      Gem::Resolver::APISpecification.new(set, data.first),
     ]
 
     assert_equal expected, set.find_all(a_dep)
+  end
+
+  def test_find_all_content_addressed
+    spec_fetcher
+
+    a_spec = util_ca_spec("a", "1", "ab12345678", ruby_abi: "3.3", platform: Gem::Platform.local.to_s)
+    util_setup_compact_index(a_spec)
+
+    set = Gem::Resolver::APISet.new @dep_uri
+    a_dep = Gem::Resolver::DependencyRequest.new dep("a"), nil
+    spec = set.find_all(a_dep).first
+
+    assert_equal "ab12345678", spec.content_address
+    assert_equal Gem::Platform.local, spec.platform
+    assert Gem::ContentAddress.match?(spec.content_address)
   end
 
   def test_find_all_prereleases
     spec_fetcher
 
     data = [
-      { :name         => 'a',
-        :number       => '1',
-        :platform     => 'ruby',
-        :dependencies => [] },
-      { :name         => 'a',
-        :number       => '2.a',
-        :platform     => 'ruby',
-        :dependencies => [] },
+      { name: "a",
+        number: "1",
+        suffix: "ruby",
+        dependencies: [] },
+      { name: "a",
+        number: "2.a",
+        suffix: "ruby",
+        dependencies: [] },
     ]
 
-    @fetcher.data["#{@dep_uri}a"] = "---\n1\n2.a"
+    @fetcher.data["#{@dep_uri}a"] = util_compact_index_response("---\n1\n2.a")
 
-    set = @DR::APISet.new @dep_uri
+    set = Gem::Resolver::APISet.new @dep_uri
     set.prerelease = true
 
-    a_dep = @DR::DependencyRequest.new dep('a'), nil
+    a_dep = Gem::Resolver::DependencyRequest.new dep("a"), nil
 
     expected = [
-      @DR::APISpecification.new(set, data.first),
-      @DR::APISpecification.new(set, data.last),
+      Gem::Resolver::APISpecification.new(set, data.first),
+      Gem::Resolver::APISpecification.new(set, data.last),
     ]
 
     assert_equal expected, set.find_all(a_dep)
@@ -88,22 +103,22 @@ class TestGemResolverAPISet < Gem::TestCase
     spec_fetcher
 
     data = [
-      { :name         => 'a',
-        :number       => '1',
-        :platform     => 'ruby',
-        :dependencies => [] },
+      { name: "a",
+        number: "1",
+        suffix: "ruby",
+        dependencies: [] },
     ]
 
-    @fetcher.data["#{@dep_uri}a"] = "---\n1  "
+    @fetcher.data["#{@dep_uri}a"] = util_compact_index_response("---\n1  ")
 
-    set = @DR::APISet.new @dep_uri
+    set = Gem::Resolver::APISet.new @dep_uri
 
-    a_dep = @DR::DependencyRequest.new dep('a'), nil
+    a_dep = Gem::Resolver::DependencyRequest.new dep("a"), nil
 
     set.prefetch [a_dep]
 
     expected = [
-      @DR::APISpecification.new(set, data.first),
+      Gem::Resolver::APISpecification.new(set, data.first),
     ]
 
     assert_equal expected, set.find_all(a_dep)
@@ -112,10 +127,10 @@ class TestGemResolverAPISet < Gem::TestCase
   end
 
   def test_find_all_local
-    set = @DR::APISet.new @dep_uri
+    set = Gem::Resolver::APISet.new @dep_uri
     set.remote = false
 
-    a_dep = @DR::DependencyRequest.new dep('a'), nil
+    a_dep = Gem::Resolver::DependencyRequest.new dep("a"), nil
 
     assert_empty set.find_all(a_dep)
   end
@@ -123,11 +138,30 @@ class TestGemResolverAPISet < Gem::TestCase
   def test_find_all_missing
     spec_fetcher
 
-    @fetcher.data["#{@dep_uri}a"] = "---"
+    @fetcher.data["#{@dep_uri}a"] = util_compact_index_response("---")
 
-    set = @DR::APISet.new @dep_uri
+    set = Gem::Resolver::APISet.new @dep_uri
 
-    a_dep = @DR::DependencyRequest.new dep('a'), nil
+    a_dep = Gem::Resolver::DependencyRequest.new dep("a"), nil
+
+    assert_empty set.find_all(a_dep)
+
+    @fetcher.data.delete "#{@dep_uri}a"
+
+    assert_empty set.find_all(a_dep)
+  end
+
+  def test_find_all_not_found
+    spec_fetcher
+
+    @fetcher.data["#{@dep_uri}/a"] =
+      proc do
+        raise Gem::RemoteFetcher::FetchError
+      end
+
+    set = Gem::Resolver::APISet.new @dep_uri
+
+    a_dep = Gem::Resolver::DependencyRequest.new dep("a"), nil
 
     assert_empty set.find_all(a_dep)
 
@@ -139,34 +173,34 @@ class TestGemResolverAPISet < Gem::TestCase
   def test_prefetch
     spec_fetcher
 
-    @fetcher.data["#{@dep_uri}a"] = "---\n1  \n"
-    @fetcher.data["#{@dep_uri}b"] = "---"
+    @fetcher.data["#{@dep_uri}a"] = util_compact_index_response("---\n1  \n")
+    @fetcher.data["#{@dep_uri}b"] = util_compact_index_response("---")
 
-    set = @DR::APISet.new @dep_uri
+    set = Gem::Resolver::APISet.new @dep_uri
 
-    a_dep = @DR::DependencyRequest.new dep('a'), nil
-    b_dep = @DR::DependencyRequest.new dep('b'), nil
+    a_dep = Gem::Resolver::DependencyRequest.new dep("a"), nil
+    b_dep = Gem::Resolver::DependencyRequest.new dep("b"), nil
 
     set.prefetch [a_dep, b_dep]
 
-    assert_equal %w[a-1], set.find_all(a_dep).map {|s| s.full_name }
+    assert_equal %w[a-1], set.find_all(a_dep).map(&:full_name)
     assert_empty          set.find_all(b_dep)
   end
 
   def test_prefetch_cache
     spec_fetcher
 
-    @fetcher.data["#{@dep_uri}a"] = "---\n1  \n"
+    @fetcher.data["#{@dep_uri}a"] = util_compact_index_response("---\n1  \n")
 
-    set = @DR::APISet.new @dep_uri
+    set = Gem::Resolver::APISet.new @dep_uri
 
-    a_dep = @DR::DependencyRequest.new dep('a'), nil
-    b_dep = @DR::DependencyRequest.new dep('b'), nil
+    a_dep = Gem::Resolver::DependencyRequest.new dep("a"), nil
+    b_dep = Gem::Resolver::DependencyRequest.new dep("b"), nil
 
     set.prefetch [a_dep]
 
     @fetcher.data.delete "#{@dep_uri}a"
-    @fetcher.data["#{@dep_uri}?b"] = "---"
+    @fetcher.data["#{@dep_uri}?b"] = util_compact_index_response("---")
 
     set.prefetch [a_dep, b_dep]
   end
@@ -174,13 +208,13 @@ class TestGemResolverAPISet < Gem::TestCase
   def test_prefetch_cache_missing
     spec_fetcher
 
-    @fetcher.data["#{@dep_uri}a"] = "---\n1  \n"
-    @fetcher.data["#{@dep_uri}b"] = "---"
+    @fetcher.data["#{@dep_uri}a"] = util_compact_index_response("---\n1  \n")
+    @fetcher.data["#{@dep_uri}b"] = util_compact_index_response("---")
 
-    set = @DR::APISet.new @dep_uri
+    set = Gem::Resolver::APISet.new @dep_uri
 
-    a_dep = @DR::DependencyRequest.new dep('a'), nil
-    b_dep = @DR::DependencyRequest.new dep('b'), nil
+    a_dep = Gem::Resolver::DependencyRequest.new dep("a"), nil
+    b_dep = Gem::Resolver::DependencyRequest.new dep("b"), nil
 
     set.prefetch [a_dep, b_dep]
 
@@ -193,14 +227,14 @@ class TestGemResolverAPISet < Gem::TestCase
   def test_prefetch_local
     spec_fetcher
 
-    @fetcher.data["#{@dep_uri}a"] = "---\n1  \n"
-    @fetcher.data["#{@dep_uri}b"] = "---"
+    @fetcher.data["#{@dep_uri}a"] = util_compact_index_response("---\n1  \n")
+    @fetcher.data["#{@dep_uri}b"] = util_compact_index_response("---")
 
-    set = @DR::APISet.new @dep_uri
+    set = Gem::Resolver::APISet.new @dep_uri
     set.remote = false
 
-    a_dep = @DR::DependencyRequest.new dep('a'), nil
-    b_dep = @DR::DependencyRequest.new dep('b'), nil
+    a_dep = Gem::Resolver::DependencyRequest.new dep("a"), nil
+    b_dep = Gem::Resolver::DependencyRequest.new dep("b"), nil
 
     set.prefetch [a_dep, b_dep]
 

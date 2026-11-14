@@ -18,6 +18,7 @@
 
 #include <stdio.h>
 
+#include "ruby/onigmo.h"
 #include "ruby/regex.h"
 #include "ruby/internal/core/rmatch.h"
 #include "ruby/internal/dllexport.h"
@@ -58,7 +59,7 @@ VALUE rb_reg_regcomp(VALUE str);
  * Distinction  between raising  ::rb_eArgError  and  ::rb_eRegexpError is  not
  * obvious, at least to @shyouhei.
  */
-long rb_reg_search(VALUE re, VALUE str, long pos, int dir);
+rb_len_t rb_reg_search(VALUE re, VALUE str, rb_len_t pos, int dir);
 
 /**
  * Substitution.  This  is basically the implementation  of `String#sub`.  Also
@@ -93,7 +94,7 @@ VALUE rb_reg_regsub(VALUE repl, VALUE src, struct re_registers *regs, VALUE rexp
  *             character boundary.
  *
  */
-long rb_reg_adjust_startpos(VALUE re, VALUE str, long pos, int dir);
+rb_len_t rb_reg_adjust_startpos(VALUE re, VALUE str, rb_len_t pos, int dir);
 
 /**
  * Escapes  any  characters  that  would  have special  meaning  in  a  regular
@@ -115,7 +116,10 @@ VALUE rb_reg_quote(VALUE str);
  * @exception  rb_eEncCompatError  `re` and `str` are incompatible.
  * @exception  rb_eRegexpError     `re` is malformed.
  * @return     A preprocessesed pattern buffer ready to be applied to `str`.
- * @note       The return value is manages by our GC.  Don't free.
+ * @warning    Do not use this function.  Use rb_reg_onig_match() instead.
+ *             It is kept only for old extensions.  Its ownership rules are
+ *             error prone: unless the return value is `RREGEXP_PTR(re)`, the
+ *             caller must free it with `onig_free()`.
  *
  * @internal
  *
@@ -124,6 +128,30 @@ VALUE rb_reg_quote(VALUE str);
  * at this point.  Just don't mix the two.
  */
 regex_t *rb_reg_prepare_re(VALUE re, VALUE str);
+
+/**
+ * Runs a regular expression match using function `match`. Performs preparation,
+ * error handling, and memory cleanup.
+ *
+ * @param[in]  re                  Target regular expression.
+ * @param[in]  str                 What `re` is about to run on.
+ * @param[in]  match               The function to run to match `str` against `re`.
+ * @param[in]  args                Pointer to arguments to pass into `match`.
+ * @param[out] regs                Registers on a successful match.
+ * @exception  rb_eArgError        `re` does not fit for `str`.
+ * @exception  rb_eEncCompatError  `re` and `str` are incompatible.
+ * @exception  rb_eRegexpError     `re` is malformed.
+ * @return     Match position on a successful match, `ONIG_MISMATCH` otherwise.
+ *
+ * @internal
+ *
+ * The type `regex_t  *` is  defined  in  `<ruby/onigmo.h>`,  _and_
+ * _conflicts_ with POSIX's  `<regex.h>`.  We can no longer  save the situation
+ * at this point.  Just don't mix the two.
+ */
+OnigPosition rb_reg_onig_match(VALUE re, VALUE str,
+                               OnigPosition (*match)(regex_t *reg, VALUE str, struct re_registers *regs, void *args),
+                               void *args, struct re_registers *regs);
 
 /**
  * Duplicates a match data.  This  is roughly the same as `onig_region_copy()`,

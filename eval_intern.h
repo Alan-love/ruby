@@ -3,6 +3,7 @@
 
 #include "ruby/ruby.h"
 #include "vm_core.h"
+#include "zjit.h"
 
 static inline void
 vm_passed_block_handler_set(rb_execution_context_t *ec, VALUE block_handler)
@@ -33,7 +34,11 @@ pass_passed_block_handler(rb_execution_context_t *ec)
 #endif
 
 #include <stdio.h>
-#include <setjmp.h>
+#if defined(__wasm__) && !defined(__EMSCRIPTEN__)
+# include "wasm/setjmp.h"
+#else
+# include <setjmp.h>
+#endif
 
 #ifdef __APPLE__
 # ifdef HAVE_CRT_EXTERNS_H
@@ -91,14 +96,6 @@ extern int select_large_fdset(int, fd_set *, fd_set *, fd_set *, struct timeval 
 
 #include <sys/stat.h>
 
-
-#define SAVE_ROOT_JMPBUF(th, stmt) do \
-  if (true) { \
-      stmt; \
-  } \
-  else if (th) { /* suppress unused-variable warning */ \
-  } while (0)
-
 #define EC_PUSH_TAG(ec) do { \
   rb_execution_context_t * const _ec = (ec); \
   struct rb_vm_tag _tag; \
@@ -106,9 +103,24 @@ extern int select_large_fdset(int, fd_set *, fd_set *, fd_set *, struct timeval 
   _tag.tag = Qundef; \
   _tag.prev = _ec->tag; \
   _tag.lock_rec = rb_ec_vm_lock_rec(_ec); \
+  EC_SAVE_TAG_CFP(_tag, _ec); \
+  rb_vm_tag_jmpbuf_init(&_tag.buf); \
+
+// Remember the CFP and whether it was already running in ZJIT as of
+// EC_PUSH_TAG. When a C method does longjmp inside it, the target CFP may not
+// be equal to the VM_FRAME_FLAG_FINISH frame. If its ZJIT frame predates this
+// tag, its native stack survives the jump and should not be materialized.
+#if USE_ZJIT
+# define EC_SAVE_TAG_CFP(_tag, _ec) \
+    _tag.cfp = _ec->cfp; \
+    _tag.zjit_frame_active = CFP_ZJIT_FRAME_P(_ec->cfp)
+#else
+# define EC_SAVE_TAG_CFP(_tag, _ec)
+#endif
 
 #define EC_POP_TAG() \
   _ec->tag = _tag.prev; \
+  rb_vm_tag_jmpbuf_deinit(&_tag.buf); \
 } while (0)
 
 #define EC_TMPPOP_TAG() \
@@ -116,9 +128,8 @@ extern int select_large_fdset(int, fd_set *, fd_set *, fd_set *, struct timeval 
 
 #define EC_REPUSH_TAG() (void)(_ec->tag = &_tag)
 
-#if defined __GNUC__ && __GNUC__ == 4 && (__GNUC_MINOR__ >= 6 && __GNUC_MINOR__ <= 8) || defined __clang__
-/* This macro prevents GCC 4.6--4.8 from emitting maybe-uninitialized warnings.
- * This macro also prevents Clang from dumping core in EC_EXEC_TAG().
+#if defined __clang__
+/* This macro prevents Clang from dumping core in EC_EXEC_TAG().
  * (I confirmed Clang 4.0.1 and 5.0.0.)
  */
 # define VAR_FROM_MEMORY(var) __extension__(*(__typeof__(var) volatile *)&(var))
@@ -147,6 +158,8 @@ rb_ec_tag_state(const rb_execution_context_t *ec)
     enum ruby_tag_type state = tag->state;
     tag->state = TAG_NONE;
     rb_ec_vm_lock_rec_check(ec, tag->lock_rec);
+    RBIMPL_ASSUME(state > TAG_NONE);
+    RBIMPL_ASSUME(state <= TAG_FATAL);
     return state;
 }
 
@@ -154,8 +167,12 @@ NORETURN(static inline void rb_ec_tag_jump(const rb_execution_context_t *ec, enu
 static inline void
 rb_ec_tag_jump(const rb_execution_context_t *ec, enum ruby_tag_type st)
 {
+    RUBY_ASSERT(st > TAG_NONE && st <= TAG_FATAL, ": Invalid tag jump: %d", (int)st);
+#if USE_ZJIT
+    rb_zjit_materialize_frames_for_longjmp(ec, ec->cfp);
+#endif
     ec->tag->state = st;
-    ruby_longjmp(ec->tag->buf, 1);
+    ruby_longjmp(RB_VM_TAG_JMPBUF_GET(ec->tag->buf), 1);
 }
 
 /*
@@ -163,7 +180,7 @@ rb_ec_tag_jump(const rb_execution_context_t *ec, enum ruby_tag_type st)
   [ISO/IEC 9899:1999] 7.13.1.1
 */
 #define EC_EXEC_TAG() \
-    (ruby_setjmp(_tag.buf) ? rb_ec_tag_state(VAR_FROM_MEMORY(_ec)) : (EC_REPUSH_TAG(), 0))
+    (UNLIKELY(ruby_setjmp(RB_VM_TAG_JMPBUF_GET(_tag.buf))) ? rb_ec_tag_state(VAR_FROM_MEMORY(_ec)) : (EC_REPUSH_TAG(), 0))
 
 #define EC_JUMP_TAG(ec, st) rb_ec_tag_jump(ec, st)
 
@@ -171,13 +188,34 @@ rb_ec_tag_jump(const rb_execution_context_t *ec, enum ruby_tag_type st)
 
 /* CREF operators */
 
-#define CREF_FL_PUSHED_BY_EVAL IMEMO_FL_USER1
-#define CREF_FL_OMOD_SHARED    IMEMO_FL_USER2
+#define CREF_FL_PUSHED_BY_EVAL    IMEMO_FL_USER1
+#define CREF_FL_OMOD_SHARED      IMEMO_FL_USER2
+#define CREF_FL_SINGLETON        IMEMO_FL_USER3
+#define CREF_FL_DYNAMIC_CREF IMEMO_FL_USER4
+#define CREF_FL_REFINED_PROC IMEMO_FL_USER5
+
+static inline int CREF_SINGLETON(const rb_cref_t *cref);
 
 static inline VALUE
 CREF_CLASS(const rb_cref_t *cref)
 {
-    return cref->klass;
+    if (CREF_SINGLETON(cref)) {
+        return CLASS_OF(cref->klass_or_self);
+    }
+    else {
+        return cref->klass_or_self;
+    }
+}
+
+static inline VALUE
+CREF_CLASS_FOR_DEFINITION(const rb_cref_t *cref)
+{
+    if (CREF_SINGLETON(cref)) {
+        return rb_singleton_class(cref->klass_or_self);
+    }
+    else {
+        return cref->klass_or_self;
+    }
 }
 
 static inline rb_cref_t *
@@ -217,6 +255,18 @@ CREF_PUSHED_BY_EVAL_SET(rb_cref_t *cref)
 }
 
 static inline int
+CREF_SINGLETON(const rb_cref_t *cref)
+{
+    return cref->flags & CREF_FL_SINGLETON;
+}
+
+static inline void
+CREF_SINGLETON_SET(rb_cref_t *cref)
+{
+    cref->flags |= CREF_FL_SINGLETON;
+}
+
+static inline int
 CREF_OMOD_SHARED(const rb_cref_t *cref)
 {
     return cref->flags & CREF_FL_OMOD_SHARED;
@@ -228,10 +278,34 @@ CREF_OMOD_SHARED_SET(rb_cref_t *cref)
     cref->flags |= CREF_FL_OMOD_SHARED;
 }
 
+static inline int
+CREF_DYNAMIC(const rb_cref_t *cref)
+{
+    return cref->flags & CREF_FL_DYNAMIC_CREF;
+}
+
+static inline void
+CREF_DYNAMIC_SET(rb_cref_t *cref)
+{
+    cref->flags |= CREF_FL_DYNAMIC_CREF;
+}
+
 static inline void
 CREF_OMOD_SHARED_UNSET(rb_cref_t *cref)
 {
     cref->flags &= ~CREF_FL_OMOD_SHARED;
+}
+
+static inline int
+CREF_REFINED_PROC(const rb_cref_t *cref)
+{
+    return cref->flags & CREF_FL_REFINED_PROC;
+}
+
+static inline void
+CREF_REFINED_PROC_SET(rb_cref_t *cref)
+{
+    cref->flags |= CREF_FL_REFINED_PROC;
 }
 
 enum {
@@ -252,53 +326,31 @@ VALUE rb_make_exception(int argc, const VALUE *argv);
 
 NORETURN(void rb_method_name_error(VALUE, VALUE));
 
-void rb_fiber_start(rb_fiber_t*);
+NORETURN(void rb_fiber_start(rb_fiber_t*));
 
 NORETURN(void rb_print_undef(VALUE, ID, rb_method_visibility_t));
 NORETURN(void rb_print_undef_str(VALUE, VALUE));
 NORETURN(void rb_print_inaccessible(VALUE, ID, rb_method_visibility_t));
 NORETURN(void rb_vm_localjump_error(const char *,VALUE, int));
-NORETURN(void rb_vm_jump_tag_but_local_jump(int));
+NORETURN(void rb_vm_jump_tag_but_local_jump(enum ruby_tag_type));
 
-VALUE rb_vm_make_jump_tag_but_local_jump(int state, VALUE val);
+VALUE rb_vm_make_jump_tag_but_local_jump(enum ruby_tag_type state, VALUE val);
 rb_cref_t *rb_vm_cref(void);
 rb_cref_t *rb_vm_cref_replace_with_duplicated_cref(void);
 VALUE rb_vm_call_cfunc(VALUE recv, VALUE (*func)(VALUE), VALUE arg, VALUE block_handler, VALUE filename);
+VALUE rb_vm_call_cfunc_in_box(VALUE recv, VALUE (*func)(VALUE, VALUE), VALUE arg1, VALUE arg2, VALUE filename, const rb_box_t *box);
+void rb_vm_frame_flag_set_box_require(const rb_execution_context_t *ec);
+const rb_box_t *rb_vm_current_box(const rb_execution_context_t *ec);
+const rb_box_t *rb_vm_caller_box(const rb_execution_context_t *ec);
+const rb_box_t *rb_vm_loading_box(const rb_execution_context_t *ec);
 void rb_vm_set_progname(VALUE filename);
 VALUE rb_vm_cbase(void);
 
 /* vm_backtrace.c */
+#define RUBY_BACKTRACE_START 0
+#define RUBY_ALL_BACKTRACE_LINES -1
 VALUE rb_ec_backtrace_object(const rb_execution_context_t *ec);
 VALUE rb_ec_backtrace_str_ary(const rb_execution_context_t *ec, long lev, long n);
 VALUE rb_ec_backtrace_location_ary(const rb_execution_context_t *ec, long lev, long n, bool skip_internal);
-
-#ifndef CharNext		/* defined as CharNext[AW] on Windows. */
-# ifdef HAVE_MBLEN
-#  define CharNext(p) rb_char_next(p)
-static inline char *
-rb_char_next(const char *p)
-{
-    if (p) {
-        int len = mblen(p, RUBY_MBCHAR_MAXSIZE);
-        p += len > 0 ? len : 1;
-    }
-    return (char *)p;
-}
-# else
-#  define CharNext(p) ((p) + 1)
-# endif
-#endif
-
-#if defined DOSISH || defined __CYGWIN__
-static inline void
-translit_char(char *p, int from, int to)
-{
-    while (*p) {
-	if ((unsigned char)*p == from)
-	    *p = to;
-	p = CharNext(p);
-    }
-}
-#endif
 
 #endif /* RUBY_EVAL_INTERN_H */

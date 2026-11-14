@@ -1,18 +1,16 @@
 # frozen_string_literal: true
-require_relative 'deprecate'
 
 ##
 # This module contains various utility methods as module methods.
 
 module Gem::Util
-
   ##
   # Zlib::GzipReader wrapper that unzips +data+.
 
   def self.gunzip(data)
-    require 'zlib'
-    require 'stringio'
-    data = StringIO.new(data, 'r')
+    require "zlib"
+    require "stringio"
+    data = StringIO.new(data, "r")
 
     gzip_reader = begin
                     Zlib::GzipReader.new(data)
@@ -29,9 +27,9 @@ module Gem::Util
   # Zlib::GzipWriter wrapper that zips +data+.
 
   def self.gzip(data)
-    require 'zlib'
-    require 'stringio'
-    zipped = StringIO.new(String.new, 'w')
+    require "zlib"
+    require "stringio"
+    zipped = StringIO.new(String.new, "w")
     zipped.set_encoding Encoding::BINARY
 
     Zlib::GzipWriter.wrap zipped do |io|
@@ -45,7 +43,7 @@ module Gem::Util
   # A Zlib::Inflate#inflate wrapper
 
   def self.inflate(data)
-    require 'zlib'
+    require "zlib"
     Zlib::Inflate.inflate data
   end
 
@@ -57,26 +55,6 @@ module Gem::Util
   end
 
   ##
-  # Invokes system, but silences all output.
-
-  def self.silent_system(*command)
-    opt = {:out => IO::NULL, :err => [:child, :out]}
-    if Hash === command.last
-      opt.update(command.last)
-      cmds = command[0...-1]
-    else
-      cmds = command.dup
-    end
-    system(*(cmds << opt))
-  end
-
-  class << self
-    extend Gem::Deprecate
-
-    rubygems_deprecate :silent_system
-  end
-
-  ##
   # Enumerates the parents of +directory+.
 
   def self.traverse_parents(directory, &block)
@@ -84,36 +62,64 @@ module Gem::Util
 
     here = File.expand_path directory
     loop do
-      Dir.chdir here, &block rescue Errno::EACCES
+      begin
+        Dir.chdir here, &block
+      rescue StandardError
+        Errno::EACCES
+      end
 
-      new_here = File.expand_path('..', here)
+      new_here = File.expand_path("..", here)
       return if new_here == here # toplevel
       here = new_here
     end
   end
 
   ##
-  # Globs for files matching +pattern+ inside of +directory+,
-  # returning absolute paths to the matching files.
+  # Globs for entries matching +glob+ inside of +base_path+, returning
+  # absolute paths to the matching files and directories. Unlike a plain
+  # Dir.glob with an interpolated path, glob metacharacters in +base_path+
+  # are not treated as part of the pattern. Matched entries are joined to
+  # +base_path+ literally, so an entry starting with `~` is not expanded
+  # into a home directory, and no other normalization is applied to them.
 
   def self.glob_files_in_dir(glob, base_path)
-    if RUBY_VERSION >= "2.5"
-      Dir.glob(glob, base: base_path).map! {|f| File.expand_path(f, base_path) }
-    else
-      Dir.glob(File.expand_path(glob, base_path))
+    expanded_path = nil
+    Dir.glob(glob, base: base_path).map! do |f|
+      # File.join instead of File.expand_path, so that matched entries
+      # starting with `~` are not expanded into the home directory
+      File.join(expanded_path ||= File.expand_path(base_path), f)
     end
   end
 
   ##
-  # Corrects +path+ (usually returned by `URI.parse().path` on Windows), that
+  # Duplicates +obj+ without Marshal, which cannot resolve Gem:: constants from
+  # the root box under Ruby::Box (RUBY_BOX=1). Hashes and arrays are copied
+  # recursively, anything else with a plain +dup+, so an object's internals stay
+  # shared with the original, as are hash keys. Shared references are not
+  # preserved, and a cyclic +obj+ raises SystemStackError.
+
+  def self.deep_dup(obj) # :nodoc:
+    case obj
+    when Hash then obj.to_h {|k, v| [k, deep_dup(v)] }
+    when Array then obj.map {|e| deep_dup(e) }
+    else
+      begin
+        obj.dup
+      rescue TypeError
+        obj
+      end
+    end
+  end
+
+  ##
+  # Corrects +path+ (usually returned by `Gem::URI.parse().path` on Windows), that
   # comes with a leading slash.
 
   def self.correct_for_windows_path(path)
-    if path[0].chr == '/' && path[1].chr =~ /[a-z]/i && path[2].chr == ':'
+    if path[0].chr == "/" && path[1].chr.match?(/[a-z]/i) && path[2].chr == ":"
       path[1..-1]
     else
       path
     end
   end
-
 end

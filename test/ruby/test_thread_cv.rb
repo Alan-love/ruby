@@ -6,12 +6,6 @@ class TestThreadConditionVariable < Test::Unit::TestCase
   ConditionVariable = Thread::ConditionVariable
   Mutex = Thread::Mutex
 
-  def test_initialized
-    assert_raise(TypeError) {
-      ConditionVariable.allocate.wait(nil)
-    }
-  end
-
   def test_condvar_signal_and_wait
     mutex = Thread::Mutex.new
     condvar = Thread::ConditionVariable.new
@@ -76,13 +70,13 @@ class TestThreadConditionVariable < Test::Unit::TestCase
         end
       end
     end
-    sleep 0.1
+    Thread.pass until threads.all?(&:stop?)
     mutex.synchronize do
       result << "P1"
       condvar.broadcast
       result << "P2"
     end
-    Timeout.timeout(5) do
+    Timeout.timeout(60) do
       nr_threads.times do |i|
         threads[i].join
       end

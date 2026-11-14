@@ -2,12 +2,9 @@
 
 require 'socket'
 require 'timeout'
-require 'io/wait'
-
-begin
-  require 'securerandom'
-rescue LoadError
-end
+require 'io/wait' if RUBY_VERSION < '3.2'
+require 'securerandom'
+require 'rbconfig'
 
 # Resolv is a thread-aware DNS resolver library written in Ruby.  Resolv can
 # handle multiple DNS requests concurrently without blocking the entire Ruby
@@ -36,6 +33,9 @@ end
 # * /etc/nsswitch.conf is not supported.
 
 class Resolv
+
+  # The version string
+  VERSION = "0.8.1"
 
   ##
   # Looks up the first IP address for +name+.
@@ -81,9 +81,22 @@ class Resolv
 
   ##
   # Creates a new Resolv using +resolvers+.
+  #
+  # If +resolvers+ is not given, a hash, or +nil+, uses a Hosts resolver and
+  # and a DNS resolver.  If +resolvers+ is a hash, uses the hash as
+  # configuration for the DNS resolver.
 
-  def initialize(resolvers=[Hosts.new, DNS.new])
-    @resolvers = resolvers
+  def initialize(resolvers=(arg_not_set = true; nil), use_ipv6: (keyword_not_set = true; nil))
+    if !keyword_not_set && !arg_not_set
+      warn "Support for separate use_ipv6 keyword is deprecated, as it is ignored if an argument is provided. Do not provide a positional argument if using the use_ipv6 keyword argument.", uplevel: 1
+    end
+
+    @resolvers = case resolvers
+    when Hash, nil
+      [Hosts.new, DNS.new(DNS::Config.default_config_hash.merge(resolvers || {}))]
+    else
+      resolvers
+    end
   end
 
   ##
@@ -166,14 +179,15 @@ class Resolv
   # Resolv::Hosts is a hostname resolver that uses the system hosts file.
 
   class Hosts
-    if /mswin|mingw|cygwin/ =~ RUBY_PLATFORM and
+    if /mswin|cygwin|mingw/ =~ RUBY_PLATFORM || ::RbConfig::CONFIG['host_os'] =~ /mswin/
       begin
-        require 'win32/resolv'
-        DefaultFileName = Win32::Resolv.get_hosts_path || IO::NULL
+        require 'win32/resolv' unless defined?(Win32::Resolv)
+        hosts = Win32::Resolv.get_hosts_path || IO::NULL
       rescue LoadError
       end
     end
-    DefaultFileName ||= '/etc/hosts'
+    # The default file name for host names
+    DefaultFileName = hosts || '/etc/hosts'
 
     ##
     # Creates a new Resolv::Hosts, using +filename+ for its data source.
@@ -192,17 +206,10 @@ class Resolv
           File.open(@filename, 'rb') {|f|
             f.each {|line|
               line.sub!(/#.*/, '')
-              addr, hostname, *aliases = line.split(/\s+/)
+              addr, *hostnames = line.split(/\s+/)
               next unless addr
-              @addr2name[addr] = [] unless @addr2name.include? addr
-              @addr2name[addr] << hostname
-              @addr2name[addr] += aliases
-              @name2addr[hostname] = [] unless @name2addr.include? hostname
-              @name2addr[hostname] << addr
-              aliases.each {|n|
-                @name2addr[n] = [] unless @name2addr.include? n
-                @name2addr[n] << addr
-              }
+              (@addr2name[addr] ||= []).concat(hostnames)
+              hostnames.each {|hostname| (@name2addr[hostname] ||= []) << addr}
             }
           }
           @name2addr.each {|name, arr| arr.reverse!}
@@ -310,6 +317,8 @@ class Resolv
     # String:: Path to a file using /etc/resolv.conf's format.
     # Hash:: Must contain :nameserver, :search and :ndots keys.
     # :nameserver_port can be used to specify port number of nameserver address.
+    # :raise_timeout_errors can be used to raise timeout errors
+    # as exceptions instead of treating the same as an NXDOMAIN response.
     #
     # The value of :nameserver should be an address string or
     # an array of address strings.
@@ -399,13 +408,20 @@ class Resolv
     # be a Resolv::IPv4 or Resolv::IPv6
 
     def each_address(name)
-      each_resource(name, Resource::IN::A) {|resource| yield resource.address}
       if use_ipv6?
         each_resource(name, Resource::IN::AAAA) {|resource| yield resource.address}
       end
+      each_resource(name, Resource::IN::A) {|resource| yield resource.address}
     end
 
     def use_ipv6? # :nodoc:
+      @config.lazy_initialize unless @config.instance_variable_get(:@initialized)
+
+      use_ipv6 = @config.use_ipv6?
+      unless use_ipv6.nil?
+        return use_ipv6
+      end
+
       begin
         list = Socket.ip_address_list
       rescue NotImplementedError
@@ -471,13 +487,18 @@ class Resolv
     # * Resolv::DNS::Resource::IN::A
     # * Resolv::DNS::Resource::IN::AAAA
     # * Resolv::DNS::Resource::IN::ANY
+    # * Resolv::DNS::Resource::IN::CAA
     # * Resolv::DNS::Resource::IN::CNAME
     # * Resolv::DNS::Resource::IN::HINFO
+    # * Resolv::DNS::Resource::IN::HTTPS
+    # * Resolv::DNS::Resource::IN::LOC
     # * Resolv::DNS::Resource::IN::MINFO
     # * Resolv::DNS::Resource::IN::MX
     # * Resolv::DNS::Resource::IN::NS
     # * Resolv::DNS::Resource::IN::PTR
     # * Resolv::DNS::Resource::IN::SOA
+    # * Resolv::DNS::Resource::IN::SRV
+    # * Resolv::DNS::Resource::IN::SVCB
     # * Resolv::DNS::Resource::IN::TXT
     # * Resolv::DNS::Resource::IN::WKS
     #
@@ -509,37 +530,56 @@ class Resolv
       }
     end
 
+    # :stopdoc:
+
     def fetch_resource(name, typeclass)
       lazy_initialize
-      begin
-        requester = make_udp_requester
+      truncated = {}
+      requesters = {}
+      udp_requester = begin
+        make_udp_requester
       rescue Errno::EACCES
         # fall back to TCP
       end
       senders = {}
+
       begin
-        @config.resolv(name) {|candidate, tout, nameserver, port|
-          requester ||= make_tcp_requester(nameserver, port)
+        @config.resolv(name) do |candidate, tout, nameserver, port|
           msg = Message.new
           msg.rd = 1
           msg.add_question(candidate, typeclass)
-          unless sender = senders[[candidate, nameserver, port]]
+
+          requester = requesters.fetch([nameserver, port]) do
+            if !truncated[candidate] && udp_requester
+              udp_requester
+            else
+              requesters[[nameserver, port]] = make_tcp_requester(nameserver, port)
+            end
+          end
+
+          unless sender = senders[[candidate, requester, nameserver, port]]
             sender = requester.sender(msg, candidate, nameserver, port)
             next if !sender
-            senders[[candidate, nameserver, port]] = sender
+            senders[[candidate, requester, nameserver, port]] = sender
           end
-          reply, reply_name = requester.request(sender, tout)
+          begin
+            reply, reply_name = requester.request(sender, tout)
+          rescue ResolvTimeout
+            # Giving up part way through a frame loses stream sync, and a peer
+            # seen going away leaves the socket dead.  Either way the requester
+            # says so, and the next attempt has to open a fresh connection.  A
+            # timeout with the stream still on a frame boundary keeps it.
+            unless requester.reusable?
+              requesters.delete([nameserver, port])
+              requester.close
+            end
+            raise
+          end
           case reply.rcode
           when RCode::NoError
             if reply.tc == 1 and not Requester::TCP === requester
-              requester.close
               # Retry via TCP:
-              requester = make_tcp_requester(nameserver, port)
-              senders = {}
-              # This will use TCP for all remaining candidates (assuming the
-              # current candidate does not already respond successfully via
-              # TCP).  This makes sense because we already know the full
-              # response will not fit in an untruncated UDP packet.
+              truncated[candidate] = true
               redo
             else
               yield(reply, reply_name)
@@ -550,9 +590,10 @@ class Resolv
           else
             raise Config::OtherResolvError.new(reply_name.to_s)
           end
-        }
+        end
       ensure
-        requester&.close
+        udp_requester&.close
+        requesters.each_value { |requester| requester&.close }
       end
     end
 
@@ -567,6 +608,11 @@ class Resolv
 
     def make_tcp_requester(host, port) # :nodoc:
       return Requester::TCP.new(host, port)
+    rescue Errno::ECONNREFUSED
+      # Treat a refused TCP connection attempt to a nameserver like a timeout,
+      # as Resolv::DNS::Config#resolv considers ResolvTimeout exceptions as a
+      # hint to try the next nameserver:
+      raise ResolvTimeout
     end
 
     def extract_resources(msg, name, typeclass) # :nodoc:
@@ -600,16 +646,10 @@ class Resolv
       }
     end
 
-    if defined? SecureRandom
-      def self.random(arg) # :nodoc:
-        begin
-          SecureRandom.random_number(arg)
-        rescue NotImplementedError
-          rand(arg)
-        end
-      end
-    else
-      def self.random(arg) # :nodoc:
+    def self.random(arg) # :nodoc:
+      begin
+        SecureRandom.random_number(arg)
+      rescue NotImplementedError
         rand(arg)
       end
     end
@@ -641,8 +681,33 @@ class Resolv
       }
     end
 
-    def self.bind_random_port(udpsock, bind_host="0.0.0.0") # :nodoc:
-      begin
+    case RUBY_PLATFORM
+    when *[
+      # https://www.rfc-editor.org/rfc/rfc6056.txt
+      # Appendix A. Survey of the Algorithms in Use by Some Popular Implementations
+      /freebsd/, /linux/, /netbsd/, /openbsd/, /solaris/,
+      /darwin/, # the same as FreeBSD
+    ] then
+      def self.bind_random_port(udpsock, bind_host="0.0.0.0") # :nodoc:
+        udpsock.bind(bind_host, 0)
+      end
+    when /mswin|mingw/
+      # Sequential port assignment
+      def self.bind_random_port(udpsock, bind_host="0.0.0.0") # :nodoc:
+        # SO_EXCLUSIVEADDRUSE: make bind fail if another socket already uses the port
+        udpsock.setsockopt(Socket::SOL_SOCKET, ~Socket::SO_REUSEADDR, 1)
+        begin
+          # Ephemeral port number range recommended by RFC 6056
+          port = random(1024..65535)
+          udpsock.bind(bind_host, port)
+        rescue Errno::EADDRINUSE, Errno::EACCES
+          retry
+        end
+      end
+    else
+      # Sequential port assignment
+      def self.bind_random_port(udpsock, bind_host="0.0.0.0") # :nodoc:
+        # Ephemeral port number range recommended by RFC 6056
         port = random(1024..65535)
         udpsock.bind(bind_host, port)
       rescue Errno::EADDRINUSE, # POSIX
@@ -658,13 +723,27 @@ class Resolv
         @socks = nil
       end
 
+      # Whether another request may be sent over the same transport.  Only a
+      # stream transport can end up in a state that rules this out.
+      def reusable?
+        true
+      end
+
+      # A request could not be written.  Only a stream transport can be left
+      # unusable by that; see #reusable?.
+      def send_failed
+      end
+
       def request(sender, tout)
         start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         timelimit = start + tout
         begin
           sender.send
         rescue Errno::EHOSTUNREACH, # multi-homed IPv6 may generate this
-               Errno::ENETUNREACH
+               Errno::ENETUNREACH,
+               Errno::EPIPE, # a peer that went away between requests
+               Errno::ECONNRESET # the same, as Windows reports it
+          send_failed
           raise ResolvTimeout
         end
         while true
@@ -684,9 +763,10 @@ class Resolv
             raise ResolvTimeout
           end
           begin
-            reply, from = recv_reply(select_result[0])
+            reply, from = recv_reply(select_result[0], timelimit)
           rescue Errno::ECONNREFUSED, # GNU/Linux, FreeBSD
-                 Errno::ECONNRESET # Windows
+                 Errno::ECONNRESET, # Windows
+                 EOFError
             # No name server running on the server?
             # Don't wait anymore.
             raise ResolvTimeout
@@ -748,7 +828,7 @@ class Resolv
               next if @socks_hash[bind_host]
               begin
                 sock = UDPSocket.new(af)
-              rescue Errno::EAFNOSUPPORT
+              rescue Errno::EAFNOSUPPORT, Errno::EPROTONOSUPPORT
                 next # The kernel doesn't support the address family.
               end
               @socks << sock
@@ -760,7 +840,7 @@ class Resolv
           self
         end
 
-        def recv_reply(readable_socks)
+        def recv_reply(readable_socks, timelimit = nil)
           lazy_initialize
           reply, from = readable_socks[0].recvfrom(UDPSize)
           return reply, [from[3],from[1]]
@@ -819,20 +899,37 @@ class Resolv
           @mutex.synchronize {
             next if @initialized
             @initialized = true
-            is_ipv6 = @host.index(':')
-            sock = UDPSocket.new(is_ipv6 ? Socket::AF_INET6 : Socket::AF_INET)
-            @socks = [sock]
-            sock.do_not_reverse_lookup = true
-            DNS.bind_random_port(sock, is_ipv6 ? "::" : "0.0.0.0")
-            sock.connect(@host, @port)
+            connect_socket
           }
           self
         end
 
-        def recv_reply(readable_socks)
+        # The socket to talk to the nameserver over, opening one if there is
+        # none yet.  #recv_reply may have replaced it since a sender was
+        # created, so senders ask for it per request instead of holding on to
+        # one.
+        def sock
+          lazy_initialize
+          @socks[0]
+        end
+
+        def recv_reply(readable_socks, timelimit = nil)
           lazy_initialize
           reply = readable_socks[0].recv(UDPSize)
           return reply, nil
+        rescue Errno::ECONNREFUSED, Errno::ECONNRESET
+          # The kernel reports these from an ICMP message, and a second one for
+          # the same pair of endpoints is not always passed on: macOS 26.1 and
+          # later deliver every other one.  A retry over this socket would then
+          # wait out its whole timeout rather than fail at once, so start over
+          # from a new source port.
+          @mutex.synchronize {
+            if @initialized
+              @socks&.each(&:close)
+              connect_socket
+            end
+          }
+          raise
         end
 
         def sender(msg, data, host=@host, port=@port)
@@ -843,7 +940,7 @@ class Resolv
           id = DNS.allocate_request_id(@host, @port)
           request = msg.encode
           request[0,2] = [id].pack('n')
-          return @senders[[nil,id]] = Sender.new(request, data, @socks[0])
+          return @senders[[nil,id]] = Sender.new(request, data, self)
         end
 
         def close
@@ -858,10 +955,23 @@ class Resolv
           end
         end
 
+        private def connect_socket
+          is_ipv6 = @host.index(':')
+          sock = UDPSocket.new(is_ipv6 ? Socket::AF_INET6 : Socket::AF_INET)
+          @socks = [sock]
+          sock.do_not_reverse_lookup = true
+          DNS.bind_random_port(sock, is_ipv6 ? "::" : "0.0.0.0")
+          sock.connect(@host, @port)
+        end
+
         class Sender < Requester::Sender # :nodoc:
+          def initialize(msg, data, requester)
+            super(msg, data, nil)
+            @requester = requester
+          end
+
           def send
-            raise "@sock is nil." if @sock.nil?
-            @sock.send(@msg, 0)
+            @requester.sock.send(@msg, 0)
           end
           attr_reader :data
         end
@@ -892,12 +1002,32 @@ class Resolv
           sock = TCPSocket.new(@host, @port)
           @socks = [sock]
           @senders = {}
+          @reusable = true
         end
 
-        def recv_reply(readable_socks)
-          len = readable_socks[0].read(2).unpack('n')[0]
-          reply = @socks[0].read(len)
+        def reusable?
+          @reusable
+        end
+
+        def send_failed
+          @reusable = false
+        end
+
+        def recv_reply(readable_socks, timelimit = nil)
+          sock = readable_socks[0]
+          len_data = read_exactly(sock, 2, timelimit)
+          raise EOFError if len_data.nil? || len_data.bytesize != 2
+          len = len_data.unpack('n')[0]
+          reply = read_exactly(sock, len, timelimit)
+          raise EOFError if reply.nil? || reply.bytesize != len
+          @reusable = true
           return reply, nil
+        rescue EOFError, SystemCallError
+          # Whatever the kernel reported, this socket cannot be trusted for
+          # another frame.  In practice that is the peer closing or resetting;
+          # the rest is rare enough that erring towards reconnecting is right.
+          @reusable = false
+          raise
         end
 
         def sender(msg, data, host=@host, port=@port)
@@ -919,10 +1049,39 @@ class Resolv
         end
 
         def close
+          @reusable = false
           super
           @senders.each_key {|from,id|
             DNS.free_request_id(@host, @port, id)
           }
+        end
+
+        private
+
+        # Read +len+ bytes, giving up with ResolvTimeout once +timelimit+ (a
+        # CLOCK_MONOTONIC value) has passed.  A shorter result means the peer
+        # closed the connection, which the caller turns into an EOFError.
+        # Consuming any byte marks the requester unusable until the whole frame
+        # has been read, since giving up in between loses frame sync.  Without a
+        # +timelimit+ the read blocks instead and keeps no such mark; that is
+        # only for a caller still using the one argument form of #recv_reply.
+        def read_exactly(sock, len, timelimit)
+          return sock.read(len) unless timelimit
+          buf = String.new
+          while buf.bytesize < len
+            case chunk = sock.read_nonblock(len - buf.bytesize, exception: false)
+            when :wait_readable
+              remaining = timelimit - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+              raise ResolvTimeout if remaining <= 0
+              sock.wait_readable(remaining) or raise ResolvTimeout
+            when nil
+              break
+            else
+              @reusable = false
+              buf << chunk
+            end
+          end
+          buf
         end
       end
 
@@ -965,13 +1124,13 @@ class Resolv
             next unless keyword
             case keyword
             when 'nameserver'
-              nameserver += args
+              nameserver.concat(args.each(&:freeze))
             when 'domain'
               next if args.empty?
-              search = [args[0]]
+              search = [args[0].freeze]
             when 'search'
               next if args.empty?
-              search = args
+              search = args.each(&:freeze)
             when 'options'
               args.each {|arg|
                 case arg
@@ -982,28 +1141,29 @@ class Resolv
             end
           }
         }
-        return { :nameserver => nameserver, :search => search, :ndots => ndots }
+        return { :nameserver => nameserver.freeze, :search => search.freeze, :ndots => ndots.freeze }.freeze
       end
 
       def Config.default_config_hash(filename="/etc/resolv.conf")
-        if File.exist? filename
-          config_hash = Config.parse_resolv_conf(filename)
+        # Native Windows resolves the path against the current drive, while Cygwin's own resolver honors it.
+        if defined?(Win32::Resolv) and !(/cygwin/ =~ RUBY_PLATFORM and File.exist?(filename))
+          search, nameserver = Win32::Resolv.get_resolv_info
+          config_hash = {}
+          config_hash[:nameserver] = nameserver if nameserver
+          config_hash[:search] = [search].flatten if search
+          config_hash
+        elsif File.exist? filename
+          Config.parse_resolv_conf(filename)
         else
-          if /mswin|cygwin|mingw|bccwin/ =~ RUBY_PLATFORM
-            require 'win32/resolv'
-            search, nameserver = Win32::Resolv.get_resolv_info
-            config_hash = {}
-            config_hash[:nameserver] = nameserver if nameserver
-            config_hash[:search] = [search].flatten if search
-          end
+          {}
         end
-        config_hash || {}
       end
 
       def lazy_initialize
         @mutex.synchronize {
           unless @initialized
             @nameserver_port = []
+            @use_ipv6 = nil
             @search = nil
             @ndots = 1
             case @config_info
@@ -1028,8 +1188,12 @@ class Resolv
             if config_hash.include? :nameserver_port
               @nameserver_port = config_hash[:nameserver_port].map {|ns, port| [ns, (port || Port)] }
             end
+            if config_hash.include? :use_ipv6
+              @use_ipv6 = config_hash[:use_ipv6]
+            end
             @search = config_hash[:search] if config_hash.include? :search
             @ndots = config_hash[:ndots] if config_hash.include? :ndots
+            @raise_timeout_errors = config_hash[:raise_timeout_errors]
 
             if @nameserver_port.empty?
               @nameserver_port << ['0.0.0.0', Port]
@@ -1041,7 +1205,7 @@ class Resolv
               if /\./ =~ hostname
                 @search = [Label.split($')]
               else
-                @search = [[]]
+                @search = []
               end
             end
 
@@ -1083,24 +1247,23 @@ class Resolv
         @nameserver_port
       end
 
+      def use_ipv6?
+        @use_ipv6
+      end
+
       def generate_candidates(name)
-        candidates = nil
         name = Name.create(name)
         if name.absolute?
-          candidates = [name]
+          [name]
         else
+          abs = Name.new(name.to_a)
+          search = @search.map {|domain| Name.new(name.to_a + domain)}
           if @ndots <= name.length - 1
-            candidates = [Name.new(name.to_a)]
+            [abs, *search].uniq
           else
-            candidates = []
-          end
-          candidates.concat(@search.map {|domain| Name.new(name.to_a + domain)})
-          fname = Name.create("#{name}.")
-          if !candidates.include?(fname)
-            candidates << fname
+            [*search, abs].uniq
           end
         end
-        return candidates
       end
 
       InitialTimeout = 5
@@ -1116,6 +1279,7 @@ class Resolv
       def resolv(name)
         candidates = generate_candidates(name)
         timeouts = @timeouts || generate_timeouts
+        timeout_error = false
         begin
           candidates.each {|candidate|
             begin
@@ -1127,11 +1291,13 @@ class Resolv
                   end
                 }
               }
+              timeout_error = true
               raise ResolvError.new("DNS resolv timeout: #{name}")
             rescue NXDomain
             end
           }
         rescue ResolvError
+          raise if @raise_timeout_errors && timeout_error
         end
       end
 
@@ -1198,6 +1364,13 @@ class Resolv
 
       class Str # :nodoc:
         def initialize(string)
+          # A label is limited to 63 octets. [RFC 1035 2.3.4] Checking it here
+          # makes it an invariant of the object: every label, however it was
+          # built, fits in its length octet and cannot wrap it. Callers turn
+          # this into the error their own contract promises.
+          if string.bytesize > 63
+            raise ArgumentError, "DNS label is too long (#{string.bytesize} bytes, max 63): #{string.inspect}"
+          end
           @string = string
           # case insensivity of DNS labels doesn't apply non-ASCII characters. [RFC 4343]
           # This assumes @string is given in ASCII compatible encoding.
@@ -1243,7 +1416,26 @@ class Resolv
         when Name
           return arg
         when String
-          return Name.new(Label.split(arg), /\.\z/ =~ arg ? true : false)
+          # A hostname is runtime data rather than a programming mistake, so
+          # both size limits surface as ResolvError to stay rescuable alongside
+          # the rest of name resolution. The type check below is a caller
+          # mistake and keeps raising ArgumentError.
+          begin
+            labels = Label.split(arg)
+          rescue ArgumentError => e
+            raise ResolvError.new(e.message)
+          end
+          # Label::Str enforces the per-label limit. Only the total is knowable
+          # here, and it counts the encoded form, so size starts at 1 for the
+          # root label's terminating zero octet. [RFC 1035 2.3.4, 3.1]
+          size = 1
+          labels.each do |label|
+            size += 1 + label.string.bytesize
+            if size > 255
+              raise ResolvError.new("DNS name is too long (#{size} octets, max 255): #{arg.inspect}")
+            end
+          end
+          return Name.new(labels, /\.\z/ =~ arg ? true : false)
         else
           raise ArgumentError.new("cannot interpret as DNS name: #{arg.inspect}")
         end
@@ -1365,10 +1557,22 @@ class Resolv
                @rd == other.rd &&
                @ra == other.ra &&
                @rcode == other.rcode &&
-               @question == other.question &&
+               question_equal?(other.question) &&
                @answer == other.answer &&
                @authority == other.authority &&
                @additional == other.additional
+      end
+
+      # A question holds the resource class itself, and decoding creates a fresh
+      # class for each unknown type, so the classes cannot be compared by
+      # identity alone.
+      private def question_equal?(other_question) # :nodoc:
+        return false unless @question.length == other_question.length
+        @question.zip(other_question) {|(name, typeclass), (o_name, o_typeclass)|
+          return false unless name == o_name &&
+                              Resource::Generic.type_class_equal?(typeclass, o_typeclass)
+        }
+        return true
       end
 
       def add_question(name, typeclass)
@@ -1477,8 +1681,15 @@ class Resolv
         end
 
         def put_string(d)
-          self.put_pack("C", d.length)
-          @data << d
+          s = d.to_s
+          # A character-string is prefixed by a single length octet, so it can
+          # hold at most 255 octets. [RFC 1035 3.3] Reject anything longer to
+          # avoid silently truncating the length to its low 8 bits (mod 256).
+          if s.bytesize > 255
+            raise ArgumentError, "character-string is too long (#{s.bytesize} bytes, max 255): #{s.inspect}"
+          end
+          self.put_pack("C", s.bytesize)
+          @data << s
         end
 
         def put_string_list(ds)
@@ -1487,14 +1698,14 @@ class Resolv
           }
         end
 
-        def put_name(d)
-          put_labels(d.to_a)
+        def put_name(d, compress: true)
+          put_labels(d.to_a, compress: compress)
         end
 
-        def put_labels(d)
+        def put_labels(d, compress: true)
           d.each_index {|i|
             domain = d[i..-1]
-            if idx = @names[domain]
+            if compress && idx = @names[domain]
               self.put_pack("n", 0xc000 | idx)
               return
             else
@@ -1508,7 +1719,17 @@ class Resolv
         end
 
         def put_label(d)
-          self.put_string(d.to_s)
+          s = d.to_s
+          # Label::Str applies this limit when a label is built, so what is left
+          # for here is a raw string handed straight to put_labels. The two ways
+          # an over-long label goes wrong differ: 64 to 255 octets write a length
+          # octet in the reserved or compression pointer range, and 256 or more
+          # wrap it mod 256. Either way the encoded name stops being the name the
+          # caller asked for. [RFC 1035 2.3.4, 4.1.4]
+          if s.bytesize > 63
+            raise ArgumentError, "DNS label is too long (#{s.bytesize} bytes, max 63): #{s.inspect}"
+          end
+          self.put_string(s)
         end
       end
 
@@ -1518,13 +1739,15 @@ class Resolv
           id, flag, qdcount, ancount, nscount, arcount =
             msg.get_unpack('nnnnnn')
           o.id = id
+          o.tc = (flag >> 9) & 1
+          o.rcode = flag & 15
+          return o unless o.tc.zero?
+
           o.qr = (flag >> 15) & 1
           o.opcode = (flag >> 11) & 15
           o.aa = (flag >> 10) & 1
-          o.tc = (flag >> 9) & 1
           o.rd = (flag >> 8) & 1
           o.ra = (flag >> 7) & 1
-          o.rcode = flag & 15
           (1..qdcount).each {
             name, typeclass = msg.get_question
             o.add_question(name, typeclass)
@@ -1616,6 +1839,14 @@ class Resolv
           strings
         end
 
+        def get_list
+          [].tap do |values|
+            while @index < @limit
+              values << yield
+            end
+          end
+        end
+
         def get_name
           return Name.new(self.get_labels)
         end
@@ -1624,6 +1855,12 @@ class Resolv
           prev_index = @index
           save_index = nil
           d = []
+          # size counts the encoded form, so it starts at 1 for the root
+          # label's terminating zero octet. [RFC 1035 3.1]
+          size = 1
+          # A pointer chain decodes to few or no labels, so the 255-octet cap
+          # never bounds its work; cap the pointers followed per name too.
+          pointers = 0
           while true
             raise DecodeError.new("limit exceeded") if @limit <= @index
             case @data.getbyte(@index)
@@ -1634,6 +1871,8 @@ class Resolv
               end
               return d
             when 192..255
+              pointers += 1
+              raise DecodeError.new("too many compression pointers") if pointers > 128
               idx = self.get_unpack('n')[0] & 0x3fff
               if prev_index <= idx
                 raise DecodeError.new("non-backward name pointer")
@@ -1644,13 +1883,21 @@ class Resolv
               end
               @index = idx
             else
-              d << self.get_label
+              l = self.get_label
+              d << l
+              size += 1 + l.string.bytesize
+              raise DecodeError.new("name label data exceed 255 octets") if size > 255
             end
           end
         end
 
         def get_label
           return Label::Str.new(self.get_string)
+        rescue ArgumentError => e
+          # A length octet of 64..191 is reserved rather than a label length,
+          # but this decoder used to read it as one. [RFC 1035 4.1.4] Report it
+          # the way the rest of a malformed message is reported.
+          raise DecodeError.new(e.message)
         end
 
         def get_question
@@ -1672,6 +1919,378 @@ class Resolv
           end
           res.instance_variable_set :@ttl, ttl
           return name, ttl, res
+        end
+      end
+    end
+
+    ##
+    # SvcParams for service binding RRs. [RFC9460]
+
+    class SvcParams
+      include Enumerable
+
+      ##
+      # Create a list of SvcParams with the given initial content.
+      #
+      # +params+ has to be an enumerable of +SvcParam+s.
+      # If its content has +SvcParam+s with the duplicate key,
+      # the one appears last takes precedence.
+
+      def initialize(params = [])
+        @params = {}
+
+        params.each do |param|
+          add param
+        end
+      end
+
+      ##
+      # Get SvcParam for the given +key+ in this list.
+
+      def [](key)
+        @params[canonical_key(key)]
+      end
+
+      ##
+      # Get the number of SvcParams in this list.
+
+      def count
+        @params.count
+      end
+
+      ##
+      # Get whether this list is empty.
+
+      def empty?
+        @params.empty?
+      end
+
+      ##
+      # Add the SvcParam +param+ to this list, overwriting the existing one with the same key.
+
+      def add(param)
+        @params[param.class.key_number] = param
+      end
+
+      ##
+      # Remove the +SvcParam+ with the given +key+ and return it.
+
+      def delete(key)
+        @params.delete(canonical_key(key))
+      end
+
+      ##
+      # Enumerate the +SvcParam+s in this list.
+
+      def each(&block)
+        return enum_for(:each) unless block
+        @params.each_value(&block)
+      end
+
+      def encode(msg) # :nodoc:
+        @params.keys.sort.each do |key|
+          msg.put_pack('n', key)
+          msg.put_length16 do
+            @params.fetch(key).encode(msg)
+          end
+        end
+      end
+
+      def self.decode(msg) # :nodoc:
+        params = msg.get_list do
+          key, = msg.get_unpack('n')
+          msg.get_length16 do
+            SvcParam::ClassHash[key].decode(msg)
+          end
+        end
+
+        return self.new(params)
+      end
+
+      private
+
+      def canonical_key(key) # :nodoc:
+        case key
+        when Integer
+          key
+        when /\Akey(\d+)\z/
+          Integer($1)
+        when Symbol
+          SvcParam::ClassHash[key].key_number
+        else
+          raise TypeError, 'key must be either String or Symbol'
+        end
+      end
+    end
+
+    ##
+    # Base class for SvcParam. [RFC9460]
+
+    class SvcParam
+
+      ##
+      # Get the presentation name of the SvcParamKey.
+
+      def self.key_name
+        const_get(:KeyName)
+      end
+
+      ##
+      # Get the registered number of the SvcParamKey.
+
+      def self.key_number
+        const_get(:KeyNumber)
+      end
+
+      ClassHash = Hash.new do |h, key| # :nodoc:
+        case key
+        when Integer
+          Generic.create(key)
+        when /\Akey(?<key>\d+)\z/
+          Generic.create(key.to_int)
+        when Symbol
+          raise KeyError, "unknown key #{key}"
+        else
+          raise TypeError, 'key must be either String or Symbol'
+        end
+      end
+
+      ##
+      # Generic SvcParam abstract class.
+
+      class Generic < SvcParam
+
+        ##
+        # SvcParamValue in wire-format byte string.
+
+        attr_reader :value
+
+        ##
+        # Create generic SvcParam
+
+        def initialize(value)
+          @value = value
+        end
+
+        def encode(msg) # :nodoc:
+          msg.put_bytes(@value)
+        end
+
+        def self.decode(msg) # :nodoc:
+          return self.new(msg.get_bytes)
+        end
+
+        def self.create(key_number)
+          c = Class.new(Generic)
+          key_name = :"key#{key_number}"
+          c.const_set(:KeyName, key_name)
+          c.const_set(:KeyNumber, key_number)
+          # Not registered in a constant or in ClassHash. ClassHash creates a
+          # class for every unknown SvcParamKey, so registering them
+          # permanently would let a malicious response exhaust memory.
+          return c
+        end
+      end
+
+      ##
+      # "mandatory" SvcParam -- Mandatory keys in service binding RR
+
+      class Mandatory < SvcParam
+        KeyName = :mandatory
+        KeyNumber = 0
+        ClassHash[KeyName] = ClassHash[KeyNumber] = self # :nodoc:
+
+        ##
+        # Mandatory keys.
+
+        attr_reader :keys
+
+        ##
+        # Initialize "mandatory" ScvParam.
+
+        def initialize(keys)
+          @keys = keys.map(&:to_int)
+        end
+
+        def encode(msg) # :nodoc:
+          @keys.sort.each do |key|
+            msg.put_pack('n', key)
+          end
+        end
+
+        def self.decode(msg) # :nodoc:
+          keys = msg.get_list { msg.get_unpack('n')[0] }
+          return self.new(keys)
+        end
+      end
+
+      ##
+      # "alpn" SvcParam -- Additional supported protocols
+
+      class ALPN < SvcParam
+        KeyName = :alpn
+        KeyNumber = 1
+        ClassHash[KeyName] = ClassHash[KeyNumber] = self # :nodoc:
+
+        ##
+        # Supported protocol IDs.
+
+        attr_reader :protocol_ids
+
+        ##
+        # Initialize "alpn" ScvParam.
+
+        def initialize(protocol_ids)
+          @protocol_ids = protocol_ids.map(&:to_str)
+        end
+
+        def encode(msg) # :nodoc:
+          msg.put_string_list(@protocol_ids)
+        end
+
+        def self.decode(msg) # :nodoc:
+          return self.new(msg.get_string_list)
+        end
+      end
+
+      ##
+      # "no-default-alpn" SvcParam -- No support for default protocol
+
+      class NoDefaultALPN < SvcParam
+        KeyName = :'no-default-alpn'
+        KeyNumber = 2
+        ClassHash[KeyName] = ClassHash[KeyNumber] = self # :nodoc:
+
+        def encode(msg) # :nodoc:
+          # no payload
+        end
+
+        def self.decode(msg) # :nodoc:
+          return self.new
+        end
+      end
+
+      ##
+      # "port" SvcParam -- Port for alternative endpoint
+
+      class Port < SvcParam
+        KeyName = :port
+        KeyNumber = 3
+        ClassHash[KeyName] = ClassHash[KeyNumber] = self # :nodoc:
+
+        ##
+        # Port number.
+
+        attr_reader :port
+
+        ##
+        # Initialize "port" ScvParam.
+
+        def initialize(port)
+          @port = port.to_int
+        end
+
+        def encode(msg) # :nodoc:
+          msg.put_pack('n', @port)
+        end
+
+        def self.decode(msg) # :nodoc:
+          port, = msg.get_unpack('n')
+          return self.new(port)
+        end
+      end
+
+      ##
+      # "ipv4hint" SvcParam -- IPv4 address hints
+
+      class IPv4Hint < SvcParam
+        KeyName = :ipv4hint
+        KeyNumber = 4
+        ClassHash[KeyName] = ClassHash[KeyNumber] = self # :nodoc:
+
+        ##
+        # Set of IPv4 addresses.
+
+        attr_reader :addresses
+
+        ##
+        # Initialize "ipv4hint" ScvParam.
+
+        def initialize(addresses)
+          @addresses = addresses.map {|address| IPv4.create(address) }
+        end
+
+        def encode(msg) # :nodoc:
+          @addresses.each do |address|
+            msg.put_bytes(address.address)
+          end
+        end
+
+        def self.decode(msg) # :nodoc:
+          addresses = msg.get_list { IPv4.new(msg.get_bytes(4)) }
+          return self.new(addresses)
+        end
+      end
+
+      ##
+      # "ipv6hint" SvcParam -- IPv6 address hints
+
+      class IPv6Hint < SvcParam
+        KeyName = :ipv6hint
+        KeyNumber = 6
+        ClassHash[KeyName] = ClassHash[KeyNumber] = self # :nodoc:
+
+        ##
+        # Set of IPv6 addresses.
+
+        attr_reader :addresses
+
+        ##
+        # Initialize "ipv6hint" ScvParam.
+
+        def initialize(addresses)
+          @addresses = addresses.map {|address| IPv6.create(address) }
+        end
+
+        def encode(msg) # :nodoc:
+          @addresses.each do |address|
+            msg.put_bytes(address.address)
+          end
+        end
+
+        def self.decode(msg) # :nodoc:
+          addresses = msg.get_list { IPv6.new(msg.get_bytes(16)) }
+          return self.new(addresses)
+        end
+      end
+
+      ##
+      # "dohpath" SvcParam -- DNS over HTTPS path template [RFC9461]
+
+      class DoHPath < SvcParam
+        KeyName = :dohpath
+        KeyNumber = 7
+        ClassHash[KeyName] = ClassHash[KeyNumber] = self # :nodoc:
+
+        ##
+        # URI template for DoH queries.
+
+        attr_reader :template
+
+        ##
+        # Initialize "dohpath" ScvParam.
+
+        def initialize(template)
+          @template = template.encode('utf-8')
+        end
+
+        def encode(msg) # :nodoc:
+          msg.put_bytes(@template)
+        end
+
+        def self.decode(msg) # :nodoc:
+          template = msg.get_bytes.force_encoding('utf-8')
+          return self.new(template)
         end
       end
     end
@@ -1699,7 +2318,14 @@ class Resolv
 
       attr_reader :ttl
 
-      ClassHash = {} # :nodoc:
+      ClassHash = Module.new do
+        module_function
+
+        def []=(type_class_value, klass)
+          type_value, class_value = type_class_value
+          Resource.const_set(:"Type#{type_value}_Class#{class_value}", klass)
+        end
+      end
 
       def encode_rdata(msg) # :nodoc:
         raise NotImplementedError.new
@@ -1737,7 +2363,9 @@ class Resolv
       end
 
       def self.get_class(type_value, class_value) # :nodoc:
-        return ClassHash[[type_value, class_value]] ||
+        cache = :"Type#{type_value}_Class#{class_value}"
+
+        return (const_defined?(cache) && const_get(cache)) ||
                Generic.create(type_value, class_value)
       end
 
@@ -1766,12 +2394,28 @@ class Resolv
           return self.new(msg.get_bytes)
         end
 
+        # create makes a fresh class for each decoded resource, so the type and
+        # class values have to be compared instead of the class itself.
+        def self.type_class_equal?(klass, other) # :nodoc:
+          return true if klass.equal?(other)
+          Generic > klass && Generic > other &&
+            klass::TypeValue == other::TypeValue &&
+            klass::ClassValue == other::ClassValue
+        end
+
+        def ==(other) # :nodoc:
+          return other.is_a?(Generic) &&
+                 Generic.type_class_equal?(self.class, other.class) &&
+                 @data == other.data
+        end
+
         def self.create(type_value, class_value) # :nodoc:
           c = Class.new(Generic)
           c.const_set(:TypeValue, type_value)
           c.const_set(:ClassValue, class_value)
-          Generic.const_set("Type#{type_value}_Class#{class_value}", c)
-          ClassHash[[type_value, class_value]] = c
+          # Not registered in a constant or in ClassHash. get_class creates a
+          # class for every unknown (type, class) pair, so registering them
+          # permanently would let a malicious response exhaust memory.
           return c
         end
       end
@@ -2103,7 +2747,6 @@ class Resolv
 
         attr_reader :altitude
 
-
         def encode_rdata(msg) # :nodoc:
           msg.put_bytes(@version)
           msg.put_bytes(@ssize.scalar)
@@ -2141,8 +2784,70 @@ class Resolv
         TypeValue = 255 # :nodoc:
       end
 
+      ##
+      # CAA resource record defined in RFC 8659
+      #
+      # These records identify certificate authority allowed to issue
+      # certificates for the given domain.
+
+      class CAA < Resource
+        TypeValue = 257
+
+        ##
+        # Creates a new CAA for +flags+, +tag+ and +value+.
+
+        def initialize(flags, tag, value)
+          unless (0..255) === flags
+            raise ArgumentError.new('flags must be an Integer between 0 and 255')
+          end
+          unless (1..15) === tag.bytesize
+            raise ArgumentError.new('length of tag must be between 1 and 15')
+          end
+
+          @flags = flags
+          @tag = tag
+          @value = value
+        end
+
+        ##
+        # Flags for this property:
+        # - Bit 0 : 0 = not critical, 1 = critical
+
+        attr_reader :flags
+
+        ##
+        # Property tag ("issue", "issuewild", "iodef"...).
+
+        attr_reader :tag
+
+        ##
+        # Property value.
+
+        attr_reader :value
+
+        ##
+        # Whether the critical flag is set on this property.
+
+        def critical?
+          flags & 0x80 != 0
+        end
+
+        def encode_rdata(msg) # :nodoc:
+          msg.put_pack('C', @flags)
+          msg.put_string(@tag)
+          msg.put_bytes(@value)
+        end
+
+        def self.decode_rdata(msg) # :nodoc:
+          flags, = msg.get_unpack('C')
+          tag = msg.get_string
+          value = msg.get_bytes
+          self.new flags, tag, value
+        end
+      end
+
       ClassInsensitiveTypes = [ # :nodoc:
-        NS, CNAME, SOA, PTR, HINFO, MINFO, MX, TXT, LOC, ANY
+        NS, CNAME, SOA, PTR, HINFO, MINFO, MX, TXT, LOC, ANY, CAA
       ]
 
       ##
@@ -2328,7 +3033,7 @@ class Resolv
             msg.put_pack("n", @priority)
             msg.put_pack("n", @weight)
             msg.put_pack("n", @port)
-            msg.put_name(@target)
+            msg.put_name(@target, compress: false)
           end
 
           def self.decode_rdata(msg) # :nodoc:
@@ -2339,6 +3044,84 @@ class Resolv
             return self.new(priority, weight, port, target)
           end
         end
+
+        ##
+        # Common implementation for SVCB-compatible resource records.
+
+        class ServiceBinding
+
+          ##
+          # Create a service binding resource record.
+
+          def initialize(priority, target, params = [])
+            @priority = priority.to_int
+            @target = Name.create(target)
+            @params = SvcParams.new(params)
+          end
+
+          ##
+          # The priority of this target host.
+          #
+          # The range is 0-65535.
+          # If set to 0, this RR is in AliasMode. Otherwise, it is in ServiceMode.
+
+          attr_reader :priority
+
+          ##
+          # The domain name of the target host.
+
+          attr_reader :target
+
+          ##
+          # The service parameters for the target host.
+
+          attr_reader :params
+
+          ##
+          # Whether this RR is in AliasMode.
+
+          def alias_mode?
+            self.priority == 0
+          end
+
+          ##
+          # Whether this RR is in ServiceMode.
+
+          def service_mode?
+            !alias_mode?
+          end
+
+          def encode_rdata(msg) # :nodoc:
+            msg.put_pack("n", @priority)
+            msg.put_name(@target, compress: false)
+            @params.encode(msg)
+          end
+
+          def self.decode_rdata(msg) # :nodoc:
+            priority, = msg.get_unpack("n")
+            target    = msg.get_name
+            params    = SvcParams.decode(msg)
+            return self.new(priority, target, params)
+          end
+        end
+
+        ##
+        # SVCB resource record [RFC9460]
+
+        class SVCB < ServiceBinding
+          TypeValue = 64
+          ClassValue = IN::ClassValue
+          ClassHash[[TypeValue, ClassValue]] = self # :nodoc:
+        end
+
+        ##
+        # HTTPS resource record [RFC9460]
+
+        class HTTPS < ServiceBinding
+          TypeValue = 65
+          ClassValue = IN::ClassValue
+          ClassHash[[TypeValue, ClassValue]] = self # :nodoc:
+        end
       end
     end
   end
@@ -2348,14 +3131,20 @@ class Resolv
 
   class IPv4
 
-    ##
-    # Regular expression IPv4 addresses must match.
-
     Regex256 = /0
                |1(?:[0-9][0-9]?)?
                |2(?:[0-4][0-9]?|5[0-5]?|[6-9])?
-               |[3-9][0-9]?/x
+               |[3-9][0-9]?/x # :nodoc:
+
+    ##
+    # Regular expression IPv4 addresses must match.
     Regex = /\A(#{Regex256})\.(#{Regex256})\.(#{Regex256})\.(#{Regex256})\z/
+
+    ##
+    # Creates a new IPv4 address from +arg+ which may be:
+    #
+    # IPv4:: returns +arg+.
+    # String:: +arg+ must match the IPv4::Regex constant
 
     def self.create(arg)
       case arg
@@ -2464,7 +3253,7 @@ class Resolv
     Regex_8HexLinkLocal = /\A
       [Ff][Ee]80
       (?::[0-9A-Fa-f]{1,4}){7}
-      %[0-9A-Za-z]+
+      %[-0-9A-Za-z._~]+
       \z/x
 
     ##
@@ -2478,7 +3267,7 @@ class Resolv
         |
         :((?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?)
       )?
-      :[0-9A-Fa-f]{1,4}%[0-9A-Za-z.]+
+      :[0-9A-Fa-f]{1,4}%[-0-9A-Za-z._~]+
       \z/x
 
     ##
@@ -2558,11 +3347,7 @@ class Resolv
     attr_reader :address
 
     def to_s # :nodoc:
-      address = sprintf("%x:%x:%x:%x:%x:%x:%x:%x", *@address.unpack("nnnnnnnn"))
-      unless address.sub!(/(^|:)0(:0)+(:|$)/, '::')
-        address.sub!(/(^|:)0(:|$)/, '::')
-      end
-      return address
+      sprintf("%x:%x:%x:%x:%x:%x:%x:%x", *@address.unpack("nnnnnnnn")).sub(/(^|:)0(:0)+(:|$)/, '::')
     end
 
     def inspect # :nodoc:
@@ -2669,14 +3454,16 @@ class Resolv
 
   end
 
-  module LOC
+  module LOC # :nodoc:
 
     ##
     # A Resolv::LOC::Size
 
     class Size
 
-      Regex = /^(\d+\.*\d*)[m]$/
+      # Regular expression LOC size must match.
+
+      Regex = /\A0*(\d{1,8}(?:\.\d+)?)m\z/
 
       ##
       # Creates a new LOC::Size from +arg+ which may be:
@@ -2689,18 +3476,20 @@ class Resolv
         when Size
           return arg
         when String
-          scalar = ''
-          if Regex =~ arg
-            scalar = [(($1.to_f*(1e2)).to_i.to_s[0].to_i*(2**4)+(($1.to_f*(1e2)).to_i.to_s.length-1))].pack("C")
-          else
+          unless Regex =~ arg
             raise ArgumentError.new("not a properly formed Size string: " + arg)
           end
-          return Size.new(scalar)
+          unless (0.0...1e8) === (scalar = $1.to_f)
+            raise ArgumentError.new("out of range as Size: #{arg}")
+          end
+          str = (scalar * 100).to_i.to_s
+          return new([(str[0].to_i << 4) + (str.bytesize-1)].pack("C"))
         else
           raise ArgumentError.new("cannot interpret as Size: #{arg.inspect}")
         end
       end
 
+      # Internal use; use self.create.
       def initialize(scalar)
         @scalar = scalar
       end
@@ -2711,8 +3500,8 @@ class Resolv
       attr_reader :scalar
 
       def to_s # :nodoc:
-        s = @scalar.unpack("H2").join.to_s
-        return ((s[0].to_i)*(10**(s[1].to_i-2))).to_s << "m"
+        s, = @scalar.unpack("C")
+        return "#{(s >> 4) * (10.0 ** ((s & 0xf) - 2))}m"
       end
 
       def inspect # :nodoc:
@@ -2738,7 +3527,12 @@ class Resolv
 
     class Coord
 
-      Regex = /^(\d+)\s(\d+)\s(\d+\.\d+)\s([NESW])$/
+      # Regular expression LOC Coord must match.
+
+      Regex = /\A0*(\d{1,3})\s([0-5]?\d)\s([0-5]?\d(?:\.\d+)?)\s([NESW])\z/
+
+      # Bias for the equator/prime meridian, in thousandths of a second of arc.
+      Bias = 1 << 31
 
       ##
       # Creates a new LOC::Coord from +arg+ which may be:
@@ -2751,27 +3545,30 @@ class Resolv
         when Coord
           return arg
         when String
-          coordinates = ''
-          if Regex =~ arg && $1.to_f < 180
-            m = $~
-            hemi = (m[4][/[NE]/]) || (m[4][/[SW]/]) ? 1 : -1
-            coordinates = [ ((m[1].to_i*(36e5)) + (m[2].to_i*(6e4)) +
-                             (m[3].to_f*(1e3))) * hemi+(2**31) ].pack("N")
-            orientation = m[4][/[NS]/] ? 'lat' : 'lon'
-          else
+          unless m = Regex.match(arg)
             raise ArgumentError.new("not a properly formed Coord string: " + arg)
           end
-          return Coord.new(coordinates,orientation)
+
+          arc = (m[1].to_i * 3_600_000) + (m[2].to_i * 60_000) + (m[3].to_f * 1_000).to_i
+          dir = m[4]
+          lat = dir[/[NS]/]
+          unless arc <= (lat ? 324_000_000 : 648_000_000) # (lat ? 90 : 180) * 3_600_000
+            raise ArgumentError.new("out of range as Coord: #{arg}")
+          end
+
+          hemi = dir[/[NE]/] ? 1 : -1
+          return new([arc * hemi + Bias].pack("N"), lat ? "lat" : "lon")
         else
           raise ArgumentError.new("cannot interpret as Coord: #{arg.inspect}")
         end
       end
 
+      # Internal use; use self.create.
       def initialize(coordinates,orientation)
-        unless coordinates.kind_of?(String)
+        unless coordinates.kind_of?(String) and coordinates.bytesize == 4
           raise ArgumentError.new("Coord must be a 32bit unsigned integer in hex format: #{coordinates.inspect}")
         end
-        unless orientation.kind_of?(String) && orientation[/^lon$|^lat$/]
+        unless orientation == "lon" || orientation == "lat"
           raise ArgumentError.new('Coord expects orientation to be a String argument of "lat" or "lon"')
         end
         @coordinates = coordinates
@@ -2788,22 +3585,17 @@ class Resolv
       attr_reader :orientation
 
       def to_s # :nodoc:
-          c = @coordinates.unpack("N").join.to_i
-          val      = (c - (2**31)).abs
-          fracsecs = (val % 1e3).to_i.to_s
-          val      = val / 1e3
-          secs     = (val % 60).to_i.to_s
-          val      = val / 60
-          mins     = (val % 60).to_i.to_s
-          degs     = (val / 60).to_i.to_s
-          posi = (c >= 2**31)
-          case posi
-          when true
-            hemi = @orientation[/^lat$/] ? "N" : "E"
+          c, = @coordinates.unpack("N")
+          val = (c -= Bias).abs
+          val, fracsecs = val.divmod(1000)
+          val, secs     = val.divmod(60)
+          degs, mins    = val.divmod(60)
+          hemi = if c.negative?
+            @orientation == "lon" ? "W" : "S"
           else
-            hemi = @orientation[/^lon$/] ? "W" : "S"
+            @orientation == "lat" ? "N" : "E"
           end
-          return degs << " " << mins << " " << secs << "." << fracsecs << " " << hemi
+          format("%d %02d %02d.%03d %s", degs, mins, secs, fracsecs, hemi)
       end
 
       def inspect # :nodoc:
@@ -2829,7 +3621,12 @@ class Resolv
 
     class Alt
 
-      Regex = /^([+-]*\d+\.*\d*)[m]$/
+      # Regular expression LOC Alt must match.
+
+      Regex = /\A([+-]?0*\d{1,8}(?:\.\d+)?)m\z/
+
+      # Bias to a base of 100,000m below the WGS 84 reference spheroid.
+      Bias = 100_000_00
 
       ##
       # Creates a new LOC::Alt from +arg+ which may be:
@@ -2842,18 +3639,20 @@ class Resolv
         when Alt
           return arg
         when String
-          altitude = ''
-          if Regex =~ arg
-            altitude = [($1.to_f*(1e2))+(1e7)].pack("N")
-          else
+          unless Regex =~ arg
             raise ArgumentError.new("not a properly formed Alt string: " + arg)
           end
-          return Alt.new(altitude)
+          altitude = ($1.to_f * 100).to_i + Bias
+          unless (0...0x1_0000_0000) === altitude
+            raise ArgumentError.new("out of raise as Alt: #{arg}")
+          end
+          return new([altitude].pack("N"))
         else
           raise ArgumentError.new("cannot interpret as Alt: #{arg.inspect}")
         end
       end
 
+      # Internal use; use self.create.
       def initialize(altitude)
         @altitude = altitude
       end
@@ -2864,8 +3663,8 @@ class Resolv
       attr_reader :altitude
 
       def to_s # :nodoc:
-        a = @altitude.unpack("N").join.to_i
-        return ((a.to_f/1e2)-1e5).to_s + "m"
+        a, = @altitude.unpack("N")
+        return "#{(a - Bias).fdiv(100)}m"
       end
 
       def inspect # :nodoc:
@@ -2907,4 +3706,3 @@ class Resolv
   AddressRegex = /(?:#{IPv4::Regex})|(?:#{IPv6::Regex})/
 
 end
-

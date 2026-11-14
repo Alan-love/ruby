@@ -25,6 +25,9 @@
 /* Prevent compiler from reordering access */
 #define ACCESS_ONCE(type,x) (*((volatile type *)&(x)))
 
+#define UNDEF_P         RB_UNDEF_P
+#define NIL_OR_UNDEF_P  RB_NIL_OR_UNDEF_P
+
 #include "ruby/ruby.h"
 
 /* Following macros were formerly defined in this header but moved to somewhere
@@ -37,19 +40,11 @@
 #undef RClass
 #undef RCLASS_SUPER
 
-/* internal/gc.h */
-#undef NEWOBJ_OF
-#undef RB_NEWOBJ_OF
-#undef RB_OBJ_WRITE
-
 /* internal/hash.h */
 #undef RHASH_IFNONE
 #undef RHASH_SIZE
 #undef RHASH_TBL
 #undef RHASH_EMPTY_P
-
-/* internal/object.h */
-#undef ROBJECT_IV_INDEX_TBL
 
 /* internal/struct.h */
 #undef RSTRUCT_LEN
@@ -63,18 +58,16 @@
 /* internal/array.h */
 #define rb_ary_new_from_args(...) rb_nonexistent_symbol(__VA_ARGS__)
 
-/* internal/io.h */
-#define rb_io_fptr_finalize(...) rb_nonexistent_symbol(__VA_ARGS__)
-
 /* internal/string.h */
 #define rb_fstring_cstr(...) rb_nonexistent_symbol(__VA_ARGS__)
 
 /* internal/symbol.h */
 #define rb_sym_intern_ascii_cstr(...) rb_nonexistent_symbol(__VA_ARGS__)
 
-/* internal/vm.h */
-#define rb_funcallv(...) rb_nonexistent_symbol(__VA_ARGS__)
-#define rb_method_basic_definition_p(...) rb_nonexistent_symbol(__VA_ARGS__)
+#ifdef _WIN32
+/* win32/win32.c */
+void rb_w32_init_long_paths(void);
+#endif
 
 
 /* MRI debug support */
@@ -106,4 +99,8 @@ RUBY_SYMBOL_EXPORT_END
 #define RBOOL(v) ((v) ? Qtrue : Qfalse)
 #define RB_BIGNUM_TYPE_P(x) RB_TYPE_P((x), T_BIGNUM)
 
+#ifndef __MINGW32__
+#undef memcpy
+#define memcpy ruby_nonempty_memcpy
+#endif
 #endif /* RUBY_INTERNAL_H */

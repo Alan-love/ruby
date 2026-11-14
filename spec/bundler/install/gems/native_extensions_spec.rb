@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-RSpec.describe "installing a gem with native extensions", :ruby_repo do
+RSpec.describe "installing a gem with native extensions" do
   it "installs" do
     build_repo2 do
       build_gem "c_extension" do |s|
@@ -9,7 +9,7 @@ RSpec.describe "installing a gem with native extensions", :ruby_repo do
           require "mkmf"
           name = "c_extension_bundle"
           dir_config(name)
-          raise "OMG" unless with_config("c_extension") == "hello"
+          raise ArgumentError unless with_config("c_extension") == "hello"
           create_makefile(name)
         E
 
@@ -33,11 +33,11 @@ RSpec.describe "installing a gem with native extensions", :ruby_repo do
     end
 
     gemfile <<-G
-      source "#{file_uri_for(gem_repo2)}"
+      source "https://gem.repo2"
       gem "c_extension"
     G
 
-    bundle "config set build.c_extension --with-c_extension=hello"
+    bundle_config "build.c_extension --with-c_extension=hello"
     bundle "install"
 
     expect(out).to include("Installing c_extension 1.0 with native extensions")
@@ -53,7 +53,7 @@ RSpec.describe "installing a gem with native extensions", :ruby_repo do
         require "mkmf"
         name = "c_extension_bundle"
         dir_config(name)
-        raise "OMG" unless with_config("c_extension") == "hello"
+        raise ArgumentError unless with_config("c_extension") == "hello"
         create_makefile(name)
       E
 
@@ -75,10 +75,10 @@ RSpec.describe "installing a gem with native extensions", :ruby_repo do
       C
     end
 
-    bundle "config set build.c_extension --with-c_extension=hello"
+    bundle_config "build.c_extension --with-c_extension=hello"
 
     install_gemfile <<-G
-      source "#{file_uri_for(gem_repo1)}"
+      source "https://gem.repo1"
       gem "c_extension", :git => #{lib_path("c_extension-1.0").to_s.dump}
     G
 
@@ -91,13 +91,13 @@ RSpec.describe "installing a gem with native extensions", :ruby_repo do
   it "installs correctly from git when multiple gems with extensions share one repository" do
     build_repo2 do
       ["one", "two"].each do |n|
-        build_lib "c_extension_#{n}", "1.0", :path => lib_path("gems/c_extension_#{n}") do |s|
+        build_lib "c_extension_#{n}", "1.0", path: lib_path("gems/c_extension_#{n}") do |s|
           s.extensions = ["ext/extconf.rb"]
           s.write "ext/extconf.rb", <<-E
             require "mkmf"
             name = "c_extension_bundle_#{n}"
             dir_config(name)
-            raise "OMG" unless with_config("c_extension_#{n}") == "#{n}"
+            raise ArgumentError unless with_config("c_extension_#{n}") == "#{n}"
             create_makefile(name)
           E
 
@@ -119,21 +119,21 @@ RSpec.describe "installing a gem with native extensions", :ruby_repo do
           C
         end
       end
-      build_git "gems", :path => lib_path("gems"), :gemspec => false
+      build_git "gems", path: lib_path("gems"), gemspec: false
     end
 
-    bundle "config set build.c_extension_one --with-c_extension_one=one"
-    bundle "config set build.c_extension_two --with-c_extension_two=two"
+    bundle_config "build.c_extension_one --with-c_extension_one=one"
+    bundle_config "build.c_extension_two --with-c_extension_two=two"
 
     # 1st time, require only one gem -- only one of the extensions gets built.
     install_gemfile <<-G
-      source "#{file_uri_for(gem_repo1)}"
+      source "https://gem.repo1"
       gem "c_extension_one", :git => #{lib_path("gems").to_s.dump}
     G
 
     # 2nd time, require both gems -- we need both extensions to be built now.
     install_gemfile <<-G
-      source "#{file_uri_for(gem_repo1)}"
+      source "https://gem.repo1"
       gem "c_extension_one", :git => #{lib_path("gems").to_s.dump}
       gem "c_extension_two", :git => #{lib_path("gems").to_s.dump}
     G
@@ -149,7 +149,7 @@ RSpec.describe "installing a gem with native extensions", :ruby_repo do
         require "mkmf"
         name = "c_extension_bundle"
         dir_config(name)
-        raise "OMG" unless with_config("c_extension") == "hello" && with_config("c_extension_bundle-dir") == "hola"
+        raise ArgumentError unless with_config("c_extension") == "hello" && with_config("c_extension_bundle-dir") == "hola"
         create_makefile(name)
       E
 
@@ -171,10 +171,10 @@ RSpec.describe "installing a gem with native extensions", :ruby_repo do
       C
     end
 
-    bundle "config set build.c_extension --with-c_extension=hello --with-c_extension_bundle-dir=hola"
+    bundle_config "build.c_extension --with-c_extension=hello --with-c_extension_bundle-dir=hola"
 
     install_gemfile <<-G
-      source "#{file_uri_for(gem_repo1)}"
+      source "https://gem.repo1"
       gem "c_extension", :git => #{lib_path("c_extension-1.0").to_s.dump}
     G
 

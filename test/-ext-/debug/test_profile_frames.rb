@@ -14,6 +14,8 @@ class SampleClassForTestProfileFrames
   end
 
   class Sample2
+    EVAL_LINE = __LINE__ + 3
+
     def baz(block)
       instance_eval "def zab(block) block.call end"
       [self, zab(block)]
@@ -34,6 +36,20 @@ class SampleClassForTestProfileFrames
 
   def foo(block)
     self.class.bar(block)
+  end
+end
+
+class SampleClassForTestProfileThreadFrames
+  def initialize(mutex)
+    @mutex = mutex
+  end
+
+  def foo(block)
+    bar(block)
+  end
+
+  def bar(block)
+    block.call
   end
 end
 
@@ -112,7 +128,7 @@ class TestProfileFrames < Test::Unit::TestCase
       "SampleClassForTestProfileFrames#foo",
       "TestProfileFrames#test_profile_frames",
     ]
-    paths = [ nil, file=__FILE__, "(eval)", file, file, file, file, file, file, nil ]
+    paths = [ nil, file=__FILE__, "(eval at #{__FILE__}:#{SampleClassForTestProfileFrames::Sample2::EVAL_LINE})", file, file, file, file, file, file, nil ]
     absolute_paths = [ "<cfunc>", file, nil, file, file, file, file, file, file, nil ]
 
     assert_equal(labels.size, frames.size)
@@ -137,6 +153,74 @@ class TestProfileFrames < Test::Unit::TestCase
     }
   end
 
+  def test_profile_thread_frames
+    mutex = Mutex.new
+    th = Thread.new do
+      mutex.lock
+      Thread.stop
+      SampleClassForTestProfileThreadFrames.new(mutex).foo(lambda { mutex.unlock; loop { sleep(1) } } )
+    end
+
+    # ensure execution has reached SampleClassForTestProfileThreadFrames#bar before running profile_thread_frames
+    loop { break if th.status == "sleep"; sleep 0.1 }
+    th.run
+    mutex.lock # wait until SampleClassForTestProfileThreadFrames#bar has been called
+
+    frames = Bug::Debug.profile_thread_frames(th, 0, 10)
+
+    full_labels = [
+      "Kernel#sleep",
+      "TestProfileFrames#test_profile_thread_frames",
+      "Kernel#loop",
+      "TestProfileFrames#test_profile_thread_frames",
+      "SampleClassForTestProfileThreadFrames#bar",
+      "SampleClassForTestProfileThreadFrames#foo",
+      "TestProfileFrames#test_profile_thread_frames",
+    ]
+
+    frames.each.with_index do |frame, i|
+      assert_equal(full_labels[i], frame)
+    end
+
+  ensure
+    th.kill
+    th.join
+  end
+
+
+  def test_matches_backtrace_locations_main_thread
+    assert_equal(Thread.current, Thread.main)
+
+    # Keep these in the same line, so the backtraces match exactly
+    backtrace_locations, profile_frames = [Thread.current.backtrace_locations, Bug::Debug.profile_frames(0, 100)]
+
+    errmsg  = "backtrace_locations:\n  " + backtrace_locations.map.with_index{|loc, i| "#{i} #{loc}"}.join("\n  ")
+    errmsg += "\n\nprofile_frames:\n  "      + profile_frames.map.with_index{|(path, absolute_path, _, base_label, _, _, _, _, _, full_label, lineno), i|
+      if lineno
+        "#{i} #{absolute_path}:#{lineno} // #{full_label}"
+      else
+        "#{i} #{absolute_path} #{full_label}"
+      end
+    }.join("\n  ")
+    assert_equal(backtrace_locations.size, profile_frames.size, errmsg)
+
+    # The first entries are not going to match, since one is #backtrace_locations and the other #profile_frames
+    backtrace_locations.shift
+    profile_frames.shift
+
+    # The rest of the stack is expected to look the same...
+    backtrace_locations.zip(profile_frames).each.with_index do |(location, (path, absolute_path, _, base_label, label, _, _, _, _, _, lineno)), i|
+      next if absolute_path == "<cfunc>" # ...except for cfunc frames
+      next if label in "Array#each" | "Array#map" # ...except for :c_trace method frames
+
+      err_msg = "#{i}th frame"
+      assert_equal(location.absolute_path, absolute_path, err_msg)
+      assert_equal(location.base_label, base_label, err_msg)
+      assert_equal(location.lineno, lineno, err_msg)
+      assert_equal(location.path, path, err_msg)
+    end
+  end
+
   def test_ifunc_frame
     bug11851 = '[ruby-core:72409] [Bug #11851]'
     assert_ruby_status([], <<~'end;', bug11851) # do
@@ -151,6 +235,32 @@ class TestProfileFrames < Test::Unit::TestCase
         [A.new].each(&:x)
       end
       a
+    end;
+  end
+
+  def test_start
+    assert_equal Bug::Debug.profile_frames(0, 10).tap(&:shift), Bug::Debug.profile_frames(1, 9)
+  end
+
+  def test_profile_frames_in_signal_handler_while_making_env
+    omit "no SIGPROF sampler on this platform" unless Bug::Debug.respond_to?(:start_profile_frames_sampler)
+
+    assert_separately([], <<~'end;')
+      require '-test-/debug'
+      Bug::Debug.start_profile_frames_sampler
+      begin
+        100_000.times do
+          # proc {} moves the block frame and the class body frame to the heap.
+          # A sample taken in between must not follow a stale on-stack ep, as
+          # the class body frame has a cref (no method entry) and no block.
+          class Foo
+            1.times { proc {} }
+          end
+        end
+      ensure
+        samples = Bug::Debug.stop_profile_frames_sampler
+      end
+      assert_operator samples, :>, 0, '[Bug #22476]'
     end;
   end
 end

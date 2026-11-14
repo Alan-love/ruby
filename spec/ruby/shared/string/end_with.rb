@@ -30,15 +30,15 @@ describe :end_with, shared: true do
 
   it "ignores arguments not convertible to string" do
     "hello".send(@method).should_not.end_with?()
-    -> { "hello".send(@method).end_with?(1) }.should raise_error(TypeError)
-    -> { "hello".send(@method).end_with?(["o"]) }.should raise_error(TypeError)
-    -> { "hello".send(@method).end_with?(1, nil, "o") }.should raise_error(TypeError)
+    -> { "hello".send(@method).end_with?(1) }.should.raise(TypeError)
+    -> { "hello".send(@method).end_with?(["o"]) }.should.raise(TypeError)
+    -> { "hello".send(@method).end_with?(1, nil, "o") }.should.raise(TypeError)
   end
 
   it "uses only the needed arguments" do
     find = mock('h')
     find.should_not_receive(:to_str)
-    "hello".send(@method).should.end_with?("o",find)
+    "hello".send(@method).should.end_with?("o", find)
   end
 
   it "works for multibyte strings" do
@@ -49,6 +49,13 @@ describe :end_with, shared: true do
     pat = "ア".encode Encoding::EUC_JP
     -> do
       "あれ".send(@method).end_with?(pat)
-    end.should raise_error(Encoding::CompatibilityError)
+    end.should.raise(Encoding::CompatibilityError)
+  end
+
+  it "checks that we are starting to match at the head of a character" do
+    "\xC3\xA9".send(@method).should_not.end_with?("\xA9")
+    "\xe3\x81\x82".send(@method).should_not.end_with?("\x82")
+    "\xd8\x00\xdc\x00".dup.force_encoding("UTF-16BE").send(@method).should_not.end_with?(
+        "\xdc\x00".dup.force_encoding("UTF-16BE"))
   end
 end

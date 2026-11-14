@@ -1,14 +1,9 @@
 # frozen_string_literal: true
 
-# tentatively disabled due to IPv6 configuration issue on Solaris CI
-# http://rubyci.s3.amazonaws.com/solaris10-gcc/ruby-master/log/20210729T040002Z.fail.html.gz
-return if /solaris/ =~ RUBY_PLATFORM
-
 begin
   require "socket"
   require "tmpdir"
   require "fcntl"
-  require "etc"
   require "test/unit"
 rescue LoadError
 end
@@ -95,20 +90,20 @@ class TestSocket < Test::Unit::TestCase
 
   def test_getaddrinfo
     # This should not send a DNS query because AF_UNIX.
-    assert_raise(SocketError) { Socket.getaddrinfo("www.kame.net", 80, "AF_UNIX") }
+    assert_raise(Socket::ResolutionError) { Socket.getaddrinfo("www.kame.net", 80, "AF_UNIX") }
   end
 
   def test_getaddrinfo_raises_no_errors_on_port_argument_of_0 # [ruby-core:29427]
     assert_nothing_raised('[ruby-core:29427]'){ Socket.getaddrinfo('localhost', 0, Socket::AF_INET, Socket::SOCK_STREAM, nil, Socket::AI_CANONNAME) }
     assert_nothing_raised('[ruby-core:29427]'){ Socket.getaddrinfo('localhost', '0', Socket::AF_INET, Socket::SOCK_STREAM, nil, Socket::AI_CANONNAME) }
     assert_nothing_raised('[ruby-core:29427]'){ Socket.getaddrinfo('localhost', '00', Socket::AF_INET, Socket::SOCK_STREAM, nil, Socket::AI_CANONNAME) }
-    assert_raise(SocketError, '[ruby-core:29427]'){ Socket.getaddrinfo(nil, nil, Socket::AF_INET, Socket::SOCK_STREAM, nil, Socket::AI_CANONNAME) }
+    assert_raise(Socket::ResolutionError, '[ruby-core:29427]'){ Socket.getaddrinfo(nil, nil, Socket::AF_INET, Socket::SOCK_STREAM, nil, Socket::AI_CANONNAME) }
     assert_nothing_raised('[ruby-core:29427]'){ TCPServer.open('localhost', 0) {} }
   end
 
 
   def test_getnameinfo
-    assert_raise(SocketError) { Socket.getnameinfo(["AF_UNIX", 80, "0.0.0.0"]) }
+    assert_raise(Socket::ResolutionError) { Socket.getnameinfo(["AF_UNIX", 80, "0.0.0.0"]) }
     assert_raise(ArgumentError) {Socket.getnameinfo(["AF_INET", "http\0", "example.net"])}
     assert_raise(ArgumentError) {Socket.getnameinfo(["AF_INET", "http", "example.net\0"])}
   end
@@ -131,7 +126,7 @@ class TestSocket < Test::Unit::TestCase
     rescue NotImplementedError
       return
     end
-    assert_includes list.map(&:ip_address), Addrinfo.tcp("localhost", 0).ip_address
+    assert_include list.map(&:ip_address), Addrinfo.tcp("localhost", 0).ip_address
   end
 
   def test_tcp
@@ -177,8 +172,11 @@ class TestSocket < Test::Unit::TestCase
 
   def errors_addrinuse
     errs = [Errno::EADDRINUSE]
-    # MinGW fails with "Errno::EACCES: Permission denied - bind(2) for 0.0.0.0:49721"
-    errs << Errno::EACCES if /mingw/ =~ RUBY_PLATFORM
+    # Windows can fail with "Errno::EACCES: Permission denied - bind(2) for 0.0.0.0:49721"
+    # or "Test::Unit::ProxyError: Permission denied - bind(2) for 0.0.0.0:55333"
+    if /mswin|mingw/ =~ RUBY_PLATFORM
+      errs += [Errno::EACCES, Test::Unit::ProxyError]
+    end
     errs
   end
 
@@ -344,10 +342,14 @@ class TestSocket < Test::Unit::TestCase
   end
 
   def test_udp_server
+    # http://rubyci.s3.amazonaws.com/rhel_zlinux/ruby-master/log/20230312T023302Z.fail.html.gz
+    # Errno::EHOSTUNREACH: No route to host - recvmsg(2)
+    omit if 'rhel_zlinux' == ENV['RUBYCI_NICKNAME']
+
     begin
       ifaddrs = Socket.getifaddrs
     rescue NotImplementedError
-      skip "Socket.getifaddrs not implemented"
+      omit "Socket.getifaddrs not implemented"
     end
 
     ifconfig = nil
@@ -362,13 +364,6 @@ class TestSocket < Test::Unit::TestCase
         next true unless s
         next true if ai.ipv6_linklocal? # IPv6 link-local address is too troublesome in this test.
         case RUBY_PLATFORM
-        when /linux/
-          if ai.ip_address.include?('%') and
-            (Etc.uname[:release][/[0-9.]+/].split('.').map(&:to_i) <=> [2,6,18]) <= 0
-            # Cent OS 5.6 (2.6.18-238.19.1.el5xen) doesn't correctly work
-            # sendmsg with pktinfo for link-local ipv6 addresses
-            next true
-          end
         when /freebsd/
           if ifa.addr.ipv6_linklocal?
             # FreeBSD 9.0 with default setting (ipv6_activate_all_interfaces
@@ -415,12 +410,16 @@ class TestSocket < Test::Unit::TestCase
 
         ping_p = false
         th = Thread.new {
-          Socket.udp_server_loop_on(sockets) {|msg, msg_src|
-            break if msg == "exit"
-            rmsg = Marshal.dump([msg, msg_src.remote_address, msg_src.local_address])
-            ping_p = true
-            msg_src.reply rmsg
-          }
+          begin
+            Socket.udp_server_loop_on(sockets) {|msg, msg_src|
+              break if msg == "exit"
+              rmsg = Marshal.dump([msg, msg_src.remote_address, msg_src.local_address])
+              ping_p = true
+              msg_src.reply rmsg
+            }
+          rescue Errno::ENOBUFS
+            # transient OS error on macOS CI, let client timeout and omit
+          end
         }
 
         ifaddrs.each {|ifa|
@@ -441,19 +440,18 @@ class TestSocket < Test::Unit::TestCase
         }
       rescue NotImplementedError, Errno::ENOSYS
         skipped = true
-        skip "need sendmsg and recvmsg: #{$!}"
+        omit "need sendmsg and recvmsg: #{$!}"
       rescue RuntimeError
         skipped = true
-        skip "UDP server is no response: #{$!}"
+        omit "UDP server is no response: #{$!}"
       ensure
         if th
-          if skipped
-            Thread.kill th unless th.join(10)
-          else
+          unless skipped
             Addrinfo.udp("127.0.0.1", port).connect {|s| s.sendmsg "exit" }
-            unless th.join(10)
-              Thread.kill th
-              th.join(10)
+          end
+          unless th.join(10)
+            th.kill.join(10)
+            unless skipped
               raise "thread killed"
             end
           end
@@ -479,9 +477,11 @@ class TestSocket < Test::Unit::TestCase
     }
   end
 
-  def timestamp_retry_rw(s1, s2, t1, type)
+  def timestamp_retry_rw(s1, type)
     IO.pipe do |r,w|
+      t1 = Time.now
       # UDP may not be reliable, keep sending until recvmsg returns:
+      s2 = Socket.new(:INET, :DGRAM, 0)
       th = Thread.new do
         n = 0
         begin
@@ -490,79 +490,58 @@ class TestSocket < Test::Unit::TestCase
         end while IO.select([r], nil, nil, 0.1).nil?
         n
       end
-      timeout = (defined?(RubyVM::JIT) && RubyVM::JIT.enabled? ? 120 : 30) # for --jit-wait
+      timeout = 30
       assert_equal([[s1],[],[]], IO.select([s1], nil, nil, timeout))
       msg, _, _, stamp = s1.recvmsg
       assert_equal("a", msg)
-      assert(stamp.cmsg_is?(:SOCKET, type))
+      assert_send([stamp, :cmsg_is?, :SOCKET, type])
       w.close # stop th
       n = th.value
+      th = nil
       n > 1 and
         warn "UDP packet loss for #{type} over loopback, #{n} tries needed"
-      t2 = Time.now.strftime("%Y-%m-%d")
-      pat = Regexp.union([t1, t2].uniq)
-      assert_match(pat, stamp.inspect)
-      t = stamp.timestamp
-      assert_match(pat, t.strftime("%Y-%m-%d"))
+      t2 = Time.now
+      assert_include(t1..t2, stamp.timestamp)
       stamp
+    ensure
+      if th and !th.join(10)
+        th.kill.join(10)
+      end
+      s2.close
     end
   end
 
   def test_timestamp
-    return if /linux|freebsd|netbsd|openbsd|solaris|darwin/ !~ RUBY_PLATFORM
+    return if /linux|freebsd|netbsd|openbsd|darwin/ !~ RUBY_PLATFORM
     return if !defined?(Socket::AncillaryData) || !defined?(Socket::SO_TIMESTAMP)
-    t1 = Time.now.strftime("%Y-%m-%d")
-    stamp = nil
     Addrinfo.udp("127.0.0.1", 0).bind {|s1|
-      Addrinfo.udp("127.0.0.1", 0).bind {|s2|
-        s1.setsockopt(:SOCKET, :TIMESTAMP, true)
-        stamp = timestamp_retry_rw(s1, s2, t1, :TIMESTAMP)
-      }
+      s1.setsockopt(:SOCKET, :TIMESTAMP, true)
+      timestamp_retry_rw(s1, :TIMESTAMP)
     }
-    t = stamp.timestamp
-    pat = /\.#{"%06d" % t.usec}/
-    assert_match(pat, stamp.inspect)
   end
 
   def test_timestampns
     return if /linux/ !~ RUBY_PLATFORM || !defined?(Socket::SO_TIMESTAMPNS)
-    t1 = Time.now.strftime("%Y-%m-%d")
-    stamp = nil
     Addrinfo.udp("127.0.0.1", 0).bind {|s1|
-      Addrinfo.udp("127.0.0.1", 0).bind {|s2|
-        begin
-          s1.setsockopt(:SOCKET, :TIMESTAMPNS, true)
-        rescue Errno::ENOPROTOOPT
-          # SO_TIMESTAMPNS is available since Linux 2.6.22
-          return
-        end
-        stamp = timestamp_retry_rw(s1, s2, t1, :TIMESTAMPNS)
-      }
+      begin
+        s1.setsockopt(:SOCKET, :TIMESTAMPNS, true)
+      rescue Errno::ENOPROTOOPT
+        # SO_TIMESTAMPNS is available since Linux 2.6.22
+        return
+      end
+      timestamp_retry_rw(s1, :TIMESTAMPNS)
     }
-    t = stamp.timestamp
-    pat = /\.#{"%09d" % t.nsec}/
-    assert_match(pat, stamp.inspect)
   end
 
   def test_bintime
     return if /freebsd/ !~ RUBY_PLATFORM
-    t1 = Time.now.strftime("%Y-%m-%d")
-    stamp = nil
-    Addrinfo.udp("127.0.0.1", 0).bind {|s1|
-      Addrinfo.udp("127.0.0.1", 0).bind {|s2|
-        s1.setsockopt(:SOCKET, :BINTIME, true)
-        s2.send "a", 0, s1.local_address
-        msg, _, _, stamp = s1.recvmsg
-        assert_equal("a", msg)
-        assert(stamp.cmsg_is?(:SOCKET, :BINTIME))
-      }
+    stamp = Addrinfo.udp("127.0.0.1", 0).bind {|s1|
+      s1.setsockopt(:SOCKET, :BINTIME, true)
+      timestamp_retry_rw(s1, :BINTIME)
     }
-    t2 = Time.now.strftime("%Y-%m-%d")
-    pat = Regexp.union([t1, t2].uniq)
-    assert_match(pat, stamp.inspect)
     t = stamp.timestamp
-    assert_match(pat, t.strftime("%Y-%m-%d"))
-    assert_equal(stamp.data[-8,8].unpack("Q")[0], t.subsec * 2**64)
+    data = stamp.data
+    assert_equal(data.unpack1("Q", offset: data.bytesize-8), t.subsec * 2**64)
   end
 
   def test_closed_read
@@ -615,6 +594,16 @@ class TestSocket < Test::Unit::TestCase
     server.close
     accepted.close if accepted
     sock.close if sock && ! sock.closed?
+  end
+
+  def test_connect_timeout_connection_refused
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.addr[1]
+    server.close
+
+    assert_raise(Errno::ECONNREFUSED) do
+      Socket.tcp("127.0.0.1", port, connect_timeout: 5)
+    end
   end
 
   def test_getifaddrs
@@ -766,4 +755,361 @@ class TestSocket < Test::Unit::TestCase
     s2.close
   end
 
+  def test_resolurion_error_error_code
+    begin
+      Socket.getaddrinfo("example.com", 80, "AF_UNIX")
+    rescue => e
+      assert_include([Socket::EAI_FAMILY, Socket::EAI_FAIL], e.error_code)
+    end
+  end
+
+  def test_tcp_socket_resolution_error_with_host
+    assert_raise_with_message(Socket::ResolutionError, /^getaddrinfo(\(3\))?: .+ "unknown"$/) do
+      TCPSocket.new("unknown", 80)
+    end
+  end
+
+  def test_tcp_socket_v6_hostname_resolved_earlier
+    opts = %w[-rsocket -W1]
+    assert_separately opts, <<~RUBY
+    begin
+      begin
+        # Verify that "localhost" can be resolved to an IPv6 address
+        Socket.getaddrinfo("localhost", 0, Socket::AF_INET6)
+        server = TCPServer.new("::1", 0)
+      rescue Socket::ResolutionError, Errno::EADDRNOTAVAIL # IPv6 is not supported
+        return
+      end
+
+      _, port, = server.addr
+      server_thread = Thread.new { server.accept }
+
+      Addrinfo.define_singleton_method(:getaddrinfo) do |_, _, family, *_|
+        case family
+        when Socket::AF_INET6 then [Addrinfo.tcp("::1", port)]
+        when Socket::AF_INET then sleep(10); [Addrinfo.tcp("127.0.0.1", port)]
+        end
+      end
+
+      socket = Socket.tcp("localhost", port)
+      assert_true(socket.remote_address.ipv6?)
+    ensure
+      server_thread&.value&.close
+      server&.close
+      socket&.close
+    end
+    RUBY
+  end
+
+  def test_tcp_socket_v4_hostname_resolved_earlier
+    opts = %w[-rsocket -W1]
+    assert_separately opts, <<~RUBY
+    begin
+      server = TCPServer.new("127.0.0.1", 0)
+      _, port, = server.addr
+      server_thread = Thread.new { server.accept }
+
+      Addrinfo.define_singleton_method(:getaddrinfo) do |_, _, family, *_|
+        case family
+        when Socket::AF_INET6 then sleep(10); [Addrinfo.tcp("::1", port)]
+        when Socket::AF_INET then [Addrinfo.tcp("127.0.0.1", port)]
+        end
+      end
+
+      socket = Socket.tcp("localhost", port)
+      assert_true(socket.remote_address.ipv4?)
+    ensure
+      server_thread&.value&.close
+      server&.close
+      socket&.close
+    end
+    RUBY
+  end
+
+  def test_tcp_socket_v6_hostname_resolved_in_resolution_delay
+    opts = %w[-rsocket -W1]
+    assert_separately opts, <<~RUBY
+    begin
+      begin
+        # Verify that "localhost" can be resolved to an IPv6 address
+        Socket.getaddrinfo("localhost", 0, Socket::AF_INET6)
+        server = TCPServer.new("::1", 0)
+      rescue Socket::ResolutionError, Errno::EADDRNOTAVAIL # IPv6 is not supported
+        return
+      end
+
+      _, port, = server.addr
+      server_thread = Thread.new { server.accept }
+
+      delay_time = 0.025 # Socket::RESOLUTION_DELAY (private) is 0.05
+
+      Addrinfo.define_singleton_method(:getaddrinfo) do |_, _, family, *_|
+        case family
+        when Socket::AF_INET6 then sleep(delay_time); [Addrinfo.tcp("::1", port)]
+        when Socket::AF_INET then [Addrinfo.tcp("127.0.0.1", port)]
+        end
+      end
+
+      socket = Socket.tcp("localhost", port)
+      assert_true(socket.remote_address.ipv6?)
+    ensure
+      server_thread&.value&.close
+      server&.close
+      socket&.close
+    end
+    RUBY
+  end
+
+  def test_tcp_socket_v6_hostname_resolved_earlier_and_v6_server_is_not_listening
+    opts = %w[-rsocket -W1]
+    assert_separately opts, <<~RUBY
+    begin
+      ipv4_address = "127.0.0.1"
+      server = Socket.new(Socket::AF_INET, :STREAM)
+      server.bind(Socket.pack_sockaddr_in(0, ipv4_address))
+      port = server.connect_address.ip_port
+      server_thread = Thread.new { server.listen(1); server.accept }
+
+      Addrinfo.define_singleton_method(:getaddrinfo) do |_, _, family, *_|
+        case family
+        when Socket::AF_INET6 then [Addrinfo.tcp("::1", port)]
+        when Socket::AF_INET then sleep(0.001); [Addrinfo.tcp(ipv4_address, port)]
+        end
+      end
+
+      socket = Socket.tcp("localhost", port)
+      assert_equal(ipv4_address, socket.remote_address.ip_address)
+    ensure
+      accepted, _ = server_thread&.value
+      accepted&.close
+      server&.close
+      socket&.close
+    end
+    RUBY
+  end
+
+  def test_tcp_socket_resolv_timeout
+    opts = %w[-rsocket -W1]
+    assert_separately opts, <<~RUBY
+    begin
+      server = TCPServer.new("localhost", 0)
+      _, port, = server.addr
+
+      Addrinfo.define_singleton_method(:getaddrinfo) { |*_| sleep }
+
+      assert_raise(IO::TimeoutError) do
+        Socket.tcp("localhost", port, resolv_timeout: 0.01)
+      end
+    ensure
+      server&.close
+    end
+    RUBY
+  end
+
+  def test_tcp_socket_resolv_timeout_with_connection_failure
+    opts = %w[-rsocket -W1]
+    assert_separately opts, <<~RUBY
+    server = TCPServer.new("127.0.0.1", 12345)
+    _, port, = server.addr
+
+    Addrinfo.define_singleton_method(:getaddrinfo) do |_, _, family, *_|
+      if family == Socket::AF_INET6
+        sleep
+      else
+        [Addrinfo.tcp("127.0.0.1", port)]
+      end
+    end
+
+    server.close
+
+    assert_raise(IO::TimeoutError) do
+      Socket.tcp("localhost", port, resolv_timeout: 0.01)
+    end
+    RUBY
+  end
+
+  def test_tcp_socket_open_timeout
+    opts = %w[-rsocket -W1]
+    assert_separately opts, <<~RUBY
+    Addrinfo.define_singleton_method(:getaddrinfo) do |_, _, family, *_|
+      if family == Socket::AF_INET6
+        sleep
+      else
+        [Addrinfo.tcp("127.0.0.1", 12345)]
+      end
+    end
+
+    assert_raise(IO::TimeoutError) do
+      Socket.tcp("localhost", 12345, open_timeout: 0.01)
+    end
+    RUBY
+  end
+
+  def test_tcp_socket_open_timeout_with_other_timeouts
+    opts = %w[-rsocket -W1]
+    assert_separately opts, <<~RUBY
+    assert_raise(ArgumentError) do
+      Socket.tcp("localhost", 12345, open_timeout: 0.01, resolv_timout: 0.01)
+    end
+    RUBY
+  end
+
+  def test_tcp_socket_one_hostname_resolution_succeeded_at_least
+    opts = %w[-rsocket -W1]
+    assert_separately opts, <<~RUBY
+    begin
+      begin
+        # Verify that "localhost" can be resolved to an IPv6 address
+        Socket.getaddrinfo("localhost", 0, Socket::AF_INET6)
+        server = TCPServer.new("::1", 0)
+      rescue Socket::ResolutionError, Errno::EADDRNOTAVAIL # IPv6 is not supported
+        return
+      end
+
+      _, port, = server.addr
+      server_thread = Thread.new { server.accept }
+
+      Addrinfo.define_singleton_method(:getaddrinfo) do |_, _, family, *_|
+        case family
+        when Socket::AF_INET6 then [Addrinfo.tcp("::1", port)]
+        when Socket::AF_INET then sleep(0.001); raise SocketError
+        end
+      end
+
+      socket = nil
+
+      assert_nothing_raised do
+        socket = Socket.tcp("localhost", port)
+      end
+    ensure
+      server_thread&.value&.close
+      server&.close
+      socket&.close
+    end
+    RUBY
+  end
+
+  def test_tcp_socket_all_hostname_resolution_failed
+    opts = %w[-rsocket -W1]
+    assert_separately opts, <<~RUBY
+    begin
+      server = TCPServer.new("localhost", 0)
+      _, port, = server.addr
+
+      Addrinfo.define_singleton_method(:getaddrinfo) do |_, _, family, *_|
+        case family
+        when Socket::AF_INET6 then raise SocketError
+        when Socket::AF_INET then sleep(0.01); raise SocketError, "Last hostname resolution error"
+        end
+      end
+
+      assert_raise_with_message(SocketError, "Last hostname resolution error") do
+        Socket.tcp("localhost", port)
+      end
+    ensure
+      server&.close
+    end
+    RUBY
+  end
+
+  def test_tcp_socket_hostname_resolution_failed_after_connection_failure
+    opts = %w[-rsocket -W1]
+    assert_separately opts, <<~RUBY
+    server = TCPServer.new("127.0.0.1", 0)
+    port = server.connect_address.ip_port
+
+    Addrinfo.define_singleton_method(:getaddrinfo) do |_, _, family, *_|
+      case family
+      when Socket::AF_INET6 then sleep(0.1); raise Socket::ResolutionError
+      when Socket::AF_INET then [Addrinfo.tcp("127.0.0.1", port)]
+      end
+    end
+
+    server.close
+
+    assert_raise(Errno::ECONNREFUSED) do
+      Socket.tcp("localhost", port)
+    end
+    RUBY
+  end
+
+  def test_tcp_socket_resolves_only_local_host_family
+    opts = %w[-rsocket -W1]
+    assert_separately opts, <<~RUBY
+    begin
+      server = TCPServer.new("127.0.0.1", 0)
+      port = server.connect_address.ip_port
+      families = []
+
+      Addrinfo.define_singleton_method(:getaddrinfo) do |host, _, family, *_|
+        if host == "127.0.0.1"
+          [Addrinfo.tcp("127.0.0.1", 0)]
+        else
+          families << family
+          [Addrinfo.tcp("127.0.0.1", port)]
+        end
+      end
+
+      socket = Socket.tcp("localhost", port, "127.0.0.1")
+      assert_equal([Socket::AF_INET], families)
+    ensure
+      server&.close
+      socket&.close
+    end
+    RUBY
+  end
+
+  def test_tcp_socket_v6_address_passed
+    opts = %w[-rsocket -W1]
+    assert_separately opts, <<~RUBY
+    begin
+      begin
+        # Verify that "localhost" can be resolved to an IPv6 address
+        Socket.getaddrinfo("localhost", 0, Socket::AF_INET6)
+        server = TCPServer.new("::1", 0)
+      rescue Socket::ResolutionError, Errno::EADDRNOTAVAIL # IPv6 is not supported
+        return
+      end
+
+      _, port, = server.addr
+      server_thread = Thread.new { server.accept }
+
+      Addrinfo.define_singleton_method(:getaddrinfo) do |*_|
+        [Addrinfo.tcp("::1", port)]
+      end
+
+      socket = Socket.tcp("::1", port)
+      assert_true(socket.remote_address.ipv6?)
+    ensure
+      server_thread&.value&.close
+      server&.close
+      socket&.close
+    end
+    RUBY
+  end
+
+  def test_tcp_socket_fast_fallback_is_false
+    server = TCPServer.new("127.0.0.1", 0)
+    _, port, = server.addr
+    server_thread = Thread.new { server.accept }
+    socket = Socket.tcp("127.0.0.1", port, fast_fallback: false)
+    assert_true(socket.remote_address.ipv4?)
+  ensure
+    server_thread&.value&.close
+    server&.close
+    socket&.close
+  end
+
+  def test_tcp_fast_fallback
+    opts = %w[-rsocket -W1]
+    assert_separately opts, <<~RUBY
+    assert_true(Socket.tcp_fast_fallback)
+
+    Socket.tcp_fast_fallback = false
+    assert_false(Socket.tcp_fast_fallback)
+
+    Socket.tcp_fast_fallback = true
+    assert_true(Socket.tcp_fast_fallback)
+    RUBY
+  end
 end if defined?(Socket)

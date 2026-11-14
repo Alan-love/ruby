@@ -1,6 +1,13 @@
+name = File.basename(__FILE__, ".gemspec")
+version = ["lib", Array.new(name.count("-")+1).join("/")].find do |dir|
+  break File.foreach(File.join(__dir__, dir, "#{name.tr('-', '/')}.rb")) do |line|
+    /^\s*VERSION\s*=\s*"(.*)"/ =~ line and break $1
+  end rescue nil
+end
+
 Gem::Specification.new do |spec|
-  spec.name          = "resolv"
-  spec.version       = "0.2.1"
+  spec.name          = name
+  spec.version       = version
   spec.authors       = ["Tanaka Akira"]
   spec.email         = ["akr@fsij.org"]
 
@@ -9,13 +16,13 @@ Gem::Specification.new do |spec|
   spec.homepage      = "https://github.com/ruby/resolv"
   spec.required_ruby_version = Gem::Requirement.new(">= 2.3.0")
   spec.licenses      = ["Ruby", "BSD-2-Clause"]
+  spec.extensions << "ext/win32/resolv/extconf.rb"
 
   spec.metadata["homepage_uri"] = spec.homepage
   spec.metadata["source_code_uri"] = spec.homepage
 
-  spec.files         = Dir.chdir(File.expand_path('..', __FILE__)) do
-    `git ls-files -z`.split("\x0").reject { |f| f.match(%r{^(test|spec|features)/}) }
-  end
+  excludes = %W[/.git* /bin /test /*file /#{File.basename(__FILE__)}]
+  spec.files = IO.popen(%W[git -C #{__dir__} ls-files -z --] + excludes.map {|e| ":^#{e}"}, &:read).split("\x0")
   spec.bindir        = "exe"
   spec.executables   = []
   spec.require_paths = ["lib"]

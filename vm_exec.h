@@ -21,11 +21,7 @@ typedef rb_iseq_t *ISEQ;
 #define DEBUG_ENTER_INSN(insn) \
     rb_vmdebug_debug_print_pre(ec, GET_CFP(), GET_PC());
 
-#if OPT_STACK_CACHING
-#define SC_REGS() , reg_a, reg_b
-#else
 #define SC_REGS()
-#endif
 
 #define DEBUG_END_INSN() \
   rb_vmdebug_debug_print_post(ec, GET_CFP() SC_REGS());
@@ -39,10 +35,6 @@ typedef rb_iseq_t *ISEQ;
 
 #define throwdebug if(0)ruby_debug_printf
 /* #define throwdebug ruby_debug_printf */
-
-#ifndef USE_INSNS_COUNTER
-#define USE_INSNS_COUNTER 0
-#endif
 
 /************************************************/
 #if defined(DISPATCH_XXX)
@@ -75,13 +67,13 @@ error !
 
 #define INSN_ENTRY_SIG(insn) \
   if (0) { \
-      ruby_debug_printf("exec: %s@(%"PRIdPTRDIFF", %"PRIdPTRDIFF")@%s:%u\n", #insn, \
-                        (reg_pc - reg_cfp->iseq->body->iseq_encoded), \
-                        (reg_cfp->pc - reg_cfp->iseq->body->iseq_encoded), \
-                        RSTRING_PTR(rb_iseq_path(reg_cfp->iseq)), \
-                        rb_iseq_line_no(reg_cfp->iseq, reg_pc - reg_cfp->iseq->body->iseq_encoded)); \
-  } \
-  if (USE_INSNS_COUNTER) vm_insns_counter_count_insn(BIN(insn));
+      VALUE path = rb_iseq_path(CFP_ISEQ(reg_cfp)); \
+      ruby_debug_printf("exec: %s@(%"PRIdPTRDIFF", %"PRIdPTRDIFF")@%.*s:%u\n", #insn, \
+                        (reg_pc - ISEQ_BODY(CFP_ISEQ(reg_cfp))->iseq_encoded), \
+                        (reg_cfp->pc - ISEQ_BODY(CFP_ISEQ(reg_cfp))->iseq_encoded), \
+                        RSTRING_LENINT(path), RSTRING_PTR(path), \
+                        rb_iseq_line_no(CFP_ISEQ(reg_cfp), reg_pc - ISEQ_BODY(CFP_ISEQ(reg_cfp))->iseq_encoded)); \
+  }
 
 #define INSN_DISPATCH_SIG(insn)
 
@@ -102,16 +94,7 @@ error !
 /* token threaded code */
 
 /* dispatcher */
-#if defined(__GNUC__) && (defined(__i386__) || defined(__x86_64__)) && __GNUC__ == 3
-#define DISPATCH_ARCH_DEPEND_WAY(addr) \
-  __asm__ __volatile__("jmp *%0;\t# -- inserted by vm.h\t[length = 2]" : : "r" (addr))
-
-#else
-#define DISPATCH_ARCH_DEPEND_WAY(addr) \
-                                /* do nothing */
-#endif
 #define TC_DISPATCH(insn)  \
-  DISPATCH_ARCH_DEPEND_WAY(insns_address_table[GET_CURRENT_INSN()]); \
   INSN_DISPATCH_SIG(insn); \
   RB_GNUC_EXTENSION_BLOCK(goto *insns_address_table[GET_CURRENT_INSN()]); \
   rb_bug("tc error");
@@ -165,12 +148,6 @@ default:                        \
 
 #define VM_SP_CNT(ec, sp) ((sp) - (ec)->vm_stack)
 
-#ifdef MJIT_HEADER
-#define THROW_EXCEPTION(exc) do { \
-    ec->errinfo = (VALUE)(exc); \
-    EC_JUMP_TAG(ec, ec->tag->state); \
-} while (0)
-#else
 #if OPT_CALL_THREADED_CODE
 #define THROW_EXCEPTION(exc) do { \
     ec->errinfo = (VALUE)(exc); \
@@ -179,7 +156,35 @@ default:                        \
 #else
 #define THROW_EXCEPTION(exc) return (VALUE)(exc)
 #endif
-#endif
+
+// Run the interpreter from the JIT
+#define VM_EXEC(ec, val) do { \
+    if (UNDEF_P(val)) { \
+        VM_ENV_FLAGS_SET(ec->cfp->ep, VM_FRAME_FLAG_FINISH); \
+        val = vm_exec(ec); \
+    } \
+} while (0)
+
+// Run the JIT from the interpreter
+#define JIT_EXEC(ec, val) do { \
+    /* don't run tailcalls since that breaks FINISH */ \
+    if (UNDEF_P(val) && GET_CFP() != ec->cfp) { \
+        rb_zjit_func_t zjit_entry; \
+        if (rb_yjit_enabled_p) { \
+            rb_jit_func_t func = yjit_compile(ec); \
+            if (func) { \
+                val = func(ec, ec->cfp); \
+                if (ec->tag->state) THROW_EXCEPTION(val); \
+            } \
+        } \
+        else if ((zjit_entry = (rb_zjit_func_t)rb_zjit_entry)) { \
+            rb_jit_func_t func = zjit_compile(ec); \
+            if (func) { \
+                val = zjit_entry(ec, ec->cfp, func); \
+            } \
+        } \
+    } \
+} while (0)
 
 #define SCREG(r) (reg_##r)
 

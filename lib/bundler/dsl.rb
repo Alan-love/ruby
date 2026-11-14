@@ -9,16 +9,20 @@ module Bundler
 
     def self.evaluate(gemfile, lockfile, unlock)
       builder = new
+      builder.lockfile(lockfile)
       builder.eval_gemfile(gemfile)
-      builder.to_definition(lockfile, unlock)
+      builder.to_definition(builder.lockfile_path, unlock)
     end
 
-    VALID_PLATFORMS = Bundler::Dependency::PLATFORM_MAP.keys.freeze
+    VALID_PLATFORMS = Bundler::CurrentRuby::PLATFORM_MAP.keys.freeze
 
     VALID_KEYS = %w[group groups git path glob name branch ref tag require submodules
-                    platform platforms type source install_if gemfile].freeze
+                    platform platforms source install_if force_ruby_platform sparse_checkout].freeze
 
-    attr_reader :gemspecs
+    GITHUB_PULL_REQUEST_URL = %r{\Ahttps://github\.com/([A-Za-z0-9_\-\.]+/[A-Za-z0-9_\-\.]+)/pull/(\d+)\z}
+    GITLAB_MERGE_REQUEST_URL = %r{\Ahttps://gitlab\.com/([A-Za-z0-9_\-\./]+)/-/merge_requests/(\d+)\z}
+
+    attr_reader :gemspecs, :gemfile, :overrides
     attr_accessor :dependencies
 
     def initialize
@@ -35,24 +39,26 @@ module Bundler
       @gemspecs             = []
       @gemfile              = nil
       @gemfiles             = []
+      @lockfile             = nil
+      @overrides            = []
       add_git_sources
     end
 
     def eval_gemfile(gemfile, contents = nil)
-      expanded_gemfile_path = Pathname.new(gemfile).expand_path(@gemfile && @gemfile.parent)
-      original_gemfile = @gemfile
-      @gemfile = expanded_gemfile_path
-      @gemfiles << expanded_gemfile_path
-      contents ||= Bundler.read_file(@gemfile.to_s)
-      instance_eval(contents.dup.tap{|x| x.untaint if RUBY_VERSION < "2.7" }, gemfile.to_s, 1)
-    rescue Exception => e # rubocop:disable Lint/RescueException
-      message = "There was an error " \
-        "#{e.is_a?(GemfileEvalError) ? "evaluating" : "parsing"} " \
-        "`#{File.basename gemfile.to_s}`: #{e.message}"
-
-      raise DSLError.new(message, gemfile, e.backtrace, contents)
-    ensure
-      @gemfile = original_gemfile
+      with_gemfile(gemfile) do |current_gemfile|
+        contents ||= Bundler.read_file(current_gemfile)
+        instance_eval(contents, current_gemfile, 1)
+      rescue GemfileEvalError => e
+        message = "There was an error evaluating `#{File.basename current_gemfile}`: #{e.message}"
+        raise DSLError.new(message, current_gemfile, e.backtrace, contents)
+      rescue GemfileError, InvalidArgumentError, InvalidOption, DeprecatedError, ScriptError => e
+        message = "There was an error parsing `#{File.basename current_gemfile}`: #{e.message}"
+        raise DSLError.new(message, current_gemfile, e.backtrace, contents)
+      rescue StandardError => e
+        raise unless e.backtrace_locations.first.path == current_gemfile
+        message = "There was an error parsing `#{File.basename current_gemfile}`: #{e.message}"
+        raise DSLError.new(message, current_gemfile, e.backtrace, contents)
+      end
     end
 
     def gemspec(opts = nil)
@@ -63,24 +69,27 @@ module Bundler
       development_group = opts[:development_group] || :development
       expanded_path     = gemfile_root.join(path)
 
-      gemspecs = Gem::Util.glob_files_in_dir("{,*}.gemspec", expanded_path).map {|g| Bundler.load_gemspec(g) }.compact
+      gemspecs = SharedHelpers.glob_files_in_dir("{,*}.gemspec", expanded_path).filter_map {|g| Bundler.load_gemspec(g) }
       gemspecs.reject! {|s| s.name != name } if name
-      Index.sort_specs(gemspecs)
       specs_by_name_and_version = gemspecs.group_by {|s| [s.name, s.version] }
 
       case specs_by_name_and_version.size
       when 1
         specs = specs_by_name_and_version.values.first
-        spec = specs.find {|s| s.match_platform(Bundler.local_platform) } || specs.first
+        spec = specs.find {|s| s.installable_on_platform?(Bundler.local_platform) } || specs.first
 
         @gemspecs << spec
 
-        gem spec.name, :name => spec.name, :path => path, :glob => glob
+        path path, "glob" => glob, "name" => spec.name, "gemspec" => spec do
+          options = {}
+          normalize_options(spec.name, [], options)
+          add_dependency spec.name, nil, options
+        end
 
-        group(development_group) do
-          spec.development_dependencies.each do |dep|
-            gem dep.name, *(dep.requirement.as_list + [:type => :development])
-          end
+        spec.development_dependencies.each do |dep|
+          options = {}
+          normalize_options(dep.name, dep.requirement.as_list, options)
+          add_dependency dep.name, dep.requirement.as_list, options.merge("gemspec_dev_dep" => true, "group" => development_group)
         end
       when 0
         raise InvalidOption, "There are no gemspecs at #{expanded_path}"
@@ -92,64 +101,41 @@ module Bundler
 
     def gem(name, *args)
       options = args.last.is_a?(Hash) ? args.pop.dup : {}
-      options["gemfile"] = @gemfile
       version = args || [">= 0"]
 
       normalize_options(name, version, options)
 
-      dep = Dependency.new(name, version, options)
+      add_dependency(name, version, options)
+    end
 
-      # if there's already a dependency with this name we try to prefer one
-      if current = @dependencies.find {|d| d.name == dep.name }
-        deleted_dep = @dependencies.delete(current) if current.type == :development
+    # For usage in Dsl.evaluate, since lockfile is used as part of the Gemfile.
+    def lockfile_path
+      @lockfile
+    end
 
-        unless deleted_dep
-          if current.requirement != dep.requirement
-            return if dep.type == :development
-
-            update_prompt = ""
-
-            if File.basename(@gemfile) == Injector::INJECTED_GEMS
-              if dep.requirements_list.include?(">= 0") && !current.requirements_list.include?(">= 0")
-                update_prompt = ". Gem already added"
-              else
-                update_prompt = ". If you want to update the gem version, run `bundle update #{current.name}`"
-
-                update_prompt += ". You may also need to change the version requirement specified in the Gemfile if it's too restrictive." unless current.requirements_list.include?(">= 0")
-              end
-            end
-
-            raise GemfileError, "You cannot specify the same gem twice with different version requirements.\n" \
-                            "You specified: #{current.name} (#{current.requirement}) and #{dep.name} (#{dep.requirement})" \
-                             "#{update_prompt}"
-          else
-            Bundler.ui.warn "Your Gemfile lists the gem #{current.name} (#{current.requirement}) more than once.\n" \
-                            "You should probably keep only one of them.\n" \
-                            "Remove any duplicate entries and specify the gem only once.\n" \
-                            "While it's not a problem now, it could cause errors if you change the version of one of them later."
-          end
-
-          if current.source != dep.source
-            return if dep.type == :development
-            raise GemfileError, "You cannot specify the same gem twice coming from different sources.\n" \
-                            "You specified that #{dep.name} (#{dep.requirement}) should come from " \
-                            "#{current.source || "an unspecified source"} and #{dep.source}\n"
-          end
-        end
-      end
-
-      @dependencies << dep
+    def lockfile(file)
+      @lockfile = file
     end
 
     def source(source, *args, &blk)
       options = args.last.is_a?(Hash) ? args.pop.dup : {}
       options = normalize_hash(options)
       source = normalize_source(source)
+      cooldown = options["cooldown"]
+      if cooldown && !(cooldown.is_a?(Integer) && cooldown >= 0)
+        raise InvalidOption, "Expected `cooldown` to be a non-negative integer, got #{cooldown.inspect}"
+      end
 
       if options.key?("type")
         options["type"] = options["type"].to_s
-        unless Plugin.source?(options["type"])
+        unless (source_plugin = Plugin.source_plugin(options["type"]))
           raise InvalidOption, "No plugin sources available for #{options["type"]}"
+        end
+        # Implicitly add a dependency on source plugins who are named bundler-source-<type>,
+        # and aren't already mentioned in the Gemfile.
+        # See also Plugin::DSL#source
+        if source_plugin.start_with?("bundler-source-") && !@dependencies.any? {|d| d.name == source_plugin }
+          plugin(source_plugin)
         end
 
         unless block_given?
@@ -159,9 +145,9 @@ module Bundler
         source_opts = options.merge("uri" => source)
         with_source(@sources.add_plugin_source(options["type"], source_opts), &blk)
       elsif block_given?
-        with_source(@sources.add_rubygems_source("remotes" => source), &blk)
+        with_source(@sources.add_rubygems_source("remotes" => source, "cooldown" => cooldown), &blk)
       else
-        @sources.add_global_rubygems_remote(source)
+        @sources.add_global_rubygems_remote(source, cooldown: cooldown)
       end
     end
 
@@ -181,8 +167,7 @@ module Bundler
     def path(path, options = {}, &blk)
       source_options = normalize_hash(options).merge(
         "path" => Pathname.new(path),
-        "root_path" => gemfile_root,
-        "gemspec" => gemspecs.find {|g| g.name == options["name"] }
+        "root_path" => gemfile_root
       )
 
       source_options["global"] = true unless block_given?
@@ -207,16 +192,50 @@ module Bundler
     end
 
     def github(repo, options = {})
-      raise ArgumentError, "GitHub sources require a block" unless block_given?
+      raise InvalidArgumentError, "GitHub sources require a block" unless block_given?
       github_uri  = @git_sources["github"].call(repo)
       git_options = normalize_hash(options).merge("uri" => github_uri)
       git_source  = @sources.add_git_source(git_options)
       with_source(git_source) { yield }
     end
 
+    SUPPORTED_OVERRIDE_FIELDS = [:version, :required_ruby_version, :required_rubygems_version].freeze
+    SUPPORTED_OVERRIDE_SYMBOL_OPERATIONS = [:ignore_upper].freeze
+
+    def override(target, **operations)
+      validate_override_target!(target)
+      source_location = caller_locations(1, 1)&.first
+
+      # 4.1.0.beta2 spelled `with:` and `in:` as `to:` and `from:`.
+      if operations.key?(:from)
+        raise ArgumentError, "`from:` and `to:` of `override` are now `in:` and `with:`; write `override #{target.inspect}, with: #{operations.fetch(:to, "<gem>").inspect}, in: #{operations[:from].inspect}`"
+      end
+
+      if operations.key?(:in) || operations.key?(:with)
+        add_dependency_override(target, operations, source_location)
+        return
+      end
+
+      if target == :all && operations.key?(:version)
+        raise ArgumentError, "`override :all, version:` is not allowed; version requirements are per-gem"
+      end
+
+      operations.each do |field, operation|
+        validate_override_field!(field)
+        validate_override_operation!(operation)
+        validate_override_uniqueness!(target, field)
+      end
+
+      operations.each do |field, operation|
+        @overrides << Override.new(target, field, operation, source_location: source_location)
+      end
+    end
+
     def to_definition(lockfile, unlock)
       check_primary_source_safety
-      Definition.new(lockfile, @dependencies, @sources, unlock, @ruby_version, @optional_groups, @gemfiles)
+      check_dropped_dependencies
+      lockfile = @lockfile unless @lockfile.nil?
+      Definition.new(lockfile, @dependencies, @sources, unlock, @ruby_version, @optional_groups, @gemfiles, @overrides)
     end
 
     def group(*args, &blk)
@@ -258,8 +277,15 @@ module Bundler
       @env = old
     end
 
-    def plugin(*args)
-      # Pass on
+    def plugin(name, *args)
+      options = args.last.is_a?(Hash) ? args.pop.dup : {}
+      version = args || [">= 0"]
+
+      normalize_options(name, version, options)
+      options["plugin"] = true
+      options["require"] = false
+
+      add_dependency(name, version, options)
     end
 
     def method_missing(name, *args)
@@ -273,31 +299,213 @@ module Bundler
 
     private
 
+    def validate_override_target!(target)
+      return if target == :all
+      raise ArgumentError, "override target must be :all or a gem name string, got #{target.inspect}" unless target.is_a?(String)
+      validate_override_gem_name!(target)
+    end
+
+    # Override names are recorded in the lockfile's OVERRIDES section, so they
+    # must be valid gem names.
+    def validate_override_gem_name!(name)
+      validate_gem_name!(name)
+      return if Gem::Specification::VALID_NAME_PATTERN.match?(name)
+      raise GemfileError, "#{name.inspect} is not a valid gem name"
+    end
+
+    def validate_override_field!(field)
+      return if SUPPORTED_OVERRIDE_FIELDS.include?(field)
+      supported = SUPPORTED_OVERRIDE_FIELDS.map {|f| "`#{f}:`" }.join(", ")
+      raise ArgumentError, "unsupported override field `#{field}:`; supported fields: #{supported}"
+    end
+
+    def validate_override_operation!(operation)
+      case operation
+      when String
+        Gem::Requirement.new(operation)
+      when nil
+        # ok
+      when Symbol
+        return if SUPPORTED_OVERRIDE_SYMBOL_OPERATIONS.include?(operation)
+        raise ArgumentError, "unsupported override operation: #{operation.inspect}"
+      else
+        raise ArgumentError, "override operation must be a String, Symbol, or nil, got #{operation.inspect}"
+      end
+    rescue Gem::Requirement::BadRequirementError => e
+      raise ArgumentError, "invalid override version requirement #{operation.inspect}: #{e.message}"
+    end
+
+    def validate_override_uniqueness!(target, field)
+      return unless @overrides.any? {|o| o.target == target && o.field == field }
+      raise ArgumentError, "duplicate override for #{target.inspect} `#{field}:`"
+    end
+
+    def add_dependency_override(target, operations, source_location)
+      unless operations.key?(:in)
+        raise ArgumentError, "`override #{target.inspect}, with:` requires `in:` naming the gem whose dependency is rewritten"
+      end
+      unless operations.key?(:with)
+        raise ArgumentError, "`override #{target.inspect}, in:` requires `with:`; use `with: nil` to drop the dependency or `with: \"<gem>\"` to replace it"
+      end
+
+      from = operations[:in]
+      with = operations[:with]
+      requirement = operations[:version]
+
+      raise ArgumentError, "`override :all` does not accept `in:`" if target == :all
+      raise ArgumentError, "`in:` must be a gem name string, got #{from.inspect}" unless from.is_a?(String)
+      raise ArgumentError, "`with:` must be a gem name string or nil, got #{with.inspect}" unless with.nil? || with.is_a?(String)
+      raise ArgumentError, "`with:` must name a gem other than #{target.inspect} and #{from.inspect}" if with == target || with == from
+      validate_override_gem_name!(from)
+      validate_override_gem_name!(with) if with
+
+      unsupported = operations.keys - [:in, :with, :version]
+      if unsupported.any?
+        raise ArgumentError, "unsupported override field `#{unsupported.first}:` with `in:`; supported fields: `with:`, `version:`"
+      end
+
+      if operations.key?(:version)
+        raise ArgumentError, "`version:` with `in:` requires `with:` to name a replacement gem" if with.nil?
+        raise ArgumentError, "`version:` with `in:` must be a version requirement string, got #{requirement.inspect}" unless requirement.is_a?(String)
+        validate_override_operation!(requirement)
+      end
+
+      if @overrides.any? {|o| o.target == target && o.from == from }
+        raise ArgumentError, "duplicate override for #{target.inspect} `in: #{from.inspect}`"
+      end
+
+      @overrides << Override.new(target, :with, with, from: from, requirement: requirement, source_location: source_location)
+    end
+
+    # Dropping a gem the Gemfile requires directly would leave it installed
+    # anyway, with only the parent's requirement gone.
+    def check_dropped_dependencies
+      @overrides.each do |override|
+        next unless override.from && override.operation.nil?
+        next unless @dependencies.any? {|d| d.name == override.target }
+
+        raise GemfileError, "#{override} cannot drop #{override.target} because the Gemfile depends on it directly"
+      end
+    end
+
+    def add_dependency(name, version = nil, options = {})
+      options["gemfile"] = @gemfile
+      options["source"] ||= @source
+      options["env"] ||= @env
+
+      dep = Dependency.new(name, version, options)
+
+      # if there's already a dependency with this name we try to prefer one
+      if current = @dependencies.find {|d| d.name == name }
+        if current.requirement != dep.requirement
+          current_requirement_open = current.requirements_list.include?(">= 0")
+
+          gemspec_dep = [dep, current].find(&:gemspec_dev_dep?)
+          if gemspec_dep
+            require_relative "vendored_pub_grub"
+
+            current_gemspec_range = Gem::PubGrub::RubyGems.requirement_to_range(current.requirement)
+            next_gemspec_range = Gem::PubGrub::RubyGems.requirement_to_range(dep.requirement)
+
+            if current_gemspec_range.intersects?(next_gemspec_range)
+              dep = Dependency.new(name, current.requirement.as_list + dep.requirement.as_list, options)
+            else
+              gemfile_dep = [dep, current].find(&:gemfile_dep?)
+
+              if gemfile_dep
+                raise GemfileError, "The #{name} dependency has conflicting requirements in Gemfile (#{gemfile_dep.requirement}) and gemspec (#{gemspec_dep.requirement})"
+              else
+                raise GemfileError, "Two gemspec development dependencies have conflicting requirements on the same gem: #{dep} and #{current}"
+              end
+            end
+          else
+            update_prompt = ""
+
+            if File.basename(@gemfile) == Injector::INJECTED_GEMS
+              if dep.requirements_list.include?(">= 0") && !current_requirement_open
+                update_prompt = ". Gem already added"
+              else
+                update_prompt = ". If you want to update the gem version, run `bundle update #{name}`"
+
+                update_prompt += ". You may also need to change the version requirement specified in the Gemfile if it's too restrictive." unless current_requirement_open
+              end
+            end
+
+            raise GemfileError, "You cannot specify the same gem twice with different version requirements.\n" \
+                           "You specified: #{name} (#{current.requirement}) and #{name} (#{dep.requirement})" \
+                           "#{update_prompt}"
+          end
+        end
+
+        unless current.gemspec_dev_dep? && dep.gemspec_dev_dep?
+          # Always prefer the dependency from the Gemfile
+          if current.gemspec_dev_dep?
+            @dependencies.delete(current)
+          elsif dep.gemspec_dev_dep?
+            return
+          elsif current.source.to_s != dep.source.to_s
+            raise GemfileError, "You cannot specify the same gem twice coming from different sources.\n" \
+                            "You specified that #{name} (#{dep.requirement}) should come from " \
+                            "#{current.source || "an unspecified source"} and #{dep.source}\n"
+          else
+            Bundler.ui.warn "Your Gemfile lists the gem #{name} (#{current.requirement}) more than once.\n" \
+                            "You should probably keep only one of them.\n" \
+                            "Remove any duplicate entries and specify the gem only once.\n" \
+                            "While it's not a problem now, it could cause errors if you change the version of one of them later."
+          end
+        end
+      end
+
+      @dependencies << dep
+    end
+
+    def with_gemfile(gemfile)
+      expanded_gemfile_path = Pathname.new(gemfile).expand_path(@gemfile&.parent)
+      original_gemfile = @gemfile
+      @gemfile = expanded_gemfile_path
+      @gemfiles << expanded_gemfile_path
+      yield @gemfile.to_s
+    ensure
+      @gemfile = original_gemfile
+    end
+
     def add_git_sources
       git_source(:github) do |repo_name|
-        warn_deprecated_git_source(:github, <<-'RUBY'.strip, 'Change any "reponame" :github sources to "username/reponame".')
-"https://github.com/#{repo_name}.git"
-        RUBY
-        repo_name = "#{repo_name}/#{repo_name}" unless repo_name.include?("/")
-        "https://github.com/#{repo_name}.git"
+        if repo_name =~ GITHUB_PULL_REQUEST_URL
+          {
+            "git" => "https://github.com/#{$1}.git",
+            "branch" => nil,
+            "ref" => "refs/pull/#{$2}/head",
+            "tag" => nil,
+          }
+        else
+          repo_name = "#{repo_name}/#{repo_name}" unless repo_name.include?("/")
+          "https://github.com/#{repo_name}.git"
+        end
       end
 
       git_source(:gist) do |repo_name|
-        warn_deprecated_git_source(:gist, '"https://gist.github.com/#{repo_name}.git"')
-
         "https://gist.github.com/#{repo_name}.git"
       end
 
       git_source(:bitbucket) do |repo_name|
-        warn_deprecated_git_source(:bitbucket, <<-'RUBY'.strip)
-user_name, repo_name = repo_name.split("/")
-repo_name ||= user_name
-"https://#{user_name}@bitbucket.org/#{user_name}/#{repo_name}.git"
-        RUBY
-
         user_name, repo_name = repo_name.split("/")
         repo_name ||= user_name
         "https://#{user_name}@bitbucket.org/#{user_name}/#{repo_name}.git"
+      end
+
+      git_source(:gitlab) do |repo_name|
+        if repo_name =~ GITLAB_MERGE_REQUEST_URL
+          {
+            "git" => "https://gitlab.com/#{$1}.git",
+            "branch" => nil,
+            "ref" => "refs/merge-requests/#{$2}/head",
+            "tag" => nil,
+          }
+        else
+          repo_name = "#{repo_name}/#{repo_name}" unless repo_name.include?("/")
+          "https://gitlab.com/#{repo_name}.git"
+        end
       end
     end
 
@@ -323,14 +531,18 @@ repo_name ||= user_name
       @valid_keys ||= VALID_KEYS
     end
 
-    def normalize_options(name, version, opts)
+    def validate_gem_name!(name)
       if name.is_a?(Symbol)
         raise GemfileError, %(You need to specify gem names as Strings. Use 'gem "#{name}"' instead)
       end
-      if name =~ /\s/
+      if /\s/.match?(name)
         raise GemfileError, %('#{name}' is not a valid gem name because it contains whitespace)
       end
       raise GemfileError, %(an empty gem name is not valid) if name.empty?
+    end
+
+    def normalize_options(name, version, opts)
+      validate_gem_name!(name)
 
       normalize_hash(opts)
 
@@ -357,6 +569,13 @@ repo_name ||= user_name
         raise GemfileError, "`#{p}` is not a valid platform. The available options are: #{VALID_PLATFORMS.inspect}"
       end
 
+      windows_platforms = platforms.select {|pl| pl.to_s.match?(/mingw|mswin/) }
+      if windows_platforms.any?
+        windows_platforms = windows_platforms.map! {|pl| ":#{pl}" }.join(", ")
+        deprecated_message = "Platform #{windows_platforms} will be removed in the future. Please use platform :windows instead."
+        Bundler::SharedHelpers.feature_deprecated! deprecated_message
+      end
+
       # Save sources passed in a key
       if opts.key?("source")
         source = normalize_source(opts["source"])
@@ -365,7 +584,11 @@ repo_name ||= user_name
 
       git_name = (git_names & opts.keys).last
       if @git_sources[git_name]
-        opts["git"] = @git_sources[git_name].call(opts[git_name])
+        git_opts = @git_sources[git_name].call(opts[git_name])
+        git_opts = { "git" => git_opts } if git_opts.is_a?(String)
+        opts.merge!(git_opts) do |key, _gemfile_value, _git_source_value|
+          raise GemfileError, %(The :#{key} option can't be used with `#{git_name}: #{opts[git_name].inspect}`)
+        end
       end
 
       %w[git path].each do |type|
@@ -379,8 +602,6 @@ repo_name ||= user_name
         opts["source"] = source
       end
 
-      opts["source"]         ||= @source
-      opts["env"]            ||= @env
       opts["platforms"]      = platforms.dup
       opts["group"]          = groups
       opts["should_include"] = install_if
@@ -396,13 +617,11 @@ repo_name ||= user_name
     end
 
     def validate_keys(command, opts, valid_keys)
-      invalid_keys = opts.keys - valid_keys
-
-      git_source = opts.keys & @git_sources.keys.map(&:to_s)
-      if opts["branch"] && !(opts["git"] || opts["github"] || git_source.any?)
+      if opts["branch"] && !(opts["git"] || opts["github"] || (opts.keys & @git_sources.keys.map(&:to_s)).any?)
         raise GemfileError, %(The `branch` option for `#{command}` is not allowed. Only gems with a git source can specify a branch)
       end
 
+      invalid_keys = opts.keys - valid_keys
       return true unless invalid_keys.any?
 
       message = String.new
@@ -421,10 +640,10 @@ repo_name ||= user_name
     def normalize_source(source)
       case source
       when :gemcutter, :rubygems, :rubyforge
-        Bundler::SharedHelpers.major_deprecation 2, "The source :#{source} is deprecated because HTTP " \
-          "requests are insecure.\nPlease change your source to 'https://" \
-          "rubygems.org' if possible, or 'http://rubygems.org' if not."
-        "http://rubygems.org"
+        removed_message =
+          "The source :#{source} is disallowed because HTTP requests are insecure.\n" \
+          "Please change your source to 'https://rubygems.org' if possible, or 'http://rubygems.org' if not."
+        Bundler::SharedHelpers.feature_removed! removed_message
       when String
         source
       else
@@ -443,52 +662,18 @@ repo_name ||= user_name
               "      gem 'rails'\n" \
               "    end\n\n"
 
-      SharedHelpers.major_deprecation(2, msg.strip)
+      SharedHelpers.feature_removed! msg.strip
     end
 
     def check_rubygems_source_safety
-      if @sources.implicit_global_source?
-        implicit_global_source_warning
-      elsif @sources.aggregate_global_source?
-        multiple_global_source_warning
-      end
-    end
-
-    def implicit_global_source_warning
-      Bundler::SharedHelpers.major_deprecation 2, "This Gemfile does not include an explicit global source. " \
-        "Not using an explicit global source may result in a different lockfile being generated depending on " \
-        "the gems you have installed locally before bundler is run. " \
-        "Instead, define a global source in your Gemfile like this: source \"https://rubygems.org\"."
+      multiple_global_source_warning if @sources.aggregate_global_source?
     end
 
     def multiple_global_source_warning
-      if Bundler.feature_flag.bundler_3_mode?
-        msg = "This Gemfile contains multiple primary sources. " \
-          "Each source after the first must include a block to indicate which gems " \
-          "should come from that source"
-        raise GemfileEvalError, msg
-      else
-        Bundler::SharedHelpers.major_deprecation 2, "Your Gemfile contains multiple primary sources. " \
-          "Using `source` more than once without a block is a security risk, and " \
-          "may result in installing unexpected gems. To resolve this warning, use " \
-          "a block to indicate which gems should come from the secondary source."
-      end
-    end
-
-    def warn_deprecated_git_source(name, replacement, additional_message = nil)
-      additional_message &&= " #{additional_message}"
-      replacement = if replacement.count("\n").zero?
-        "{|repo_name| #{replacement} }"
-      else
-        "do |repo_name|\n#{replacement.to_s.gsub(/^/, "      ")}\n    end"
-      end
-
-      Bundler::SharedHelpers.major_deprecation 3, <<-EOS
-The :#{name} git source is deprecated, and will be removed in the future.#{additional_message} Add this code to the top of your Gemfile to ensure it continues to work:
-
-    git_source(:#{name}) #{replacement}
-
-      EOS
+      msg = "This Gemfile contains multiple global sources. " \
+        "Each source after the first must include a block to indicate which gems " \
+        "should come from that source"
+      raise GemfileEvalError, msg
     end
 
     class DSLError < GemfileError
@@ -525,9 +710,7 @@ The :#{name} git source is deprecated, and will be removed in the future.#{addit
       #         be raised.
       #
       def contents
-        @contents ||= begin
-          dsl_path && File.exist?(dsl_path) && File.read(dsl_path)
-        end
+        @contents ||= dsl_path && File.exist?(dsl_path) && File.read(dsl_path)
       end
 
       # The message of the exception reports the content of podspec for the
@@ -558,23 +741,26 @@ The :#{name} git source is deprecated, and will be removed in the future.#{addit
 
           return m unless backtrace && dsl_path && contents
 
-          trace_line = backtrace.find {|l| l.include?(dsl_path.to_s) } || trace_line
+          trace_line = backtrace.find {|l| l.include?(dsl_path) } || trace_line
           return m unless trace_line
-          line_numer = trace_line.split(":")[1].to_i - 1
-          return m unless line_numer
+          # Match the line number right before `:in` or the end of the line so a
+          # Windows drive letter like `C:` does not get mistaken for the number.
+          line_number = trace_line[/:(\d+)(?::in\b|\z)/, 1]
+          return m unless line_number
+          line_number = line_number.to_i - 1
 
           lines      = contents.lines.to_a
           indent     = " #  "
           indicator  = indent.tr("#", ">")
-          first_line = line_numer.zero?
-          last_line  = (line_numer == (lines.count - 1))
+          first_line = line_number.zero?
+          last_line  = (line_number == (lines.count - 1))
 
           m << "\n"
           m << "#{indent}from #{trace_line.gsub(/:in.*$/, "")}\n"
           m << "#{indent}-------------------------------------------\n"
-          m << "#{indent}#{lines[line_numer - 1]}" unless first_line
-          m << "#{indicator}#{lines[line_numer]}"
-          m << "#{indent}#{lines[line_numer + 1]}" unless last_line
+          m << "#{indent}#{lines[line_number - 1]}" unless first_line
+          m << "#{indicator}#{lines[line_number]}"
+          m << "#{indent}#{lines[line_number + 1]}" unless last_line
           m << "\n" unless m.end_with?("\n")
           m << "#{indent}-------------------------------------------\n"
         end
@@ -584,7 +770,7 @@ The :#{name} git source is deprecated, and will be removed in the future.#{addit
 
       def parse_line_number_from_description
         description = self.description
-        if dsl_path && description =~ /((#{Regexp.quote File.expand_path(dsl_path)}|#{Regexp.quote dsl_path.to_s}):\d+)/
+        if dsl_path && description =~ /((#{Regexp.quote File.expand_path(dsl_path)}|#{Regexp.quote dsl_path}):\d+)/
           trace_line = Regexp.last_match[1]
           description = description.sub(/\n.*\n(\.\.\.)? *\^~+$/, "").sub(/#{Regexp.quote trace_line}:\s*/, "").sub("\n", " - ")
         end

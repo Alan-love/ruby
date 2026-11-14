@@ -1,4 +1,5 @@
 # -*- encoding: utf-8 -*-
+# frozen_string_literal: false
 require_relative '../../spec_helper'
 require_relative 'fixtures/classes'
 
@@ -6,6 +7,10 @@ describe "String#downcase" do
   it "returns a copy of self with all uppercase letters downcased" do
     "hELLO".downcase.should == "hello"
     "hello".downcase.should == "hello"
+  end
+
+  it "returns a String in the same encoding as self" do
+    "hELLO".encode("US-ASCII").downcase.encoding.should == Encoding::US_ASCII
   end
 
   describe "full Unicode case mapping" do
@@ -19,13 +24,17 @@ describe "String#downcase" do
       downcased.should == "king"
       downcased.size.should == 4
       downcased.bytesize.should == 4
-      downcased.ascii_only?.should be_true
+      downcased.ascii_only?.should == true
     end
   end
 
   describe "ASCII-only case mapping" do
     it "does not downcase non-ASCII characters" do
       "CÅR".downcase(:ascii).should == "cÅr"
+    end
+
+    it "works with substrings" do
+      "prefix TÉ"[-2..-1].downcase(:ascii).should == "tÉ"
     end
   end
 
@@ -39,7 +48,7 @@ describe "String#downcase" do
     end
 
     it "does not allow any other additional option" do
-      -> { "İ".downcase(:turkic, :ascii) }.should raise_error(ArgumentError)
+      -> { "İ".downcase(:turkic, :ascii) }.should.raise(ArgumentError)
     end
   end
 
@@ -53,7 +62,7 @@ describe "String#downcase" do
     end
 
     it "does not allow any other additional option" do
-      -> { "İS".downcase(:lithuanian, :ascii) }.should raise_error(ArgumentError)
+      -> { "İS".downcase(:lithuanian, :ascii) }.should.raise(ArgumentError)
     end
   end
 
@@ -65,34 +74,18 @@ describe "String#downcase" do
   end
 
   it "does not allow invalid options" do
-    -> { "ABC".downcase(:invalid_option) }.should raise_error(ArgumentError)
+    -> { "ABC".downcase(:invalid_option) }.should.raise(ArgumentError)
   end
 
-  ruby_version_is ''...'2.7' do
-    it "taints result when self is tainted" do
-      "".taint.downcase.should.tainted?
-      "x".taint.downcase.should.tainted?
-      "X".taint.downcase.should.tainted?
-    end
-  end
-
-  ruby_version_is ''...'3.0' do
-    it "returns a subclass instance for subclasses" do
-      StringSpecs::MyString.new("FOObar").downcase.should be_an_instance_of(StringSpecs::MyString)
-    end
-  end
-
-  ruby_version_is '3.0' do
-    it "returns a String instance for subclasses" do
-      StringSpecs::MyString.new("FOObar").downcase.should be_an_instance_of(String)
-    end
+  it "returns a String instance for subclasses" do
+    StringSpecs::MyString.new("FOObar").downcase.should.instance_of?(String)
   end
 end
 
 describe "String#downcase!" do
   it "modifies self in place" do
     a = "HeLlO"
-    a.downcase!.should equal(a)
+    a.downcase!.should.equal?(a)
     a.should == "hello"
   end
 
@@ -116,7 +109,7 @@ describe "String#downcase!" do
       downcased.should == "king"
       downcased.size.should == 4
       downcased.bytesize.should == 4
-      downcased.ascii_only?.should be_true
+      downcased.ascii_only?.should == true
     end
   end
 
@@ -148,7 +141,7 @@ describe "String#downcase!" do
     end
 
     it "does not allow any other additional option" do
-      -> { a = "İ"; a.downcase!(:turkic, :ascii) }.should raise_error(ArgumentError)
+      -> { a = "İ"; a.downcase!(:turkic, :ascii) }.should.raise(ArgumentError)
     end
   end
 
@@ -166,7 +159,7 @@ describe "String#downcase!" do
     end
 
     it "does not allow any other additional option" do
-      -> { a = "İS"; a.downcase!(:lithuanian, :ascii) }.should raise_error(ArgumentError)
+      -> { a = "İS"; a.downcase!(:lithuanian, :ascii) }.should.raise(ArgumentError)
     end
   end
 
@@ -182,7 +175,7 @@ describe "String#downcase!" do
   end
 
   it "does not allow invalid options" do
-    -> { a = "ABC"; a.downcase!(:invalid_option) }.should raise_error(ArgumentError)
+    -> { a = "ABC"; a.downcase!(:invalid_option) }.should.raise(ArgumentError)
   end
 
   it "returns nil if no modifications were made" do
@@ -192,11 +185,11 @@ describe "String#downcase!" do
   end
 
   it "raises a FrozenError when self is frozen" do
-    -> { "HeLlo".freeze.downcase! }.should raise_error(FrozenError)
-    -> { "hello".freeze.downcase! }.should raise_error(FrozenError)
+    -> { "HeLlo".freeze.downcase! }.should.raise(FrozenError)
+    -> { "hello".freeze.downcase! }.should.raise(FrozenError)
   end
 
   it "sets the result String encoding to the source String encoding" do
-    "ABC".downcase.encoding.should equal(Encoding::UTF_8)
+    "ABC".downcase.encoding.should.equal?(Encoding::UTF_8)
   end
 end

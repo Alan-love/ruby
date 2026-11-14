@@ -88,8 +88,8 @@ VALUE rb_define_class_id(ID id, VALUE super);
  * @post        `outer::id` refers the returned class.
  * @note        If a class named `id` is  already defined and its superclass is
  *              `super`, the function just returns the defined class.
- * @note        The  compaction  GC does  not  move  classes returned  by  this
- *              function.
+ * @note        The GC does not collect nor move classes returned by this
+ *              function. They are immortal.
  */
 VALUE rb_define_class_id_under(VALUE outer, ID id, VALUE super);
 
@@ -127,8 +127,8 @@ VALUE rb_define_module_id(ID id);
  *                             constant is not a module.
  * @return      The created module.
  * @post        `outer::id` refers the returned module.
- * @note        The  compaction  GC does  not  move  classes returned  by  this
- *              function.
+ * @note        The GC does not collect nor move classes returned by this
+ *              function. They are immortal.
  */
 VALUE rb_define_module_id_under(VALUE outer, ID id);
 
@@ -158,7 +158,7 @@ VALUE rb_mod_included_modules(VALUE mod);
 VALUE rb_mod_include_p(VALUE child, VALUE parent);
 
 /**
- * Queries the  module's ancestors.  This  routine gathers classes  and modules
+ * Queries the  module's ancestors.  This routine gathers classes  and modules
  * that  the  passed  module  either  inherits,  includes,  or  prepends,  then
  * recursively applies  that routine again  and again to the  collected entries
  * until the list doesn't grow up.
@@ -175,17 +175,41 @@ VALUE rb_mod_include_p(VALUE child, VALUE parent);
 VALUE rb_mod_ancestors(VALUE mod);
 
 /**
- * Queries the class's descendants. This  routine gathers classes that are
- * subclasses of the given class (or subclasses of those subclasses, etc.),
- * returning an array of classes that have the given class as an ancestor.
- * The returned array does not include the given class or singleton classes.
+ * Queries the module's descendants.  This routine gathers classes and modules
+ * that have the given module in their ancestors.  The returned array includes
+ * neither the given module itself nor singleton classes.
  *
- * @param[in]  klass A class.
- * @return     An array of classes where `klass` is an ancestor.
+ * @param[in]  mod  A module or a class.
+ * @return     An array of classes and modules whose `ancestors` include `mod`.
  *
  * @internal
  */
-VALUE rb_class_descendants(VALUE klass);
+VALUE rb_mod_descendants(VALUE mod);
+
+/**
+ * Queries the class's direct descendants. This  routine gathers classes that are
+ * direct subclasses of the given class,
+ * returning an array of classes that have the given class as a superclass.
+ * The returned array does not include singleton classes.
+ *
+ * @param[in]  klass A class.
+ * @return     An array of classes where `klass` is the `superclass`.
+ *
+ * @internal
+ */
+VALUE rb_class_subclasses(VALUE klass);
+
+
+/**
+ *  Returns the attached object for a singleton class.
+ *  If the given class is not a singleton class, raises a TypeError.
+ *
+ * @param[in]  klass A class.
+ * @return     The object which has the singleton class `klass`.
+ *
+ * @internal
+ */
+VALUE rb_class_attached_object(VALUE klass);
 
 /**
  * Generates an array of symbols, which are the list of method names defined in

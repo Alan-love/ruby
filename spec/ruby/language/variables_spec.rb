@@ -1,6 +1,51 @@
 require_relative '../spec_helper'
 require_relative 'fixtures/variables'
 
+describe "Evaluation order during assignment" do
+  context "with single assignment" do
+    it "evaluates from left to right" do
+      obj = VariablesSpecs::EvalOrder.new
+      obj.instance_eval do
+        foo[0] = a
+      end
+
+      obj.order.should == ["foo", "a", "foo[]="]
+    end
+  end
+
+  context "with multiple assignment" do
+    it "evaluates from left to right, receivers first then methods" do
+      obj = VariablesSpecs::EvalOrder.new
+      obj.instance_eval do
+        foo[0], bar.baz = a, b
+      end
+
+      obj.order.should == ["foo", "bar", "a", "b", "foo[]=", "bar.baz="]
+    end
+
+    it "can be used to swap variables with nested method calls" do
+      node = VariablesSpecs::EvalOrder.new.node
+
+      original_node = node
+      original_node_left = node.left
+      original_node_left_right = node.left.right
+
+      node.left, node.left.right, node = node.left.right, node, node.left
+      # Should evaluate in the order of:
+      # LHS: node, node.left(original_node_left)
+      # RHS: original_node_left_right, original_node, original_node_left
+      # Ops:
+      # * node(original_node), original_node.left = original_node_left_right
+      # * original_node_left.right = original_node
+      # * node = original_node_left
+
+      node.should == original_node_left
+      node.right.should == original_node
+      node.right.left.should == original_node_left_right
+    end
+  end
+end
+
 describe "Multiple assignment" do
   context "with a single RHS value" do
     it "assigns a simple MLHS" do
@@ -46,7 +91,7 @@ describe "Multiple assignment" do
       x = mock("multi-assign single RHS")
       x.should_receive(:to_ary).and_return(1)
 
-      -> { a, b, c = x }.should raise_error(TypeError)
+      -> { a, b, c = x }.should.raise(TypeError)
     end
 
     it "does not call #to_a to convert an Object RHS when assigning a simple MLHS" do
@@ -77,7 +122,7 @@ describe "Multiple assignment" do
       ary = [1, 2]
 
       x = (a, b = ary)
-      x.should equal(ary)
+      x.should.equal?(ary)
     end
 
     it "returns the RHS when it is an Array subclass" do
@@ -85,7 +130,7 @@ describe "Multiple assignment" do
       ary = cls.new [1, 2]
 
       x = (a, b = ary)
-      x.should equal(ary)
+      x.should.equal?(ary)
     end
 
     it "does not call #to_ary on an Array subclass instance" do
@@ -127,7 +172,7 @@ describe "Multiple assignment" do
       x = mock("multi-assign splat")
       x.should_receive(:to_ary).and_return(1)
 
-      -> { *a = x }.should raise_error(TypeError)
+      -> { *a = x }.should.raise(TypeError)
     end
 
     it "does not call #to_ary on an Array subclass" do
@@ -144,8 +189,8 @@ describe "Multiple assignment" do
       ary = cls.new [1, 2]
 
       x = (*a = ary)
-      x.should equal(ary)
-      a.should be_an_instance_of(Array)
+      x.should.equal?(ary)
+      a.should.instance_of?(Array)
     end
 
     it "calls #to_ary to convert an Object RHS with MLHS" do
@@ -160,7 +205,7 @@ describe "Multiple assignment" do
       x = mock("multi-assign splat")
       x.should_receive(:to_ary).and_return(1)
 
-      -> { a, *b, c = x }.should raise_error(TypeError)
+      -> { a, *b, c = x }.should.raise(TypeError)
     end
 
     it "does not call #to_a to convert an Object RHS with a MLHS" do
@@ -256,7 +301,7 @@ describe "Multiple assignment" do
       x = mock("multi-assign attributes")
       x.should_receive(:m).and_return(y)
 
-      -> { a, b = x.m }.should raise_error(TypeError)
+      -> { a, b = x.m }.should.raise(TypeError)
     end
 
     it "assigns values from a RHS method call with receiver and arguments" do
@@ -287,8 +332,13 @@ describe "Multiple assignment" do
 
     it "assigns indexed elements" do
       a = []
-      a[1], a[2] = 1
-      a.should == [nil, 1, nil]
+      a[1], a[2] = 1, 2
+      a.should == [nil, 1, 2]
+
+      # with splatted argument
+      a = []
+      a[*[1]], a[*[2]] = 1, 2
+      a.should == [nil, 1, 2]
     end
 
     it "assigns constants" do
@@ -296,6 +346,9 @@ describe "Multiple assignment" do
         SINGLE_RHS_1, SINGLE_RHS_2 = 1
         [SINGLE_RHS_1, SINGLE_RHS_2].should == [1, nil]
       end
+    ensure
+      VariableSpecs.send(:remove_const, :SINGLE_RHS_1)
+      VariableSpecs.send(:remove_const, :SINGLE_RHS_2)
     end
   end
 
@@ -310,11 +363,22 @@ describe "Multiple assignment" do
       a.should == []
     end
 
-    it "calls #to_a to convert nil to an empty Array" do
-      nil.should_receive(:to_a).and_return([])
+    ruby_version_is "4.0" do
+      it "converts nil to empty array without calling a method" do
+        nil.should_not_receive(:to_a)
 
-      (*a = *nil).should == []
-      a.should == []
+        (*a = *nil).should == []
+        a.should == []
+      end
+    end
+
+    ruby_version_is ""..."4.0"  do
+      it "calls #to_a to convert nil to an empty Array" do
+        nil.should_receive(:to_a).and_return([])
+
+        (*a = *nil).should == []
+        a.should == []
+      end
     end
 
     it "does not call #to_a on an Array" do
@@ -329,7 +393,7 @@ describe "Multiple assignment" do
       ary = [1, 2]
 
       (a = *ary).should == [1, 2]
-      a.should_not equal(ary)
+      a.should_not.equal?(ary)
     end
 
     it "does not call #to_a on an Array subclass" do
@@ -348,10 +412,10 @@ describe "Multiple assignment" do
       x = (a = *ary)
 
       x.should == [1, 2]
-      x.should be_an_instance_of(Array)
+      x.should.instance_of?(Array)
 
       a.should == [1, 2]
-      a.should be_an_instance_of(Array)
+      a.should.instance_of?(Array)
     end
 
     it "unfreezes the array returned from calling 'to_a' on the splatted value" do
@@ -417,7 +481,7 @@ describe "Multiple assignment" do
       x = mock("multi-assign RHS splat")
       x.should_receive(:to_a).and_return(1)
 
-      -> { *a = *x }.should raise_error(TypeError)
+      -> { *a = *x }.should.raise(TypeError)
     end
 
     it "does not call #to_ary to convert an Object RHS with a single splat LHS" do
@@ -463,7 +527,7 @@ describe "Multiple assignment" do
       x = mock("multi-assign splat")
       x.should_receive(:to_a).and_return(1)
 
-      -> { a = *x }.should raise_error(TypeError)
+      -> { a = *x }.should.raise(TypeError)
     end
 
     it "calls #to_a to convert an Object splat RHS when assigned to a simple MLHS" do
@@ -478,7 +542,7 @@ describe "Multiple assignment" do
       x = mock("multi-assign splat")
       x.should_receive(:to_a).and_return(1)
 
-      -> { a, b, c = *x }.should raise_error(TypeError)
+      -> { a, b, c = *x }.should.raise(TypeError)
     end
 
     it "does not call #to_ary to convert an Object splat RHS when assigned to a simple MLHS" do
@@ -501,7 +565,7 @@ describe "Multiple assignment" do
       x = mock("multi-assign splat")
       x.should_receive(:to_a).and_return(1)
 
-      -> { a, *b, c = *x }.should raise_error(TypeError)
+      -> { a, *b, c = *x }.should.raise(TypeError)
     end
 
     it "does not call #to_ary to convert an Object RHS with a MLHS" do
@@ -534,6 +598,8 @@ describe "Multiple assignment" do
         (*SINGLE_SPLATTED_RHS) = *1
         SINGLE_SPLATTED_RHS.should == [1]
       end
+    ensure
+      VariableSpecs.send(:remove_const, :SINGLE_SPLATTED_RHS)
     end
   end
 
@@ -579,7 +645,7 @@ describe "Multiple assignment" do
       x = mock("multi-assign splat MRHS")
       x.should_receive(:to_a).and_return(1)
 
-      -> { a, *b = 1, *x }.should raise_error(TypeError)
+      -> { a, *b = 1, *x }.should.raise(TypeError)
     end
 
     it "does not call #to_ary to convert a splatted Object as part of a MRHS with a splat MRHS" do
@@ -602,7 +668,7 @@ describe "Multiple assignment" do
       x = mock("multi-assign splat MRHS")
       x.should_receive(:to_a).and_return(1)
 
-      -> { a, *b = *x, 1 }.should raise_error(TypeError)
+      -> { a, *b = *x, 1 }.should.raise(TypeError)
     end
 
     it "does not call #to_ary to convert a splatted Object with a splat MRHS" do
@@ -651,7 +717,7 @@ describe "Multiple assignment" do
       x = mock("multi-assign mixed RHS")
       x.should_receive(:to_ary).and_return(x)
 
-      -> { a, (b, c), d = 1, x, 3, 4 }.should raise_error(TypeError)
+      -> { a, (b, c), d = 1, x, 3, 4 }.should.raise(TypeError)
     end
 
     it "calls #to_a to convert a splatted Object value in a MRHS" do
@@ -675,7 +741,7 @@ describe "Multiple assignment" do
       x = mock("multi-assign mixed splatted RHS")
       x.should_receive(:to_ary).and_return(x)
 
-      -> { a, *b, (c, d) = 1, 2, 3, *x }.should raise_error(TypeError)
+      -> { a, *b, (c, d) = 1, 2, 3, *x }.should.raise(TypeError)
     end
 
     it "does not call #to_ary to convert an Object when the position receiving the value is a simple variable" do
@@ -733,6 +799,9 @@ describe "Multiple assignment" do
         MRHS_VALUES_1.should == 1
         MRHS_VALUES_2.should == 2
       end
+    ensure
+      VariableSpecs.send(:remove_const, :MRHS_VALUES_1)
+      VariableSpecs.send(:remove_const, :MRHS_VALUES_2)
     end
 
     it "assigns all RHS values as an array to a single LHS constant" do
@@ -740,6 +809,8 @@ describe "Multiple assignment" do
         MRHS_VALUES = 1, 2, 3
         MRHS_VALUES.should == [1, 2, 3]
       end
+    ensure
+      VariableSpecs.send(:remove_const, :MRHS_VALUES)
     end
   end
 
@@ -797,17 +868,6 @@ describe 'Local variable shadowing' do
 end
 
 describe 'Allowed characters' do
-  # new feature in 2.6 -- https://bugs.ruby-lang.org/issues/13770
-  it 'does not allow non-ASCII upcased characters at the beginning' do
-    -> do
-      eval <<-CODE
-        def test
-          ἍBB = 1
-        end
-      CODE
-    end.should raise_error(SyntaxError, /dynamic constant assignment/)
-  end
-
   it 'allows non-ASCII lowercased characters at the beginning' do
     result = nil
 
@@ -821,26 +881,25 @@ describe 'Allowed characters' do
 
     result.should == 1
   end
+
+  it 'parses a non-ASCII upcased character as a constant identifier' do
+    -> do
+      eval <<-CODE
+        def test
+          ἍBB = 1
+        end
+      CODE
+    end.should.raise(SyntaxError, /dynamic constant assignment/)
+  end
 end
 
 describe "Instance variables" do
   context "when instance variable is uninitialized" do
-    ruby_version_is ""..."3.0" do
-      it "warns about accessing uninitialized instance variable" do
-        obj = Object.new
-        def obj.foobar; a = @a; end
+    it "doesn't warn about accessing uninitialized instance variable" do
+      obj = Object.new
+      def obj.foobar; a = @a; end
 
-        -> { obj.foobar }.should complain(/warning: instance variable @a not initialized/, verbose: true)
-      end
-    end
-
-    ruby_version_is "3.0" do
-      it "doesn't warn about accessing uninitialized instance variable" do
-        obj = Object.new
-        def obj.foobar; a = @a; end
-
-        -> { obj.foobar }.should_not complain(verbose: true)
-      end
+      -> { obj.foobar }.should_not complain(verbose: true)
     end
 
     it "doesn't warn at lazy initialization" do
@@ -848,6 +907,24 @@ describe "Instance variables" do
       def obj.foobar; @a ||= 42; end
 
       -> { obj.foobar }.should_not complain(verbose: true)
+    end
+  end
+
+  describe "global variable" do
+    context "when global variable is uninitialized" do
+      it "warns about accessing uninitialized global variable in verbose mode" do
+        obj = Object.new
+        def obj.foobar; a = $specs_uninitialized_global_variable; end
+
+        -> { obj.foobar }.should complain(/warning: global variable [`']\$specs_uninitialized_global_variable' not initialized/, verbose: true)
+      end
+
+      it "doesn't warn at lazy initialization" do
+        obj = Object.new
+        def obj.foobar; $specs_uninitialized_global_variable_lazy ||= 42; end
+
+        -> { obj.foobar }.should_not complain(verbose: true)
+      end
     end
   end
 end

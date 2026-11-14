@@ -77,18 +77,22 @@ class TestDateConv < Test::Unit::TestCase
     assert_equal([2004, 9, 19, 1, 2, 3, 456789],
 		 [t.year, t.mon, t.mday, t.hour, t.min, t.sec, t.usec])
 
-    if Time.allocate.respond_to?(:nsec)
-      d = DateTime.new(2004, 9, 19, 1, 2, 3, 0) + 456789123.to_r/86400000000000
-      t = d.to_time.utc
-      assert_equal([2004, 9, 19, 1, 2, 3, 456789123],
-		   [t.year, t.mon, t.mday, t.hour, t.min, t.sec, t.nsec])
-    end
+    d = DateTime.new(1582, 10, 3, 1, 2, 3, 0) + 456789.to_r/86400000000
+    t = d.to_time.utc
+    assert_equal([1582, 10, 13, 1, 2, 3, 456789],
+		 [t.year, t.mon, t.mday, t.hour, t.min, t.sec, t.usec])
 
-    if Time.allocate.respond_to?(:subsec)
+    d = DateTime.new(2004, 9, 19, 1, 2, 3, 0) + 456789123.to_r/86400000000000
+    t = d.to_time.utc
+    assert_equal([2004, 9, 19, 1, 2, 3, 456789123],
+		 [t.year, t.mon, t.mday, t.hour, t.min, t.sec, t.nsec])
+
+    # TruffleRuby does not support more than nanoseconds
+    unless RUBY_ENGINE == 'truffleruby'
       d = DateTime.new(2004, 9, 19, 1, 2, 3, 0) + 456789123456789123.to_r/86400000000000000000000
       t = d.to_time.utc
       assert_equal([2004, 9, 19, 1, 2, 3, Rational(456789123456789123,1000000000000000000)],
-		   [t.year, t.mon, t.mday, t.hour, t.min, t.sec, t.subsec])
+                   [t.year, t.mon, t.mday, t.hour, t.min, t.sec, t.subsec])
     end
   end
 
@@ -100,10 +104,14 @@ class TestDateConv < Test::Unit::TestCase
     t = Time.utc(2004, 9, 19, 1, 2, 3, 456789)
     d = t.to_date
     assert_equal([2004, 9, 19, 0], [d.year, d.mon, d.mday, d.day_fraction])
+
+    t = Time.utc(1582, 10, 13, 1, 2, 3, 456789)
+    d = t.to_date # using ITALY
+    assert_equal([1582, 10, 3, 0], [d.year, d.mon, d.mday, d.day_fraction])
   end
 
   def test_to_date__from_date
-    d = Date.new(2004, 9, 19) + 1.to_r/2
+    d = assert_deprecated_warn(/fractional day/) { Date.new(2004, 9, 19) + 1.to_r/2 }
     d2 = d.to_date
     assert_equal([2004, 9, 19, 1.to_r/2],
 		 [d2.year, d2.mon, d2.mday, d2.day_fraction])
@@ -136,6 +144,14 @@ class TestDateConv < Test::Unit::TestCase
 		 [d.year, d.mon, d.mday, d.hour, d.min, d.sec,
 		  d.sec_fraction, d.offset])
 
+    t = Time.utc(1582, 10, 13, 1, 2, 3, 456789)
+    d = t.to_datetime # using ITALY
+    assert_equal([1582, 10, 3, 1, 2, 3,
+		  456789.to_r/1000000,
+		  0],
+		 [d.year, d.mon, d.mday, d.hour, d.min, d.sec,
+		  d.sec_fraction, d.offset])
+
     t = Time.now
     d = t.to_datetime
     require 'time'
@@ -143,7 +159,7 @@ class TestDateConv < Test::Unit::TestCase
   end
 
   def test_to_datetime__from_date
-    d = Date.new(2004, 9, 19) + 1.to_r/2
+    d = assert_deprecated_warn(/fractional day/) { Date.new(2004, 9, 19) + 1.to_r/2 }
     d2 = d.to_datetime
     assert_equal([2004, 9, 19, 0, 0, 0, 0, 0],
 		 [d2.year, d2.mon, d2.mday, d2.hour, d2.min, d2.sec,

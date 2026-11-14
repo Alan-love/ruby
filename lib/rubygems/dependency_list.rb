@@ -1,12 +1,12 @@
 # frozen_string_literal: true
+
 #--
 # Copyright 2006 by Chad Fowler, Rich Kilmer, Jim Weirich and others.
 # All rights reserved.
 # See LICENSE.txt for permissions.
 #++
 
-require_relative 'tsort'
-require_relative 'deprecate'
+require_relative "vendored_tsort"
 
 ##
 # Gem::DependencyList is used for installing and uninstalling gems in the
@@ -104,7 +104,7 @@ class Gem::DependencyList
   end
 
   def inspect # :nodoc:
-    "%s %p>" % [super[0..-2], map {|s| s.full_name }]
+    format("%s %p>", super[0..-2], map(&:full_name))
   end
 
   ##
@@ -119,11 +119,11 @@ class Gem::DependencyList
     each do |spec|
       spec.runtime_dependencies.each do |dep|
         inst = Gem::Specification.any? do |installed_spec|
-          dep.name == installed_spec.name and
-            dep.requirement.satisfied_by? installed_spec.version
+          dep.name == installed_spec.name &&
+            dep.requirement.satisfied_by?(installed_spec.version)
         end
 
-        unless inst or @specs.find {|s| s.satisfies_requirement? dep }
+        unless inst || @specs.find {|s| s.satisfies_requirement? dep }
           unsatisfied[spec.name] << dep
           return unsatisfied if quick
         end
@@ -139,7 +139,7 @@ class Gem::DependencyList
   # If removing the gemspec creates breaks a currently ok dependency, then it
   # is NOT ok to remove the gemspec.
 
-  def ok_to_remove?(full_name, check_dev=true)
+  def ok_to_remove?(full_name, check_dev = true)
     gem_to_remove = find_name full_name
 
     # If the state is inconsistent, at least don't crash
@@ -168,18 +168,6 @@ class Gem::DependencyList
   end
 
   ##
-  # Remove everything in the DependencyList that matches but doesn't
-  # satisfy items in +dependencies+ (a hash of gem names to arrays of
-  # dependencies).
-
-  def remove_specs_unsatisfied_by(dependencies)
-    specs.reject! do |spec|
-      dep = dependencies[spec.name]
-      dep and not dep.requirement.satisfied_by? spec.version
-    end
-  end
-
-  ##
   # Removes the gemspec matching +full_name+ from the dependency list
 
   def remove_by_name(full_name)
@@ -189,6 +177,8 @@ class Gem::DependencyList
   ##
   # Return a hash of predecessors.  <tt>result[spec]</tt> is an Array of
   # gemspecs that have a dependency satisfied by the named gemspec.
+  #--
+  # Unused within RubyGems but kept for contrast-agent, which still calls it.
 
   def spec_predecessors
     result = Hash.new {|h,k| h[k] = [] }

@@ -1,33 +1,32 @@
 # frozen_string_literal: true
-require_relative '../rubygems'
-require_relative 'dependency_list'
-require_relative 'package'
-require_relative 'installer'
-require_relative 'spec_fetcher'
-require_relative 'user_interaction'
-require_relative 'available_set'
-require_relative 'deprecate'
+
+require_relative "../rubygems"
+require_relative "cooldown"
+require_relative "dependency_list"
+require_relative "package"
+require_relative "installer"
+require_relative "spec_fetcher"
+require_relative "user_interaction"
+require_relative "available_set"
 
 ##
 # Installs a gem along with all its dependencies from local and remote gems.
 
 class Gem::DependencyInstaller
   include Gem::UserInteraction
-  extend Gem::Deprecate
 
   DEFAULT_OPTIONS = { # :nodoc:
-    :env_shebang         => false,
-    :document            => %w[ri],
-    :domain              => :both, # HACK dup
-    :force               => false,
-    :format_executable   => false, # HACK dup
-    :ignore_dependencies => false,
-    :prerelease          => false,
-    :security_policy     => nil, # HACK NoSecurity requires OpenSSL. AlmostNo? Low?
-    :wrappers            => true,
-    :build_args          => nil,
-    :build_docs_in_background => false,
-    :install_as_default => false,
+    env_shebang: false,
+    document: %w[ri],
+    domain: :both, # HACK: dup
+    force: false,
+    format_executable: false, # HACK: dup
+    ignore_dependencies: false,
+    prerelease: false,
+    security_policy: nil, # HACK: NoSecurity requires OpenSSL. AlmostNo? Low?
+    wrappers: true,
+    build_args: nil,
+    build_docs_in_background: false,
   }.freeze
 
   ##
@@ -44,6 +43,12 @@ class Gem::DependencyInstaller
   # List of gems installed by #install in alphabetic order
 
   attr_reader :installed_gems
+
+  ##
+  # Per-gem summary entries for the newest versions the cooldown kept out
+  # of the last resolution.  See Gem::Cooldown.output_skipped_summary.
+
+  attr_reader :cooldown_skipped
 
   ##
   # Creates a new installer instance.
@@ -65,7 +70,7 @@ class Gem::DependencyInstaller
   # :build_args:: See Gem::Installer::new
 
   def initialize(options = {})
-    @only_install_dir = !!options[:install_dir]
+    @only_install_dir = !options[:install_dir].nil?
     @install_dir = options[:install_dir] || Gem.dir
     @build_root = options[:build_root]
 
@@ -85,11 +90,15 @@ class Gem::DependencyInstaller
     @user_install        = options[:user_install]
     @wrappers            = options[:wrappers]
     @build_args          = options[:build_args]
+    @build_jobs          = options[:build_jobs]
     @build_docs_in_background = options[:build_docs_in_background]
-    @install_as_default = options[:install_as_default]
     @dir_mode = options[:dir_mode]
     @data_mode = options[:data_mode]
     @prog_mode = options[:prog_mode]
+    @build_extension = options[:build_extension]
+    @install_plugin = options[:install_plugin]
+    @cooldown = Gem::Cooldown.from_options options
+    @cooldown_skipped = []
 
     # Indicates that we should not try to update any deps unless
     # we absolutely must.
@@ -109,7 +118,7 @@ class Gem::DependencyInstaller
   # gems should be considered.
 
   def consider_local?
-    @domain == :both or @domain == :local
+    @domain == :both || @domain == :local
   end
 
   ##
@@ -117,87 +126,12 @@ class Gem::DependencyInstaller
   # gems should be considered.
 
   def consider_remote?
-    @domain == :both or @domain == :remote
+    @domain == :both || @domain == :remote
   end
-
-  ##
-  # Returns a list of pairs of gemspecs and source_uris that match
-  # Gem::Dependency +dep+ from both local (Dir.pwd) and remote (Gem.sources)
-  # sources.  Gems are sorted with newer gems preferred over older gems, and
-  # local gems preferred over remote gems.
-
-  def find_gems_with_sources(dep, best_only=false) # :nodoc:
-    set = Gem::AvailableSet.new
-
-    if consider_local?
-      sl = Gem::Source::Local.new
-
-      if spec = sl.find_gem(dep.name)
-        if dep.matches_spec? spec
-          set.add spec, sl
-        end
-      end
-    end
-
-    if consider_remote?
-      begin
-        # This is pulled from #spec_for_dependency to allow
-        # us to filter tuples before fetching specs.
-        tuples, errors = Gem::SpecFetcher.fetcher.search_for_dependency dep
-
-        if best_only && !tuples.empty?
-          tuples.sort! do |a,b|
-            if b[0].version == a[0].version
-              if b[0].platform != Gem::Platform::RUBY
-                1
-              else
-                -1
-              end
-            else
-              b[0].version <=> a[0].version
-            end
-          end
-          tuples = [tuples.first]
-        end
-
-        specs = []
-        tuples.each do |tup, source|
-          begin
-            spec = source.fetch_spec(tup)
-          rescue Gem::RemoteFetcher::FetchError => e
-            errors << Gem::SourceFetchProblem.new(source, e)
-          else
-            specs << [spec, source]
-          end
-        end
-
-        if @errors
-          @errors += errors
-        else
-          @errors = errors
-        end
-
-        set << specs
-
-      rescue Gem::RemoteFetcher::FetchError => e
-        # FIX if there is a problem talking to the network, we either need to always tell
-        # the user (no really_verbose) or fail hard, not silently tell them that we just
-        # couldn't find their requested gem.
-        verbose do
-          "Error fetching remote data:\t\t#{e.message}\n" \
-            "Falling back to local-only install"
-        end
-        @domain = :local
-      end
-    end
-
-    set
-  end
-  rubygems_deprecate :find_gems_with_sources
 
   def in_background(what) # :nodoc:
     fork_happened = false
-    if @build_docs_in_background and Process.respond_to?(:fork)
+    if @build_docs_in_background && Process.respond_to?(:fork)
       begin
         Process.fork do
           yield
@@ -230,22 +164,24 @@ class Gem::DependencyInstaller
     @installed_gems = []
 
     options = {
-      :bin_dir             => @bin_dir,
-      :build_args          => @build_args,
-      :document            => @document,
-      :env_shebang         => @env_shebang,
-      :force               => @force,
-      :format_executable   => @format_executable,
-      :ignore_dependencies => @ignore_dependencies,
-      :prerelease          => @prerelease,
-      :security_policy     => @security_policy,
-      :user_install        => @user_install,
-      :wrappers            => @wrappers,
-      :build_root          => @build_root,
-      :install_as_default  => @install_as_default,
-      :dir_mode            => @dir_mode,
-      :data_mode           => @data_mode,
-      :prog_mode           => @prog_mode,
+      bin_dir: @bin_dir,
+      build_args: @build_args,
+      build_jobs: @build_jobs,
+      document: @document,
+      env_shebang: @env_shebang,
+      force: @force,
+      format_executable: @format_executable,
+      ignore_dependencies: @ignore_dependencies,
+      prerelease: @prerelease,
+      security_policy: @security_policy,
+      user_install: @user_install,
+      wrappers: @wrappers,
+      build_root: @build_root,
+      dir_mode: @dir_mode,
+      data_mode: @data_mode,
+      prog_mode: @prog_mode,
+      build_extension: @build_extension,
+      install_plugin: @install_plugin,
     }
     options[:install_dir] = @install_dir if @only_install_dir
 
@@ -267,39 +203,28 @@ class Gem::DependencyInstaller
     @installed_gems
   end
 
-  def install_development_deps # :nodoc:
-    if @development and @dev_shallow
-      :shallow
-    elsif @development
-      :all
-    else
-      :none
-    end
-  end
-
   def resolve_dependencies(dep_or_name, version) # :nodoc:
     request_set = Gem::RequestSet.new
     request_set.development         = @development
     request_set.development_shallow = @dev_shallow
     request_set.soft_missing = @force
     request_set.prerelease = @prerelease
+    request_set.cooldown = @cooldown
 
     installer_set = Gem::Resolver::InstallerSet.new @domain
     installer_set.ignore_installed = (@minimal_deps == false) || @only_install_dir
     installer_set.force = @force
 
     if consider_local?
-      if dep_or_name =~ /\.gem$/ and File.file? dep_or_name
+      if dep_or_name =~ /\.gem$/ && File.file?(dep_or_name)
         src = Gem::Source::SpecificFile.new dep_or_name
         installer_set.add_local dep_or_name, src.spec, src
         version = src.spec.version if version == Gem::Requirement.default
-      elsif dep_or_name =~ /\.gem$/
+      elsif dep_or_name =~ /\.gem$/ # rubocop:disable Performance/RegexpMatch
         Dir[dep_or_name].each do |name|
-          begin
-            src = Gem::Source::SpecificFile.new name
-            installer_set.add_local dep_or_name, src.spec, src
-          rescue Gem::Package::FormatError
-          end
+          src = Gem::Source::SpecificFile.new name
+          installer_set.add_local dep_or_name, src.spec, src
+        rescue Gem::Package::FormatError
         end
         # else This is a dependency. InstallerSet handles this case
       end
@@ -333,6 +258,7 @@ class Gem::DependencyInstaller
     request_set.resolve installer_set
 
     @errors.concat request_set.errors
+    @cooldown_skipped = request_set.resolver&.cooldown_skipped || []
 
     request_set
   end

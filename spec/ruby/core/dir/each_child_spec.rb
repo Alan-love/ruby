@@ -15,13 +15,6 @@ describe "Dir.each_child" do
     dirs.each {|dir| dir.encoding.should == Encoding::UTF_8}
   end
 
-  ruby_version_is ""..."2.7" do
-    it "accepts nil options" do
-      dirs = Dir.each_child("#{DirSpecs.mock_dir}/deeply/nested", nil).to_a.sort
-      dirs.each {|dir| dir.encoding.should == Encoding.find("filesystem")}
-    end
-  end
-
   it "yields all names in an existing directory to the provided block" do
     a, b = [], []
 
@@ -43,12 +36,12 @@ describe "Dir.each_child" do
   end
 
   it "raises a SystemCallError if passed a nonexistent directory" do
-    -> { Dir.each_child(DirSpecs.nonexistent) {} }.should raise_error(SystemCallError)
+    -> { Dir.each_child(DirSpecs.nonexistent) {} }.should.raise(SystemCallError)
   end
 
   describe "when no block is given" do
     it "returns an Enumerator" do
-      Dir.each_child(DirSpecs.mock_dir).should be_an_instance_of(Enumerator)
+      Dir.each_child(DirSpecs.mock_dir).should.instance_of?(Enumerator)
       Dir.each_child(DirSpecs.mock_dir).to_a.sort.should == DirSpecs.expected_paths - %w[. ..]
     end
 
@@ -93,11 +86,24 @@ describe "Dir#each_child" do
     @dir.each_child { |f| f }.should == @dir
   end
 
+  it "returns the same result when called repeatedly" do
+    @dir = Dir.open DirSpecs.mock_dir
+
+    a = []
+    @dir.each {|dir| a << dir}
+
+    b = []
+    @dir.each {|dir| b << dir}
+
+    a.sort.should == b.sort
+    a.sort.should == DirSpecs.expected_paths
+  end
+
   describe "when no block is given" do
     it "returns an Enumerator" do
       @dir = Dir.new(DirSpecs.mock_dir)
 
-      @dir.each_child.should be_an_instance_of(Enumerator)
+      @dir.each_child.should.instance_of?(Enumerator)
       @dir.each_child.to_a.sort.should == DirSpecs.expected_paths - %w|. ..|
     end
 

@@ -10,6 +10,12 @@ describe "Dir.glob" do
   it_behaves_like :dir_glob_recursive, :glob
 end
 
+ruby_version_is "4.1" do
+  describe "Dir.glob" do
+    it_behaves_like :dir_glob_recursive_symlinks, :glob
+  end
+end
+
 describe "Dir.glob" do
   before :each do
     DirSpecs.create_mock_dirs
@@ -67,6 +73,14 @@ describe "Dir.glob" do
     Dir.glob('**', File::FNM_DOTMATCH).sort.should == DirSpecs.expected_glob_paths
   end
 
+  it "accepts the flags keyword argument as an alternative to the positional argument" do
+    Dir.glob('**', flags: File::FNM_DOTMATCH).sort.should == DirSpecs.expected_glob_paths
+  end
+
+  it "prefers the keyword argument over the positional flag argument" do
+    Dir.glob('**', :ignored, flags: File::FNM_DOTMATCH).sort.should == DirSpecs.expected_glob_paths
+  end
+
   it "recursively matches any subdirectories except './' or '../' with '**/' from the current directory and option File::FNM_DOTMATCH" do
     expected = %w[
       .dotsubdir/
@@ -79,6 +93,7 @@ describe "Dir.glob" do
       nested/
       nested/.dotsubir/
       special/
+      special/test\ +()[]{}/
       special/test{1}/
       special/{}/
       subdir_one/
@@ -88,31 +103,15 @@ describe "Dir.glob" do
     Dir.glob('**/', File::FNM_DOTMATCH).sort.should == expected
   end
 
-  ruby_version_is ''...'3.1' do
-    it "recursively matches files and directories in nested dot subdirectory with 'nested/**/*' from the current directory and option File::FNM_DOTMATCH" do
-      expected = %w[
-        nested/.
-        nested/.dotsubir
-        nested/.dotsubir/.
-        nested/.dotsubir/.dotfile
-        nested/.dotsubir/nondotfile
-      ]
+  it "recursively matches files and directories in nested dot subdirectory except . with 'nested/**/*' from the current directory and option File::FNM_DOTMATCH" do
+    expected = %w[
+      nested/.
+      nested/.dotsubir
+      nested/.dotsubir/.dotfile
+      nested/.dotsubir/nondotfile
+    ]
 
-      Dir.glob('nested/**/*', File::FNM_DOTMATCH).sort.should == expected.sort
-    end
-  end
-
-  ruby_version_is '3.1' do
-    it "recursively matches files and directories in nested dot subdirectory except . with 'nested/**/*' from the current directory and option File::FNM_DOTMATCH" do
-      expected = %w[
-       nested/.
-       nested/.dotsubir
-       nested/.dotsubir/.dotfile
-       nested/.dotsubir/nondotfile
-     ]
-
-      Dir.glob('nested/**/*', File::FNM_DOTMATCH).sort.should == expected.sort
-    end
+    Dir.glob('nested/**/*', File::FNM_DOTMATCH).sort.should == expected.sort
   end
 
   # This is a separate case to check **/ coming after a constant
@@ -130,6 +129,7 @@ describe "Dir.glob" do
       ./nested/
       ./nested/.dotsubir/
       ./special/
+      ./special/test\ +()[]{}/
       ./special/test{1}/
       ./special/{}/
       ./subdir_one/
@@ -163,7 +163,7 @@ describe "Dir.glob" do
   it "accepts a block and yields it with each elements" do
     ary = []
     ret = Dir.glob(["file_o*", "file_t*"]) { |t| ary << t }
-    ret.should be_nil
+    ret.should == nil
     ary.should == %w!file_one.ext file_two.ext!
   end
 
@@ -178,6 +178,131 @@ describe "Dir.glob" do
 
   it "handles infinite directory wildcards" do
     Dir.glob('**/**/**').should_not.empty?
+  end
+
+  it "handles **/** with base keyword argument" do
+    Dir.glob('**/**', base: "dir").should == ["filename_ordering"]
+
+    expected = %w[
+      nested
+      nested/directory
+      nested/directory/structure
+      nested/directory/structure/bar
+      nested/directory/structure/baz
+      nested/directory/structure/file_one
+      nested/directory/structure/file_one.ext
+      nested/directory/structure/foo
+      nondotfile
+    ].sort
+
+    Dir.glob('**/**', base: "deeply").sort.should == expected
+  end
+
+  it "handles **/ with base keyword argument" do
+    expected = %w[
+      /
+      directory/
+      directory/structure/
+    ]
+    Dir.glob('**/', base: "deeply/nested").sort.should == expected
+  end
+
+  it "handles **/nondotfile with base keyword argument" do
+    expected = %w[
+      deeply/nondotfile
+      nondotfile
+      subdir_one/nondotfile
+      subdir_two/nondotfile
+    ]
+    Dir.glob('**/nondotfile', base: ".").sort.should == expected
+  end
+
+  it "handles **/nondotfile with base keyword argument and FNM_DOTMATCH" do
+    expected = %w[
+      .dotsubdir/nondotfile
+      deeply/nondotfile
+      nested/.dotsubir/nondotfile
+      nondotfile
+      subdir_one/nondotfile
+      subdir_two/nondotfile
+    ]
+    Dir.glob('**/nondotfile', File::FNM_DOTMATCH, base: ".").sort.should == expected
+  end
+
+  it "handles **/.dotfile with base keyword argument" do
+    expected = %w[
+      .dotfile
+      deeply/.dotfile
+      subdir_one/.dotfile
+    ]
+    Dir.glob('**/.dotfile', base: ".").sort.should == expected
+  end
+
+  it "handles **/.dotfile with base keyword argument and FNM_DOTMATCH" do
+    expected = %w[
+      .dotfile
+      .dotsubdir/.dotfile
+      deeply/.dotfile
+      nested/.dotsubir/.dotfile
+      subdir_one/.dotfile
+    ]
+    Dir.glob('**/.dotfile', File::FNM_DOTMATCH, base: ".").sort.should == expected
+  end
+
+  it "handles **/.* with base keyword argument" do
+    expected = %w[
+      .dotfile.ext
+      directory/structure/.ext
+    ].sort
+
+    Dir.glob('**/.*', base: "deeply/nested").sort.should == expected
+  end
+
+  it "handles **/.* with base keyword argument and FNM_DOTMATCH" do
+    expected = %w[
+      .
+      .dotfile.ext
+      directory/structure/.ext
+    ].sort
+
+    Dir.glob('**/.*', File::FNM_DOTMATCH, base: "deeply/nested").sort.should == expected
+  end
+
+  it "handles **/** with base keyword argument and FNM_DOTMATCH" do
+    expected = %w[
+      .
+      .dotfile.ext
+      directory
+      directory/structure
+      directory/structure/.ext
+      directory/structure/bar
+      directory/structure/baz
+      directory/structure/file_one
+      directory/structure/file_one.ext
+      directory/structure/foo
+    ].sort
+
+    Dir.glob('**/**', File::FNM_DOTMATCH, base: "deeply/nested").sort.should == expected
+  end
+
+  it "handles **/*pattern* with base keyword argument and FNM_DOTMATCH" do
+    expected = %w[
+      .dotfile.ext
+      directory/structure/file_one
+      directory/structure/file_one.ext
+    ]
+
+    Dir.glob('**/*file*', File::FNM_DOTMATCH, base: "deeply/nested").sort.should == expected
+  end
+
+  it "handles **/glob with base keyword argument and FNM_EXTGLOB" do
+    expected = %w[
+      directory/structure/bar
+      directory/structure/file_one
+      directory/structure/file_one.ext
+    ]
+
+    Dir.glob('**/*{file,bar}*', File::FNM_EXTGLOB, base: "deeply/nested").sort.should == expected
   end
 
   it "handles simple filename patterns" do
@@ -222,5 +347,35 @@ describe "Dir.glob" do
         Dir.rmdir('no_permission')
       end
     end
+
+    it "will follow symlinks when processing a `*/` pattern." do
+      expected = ['special/ln/nondotfile']
+      Dir.glob('special/*/nondotfile').should == expected
+    end
+
+    it "will not follow symlinks when recursively traversing directories" do
+      expected = %w[
+        deeply/nondotfile
+        nondotfile
+        subdir_one/nondotfile
+        subdir_two/nondotfile
+      ]
+      Dir.glob('**/nondotfile').sort.should == expected
+    end
+
+    it "will follow symlinks when testing directory after recursive directory in pattern" do
+      expected = %w[
+        deeply/nondotfile
+        special/ln/nondotfile
+        subdir_one/nondotfile
+        subdir_two/nondotfile
+      ]
+      Dir.glob('**/*/nondotfile').sort.should == expected
+    end
+  end
+
+  it "preserves the encoding of the path" do
+    pattern = "file_one.ext".encode(Encoding::EUC_JP)
+    Dir.glob(pattern).first.encoding.should == Encoding::EUC_JP
   end
 end

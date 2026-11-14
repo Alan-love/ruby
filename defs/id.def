@@ -2,11 +2,14 @@
 firstline, predefined = __LINE__+1, %[\
   max
   min
+  hash
   freeze
   nil?
   inspect
   intern
   object_id
+  __id__
+  const_added
   const_missing
   method_missing                                        MethodMissing
   method_added
@@ -15,7 +18,9 @@ firstline, predefined = __LINE__+1, %[\
   singleton_method_removed
   method_undefined
   singleton_method_undefined
+  new
   length
+  capacity
   size
   gets
   succ
@@ -24,8 +29,8 @@ firstline, predefined = __LINE__+1, %[\
   lambda
   send
   __send__
-  __attached__
   __recursive_key__
+  clone
   initialize
   initialize_copy
   initialize_clone
@@ -45,6 +50,7 @@ firstline, predefined = __LINE__+1, %[\
   bt
   bt_locations
   call
+  yield
   mesg
   exception
   locals
@@ -57,6 +63,13 @@ firstline, predefined = __LINE__+1, %[\
   quo
   name
   nil
+  path
+  pack
+  buffer
+  include?
+  aborted
+  exited
+  encoding
 
   _                                                     UScore
 
@@ -70,10 +83,13 @@ firstline, predefined = __LINE__+1, %[\
   _7  NUMPARAM_7
   _8  NUMPARAM_8
   _9  NUMPARAM_9
+  <it>  ItImplicit
+  it    It
 
   "/*NULL*/"                                            NULL
   empty?
   eql?
+  default
   respond_to?                                           Respond_to
   respond_to_missing?                                   Respond_to_missing
   <IFUNC>
@@ -83,9 +99,12 @@ firstline, predefined = __LINE__+1, %[\
   core#undef_method
   core#define_method
   core#define_singleton_method
+  core#iseq_path
   core#set_postexe
   core#hash_merge_ptr
+  core#hash_merge_bang_ptr
   core#hash_merge_kwd
+  core#hash_merge_bang_kwd
   core#raise
   core#sprintf
 
@@ -94,6 +113,8 @@ firstline, predefined = __LINE__+1, %[\
   $_                                                    LASTLINE
   $~                                                    BACKREF
   $!                                                    ERROR_INFO
+
+  Ruby
 ]
 
 # VM ID         OP      Parser Token
@@ -193,13 +214,14 @@ predefined.split(/^/).each_with_index do |line, num|
   end << token
   predefined_ids[token] = name
 end
+index = 127
 token_ops.split(/^/).each do |line|
   next if /^#/ =~ line
   line.sub!(/\s+#.*/, '')
   id, op, token = line.split
   next unless id and op
   token ||= (id unless /\A\W\z/ =~ op)
-  token_op_ids << [id, op, token]
+  token_op_ids << [id, op, token, (index += 1 if token)]
 end
 {
   "LOCAL" => local_ids,
@@ -211,4 +233,5 @@ end
   :preserved => preserved_ids,
   :predefined => predefined_ids,
   :token_op => token_op_ids,
+  :last_token => index,
 }

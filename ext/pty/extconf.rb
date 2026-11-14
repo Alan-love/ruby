@@ -3,19 +3,25 @@ require 'mkmf'
 
 $INCFLAGS << " -I$(topdir) -I$(top_srcdir)"
 
-if /mswin|mingw|bccwin/ !~ RUBY_PLATFORM
+if /mswin|mingw/ !~ RUBY_PLATFORM
   have_header("sys/stropts.h")
   have_func("setresuid")
   have_header("libutil.h")
-  have_header("util.h") # OpenBSD openpty
   have_header("pty.h")
   have_header("pwd.h")
-  util = have_library("util", "openpty")
-  if have_func("posix_openpt") or
+  if /openbsd/ =~ RUBY_PLATFORM
+    have_header("util.h") # OpenBSD openpty
+    util = have_library("util", "openpty")
+  end
+  openpt = have_func("posix_openpt")
+  if openpt
+    have_func("ptsname_r") or have_func("ptsname")
+  end
+  if openpt or
       (util or have_func("openpty")) or
-      have_func("_getpty") or
-      have_func("ptsname") or
       have_func("ioctl")
+    have_macro("HAVE_FCHMOD") or have_func("fchmod")
+    have_macro("HAVE_FCHOWN") or have_func("fchown")
     create_makefile('pty')
   end
 end

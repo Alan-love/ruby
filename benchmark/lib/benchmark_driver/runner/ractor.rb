@@ -87,7 +87,7 @@ __bmdv_ractors << Ractor.new(__bmdv_loop_after - __bmdv_loop_before) { |__bmdv_l
 <% end %>
 
 # Wait for all Ractors before executing code to write results
-__bmdv_ractors.map!(&:take)
+__bmdv_ractors.map!(&:value)
 
 <% results.each do |result| %>
 File.write(<%= result.dump %>, __bmdv_ractors.shift)
@@ -100,7 +100,7 @@ File.write(<%= result.dump %>, __bmdv_ractors.shift)
     private
 
     # id is to prevent:
-    # can not isolate a Proc because it accesses outer variables (__bmdv_i)
+    # cannot make a shareable Proc because the outer variable '__bmdv_i' may be reassigned.
     def while_loop(content, times, id:)
       if !times.is_a?(Integer) || times <= 0
         raise ArgumentError.new("Unexpected times: #{times.inspect}")

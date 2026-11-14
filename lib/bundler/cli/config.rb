@@ -2,17 +2,17 @@
 
 module Bundler
   class CLI::Config < Thor
-    class_option :parseable, :type => :boolean, :banner => "Use minimal formatting for more parseable output"
+    class_option :parseable, type: :boolean, banner: "Use minimal formatting for more parseable output"
 
     def self.scope_options
-      method_option :global, :type => :boolean, :banner => "Only change the global config"
-      method_option :local, :type => :boolean, :banner => "Only change the local config"
+      method_option :global, type: :boolean, banner: "Only change the global config"
+      method_option :local, type: :boolean, banner: "Only change the local config"
     end
     private_class_method :scope_options
 
-    desc "base NAME [VALUE]", "The Bundler 1 config interface", :hide => true
+    desc "base NAME [VALUE]", "The Bundler 1 config interface", hide: true
     scope_options
-    method_option :delete, :type => :boolean, :banner => "delete"
+    method_option :delete, type: :boolean, banner: "delete"
     def base(name = nil, *value)
       new_args =
         if ARGV.size == 1
@@ -25,8 +25,8 @@ module Bundler
           ["config", "get", ARGV[1]]
         end
 
-      SharedHelpers.major_deprecation 3,
-        "Using the `config` command without a subcommand [list, get, set, unset] is deprecated and will be removed in the future. Use `bundle #{new_args.join(" ")}` instead."
+      message = "Using the `config` command without a subcommand [list, get, set, unset] is deprecated and will be removed in the future. Use `bundle #{new_args.join(" ")}` instead."
+      SharedHelpers.feature_deprecated! message
 
       Base.new(options, name, value, self).run
     end
@@ -87,16 +87,21 @@ module Bundler
 
         if value.nil?
           warn_unused_scope "Ignoring --#{scope} since no value to set was given"
+          current_value = Bundler.settings[name]
 
           if options[:parseable]
             if value = Bundler.settings[name]
               Bundler.ui.info("#{name}=#{value}")
             end
-            return
+          else
+            confirm(name)
           end
 
-          confirm(name)
-          return
+          if current_value.nil? && !Bundler.settings.stored_outside_config_files?(name)
+            exit 1
+          else
+            return
+          end
         end
 
         Bundler.ui.info(message) if message
@@ -106,6 +111,8 @@ module Bundler
       def confirm_all
         if @options[:parseable]
           thor.with_padding do
+            # --parseable output is fed back to `bundle config set`, where a
+            # placeholder would be read back as the credential itself.
             Bundler.settings.all.each do |setting|
               val = Bundler.settings[setting]
               Bundler.ui.info "#{setting}=#{val}"
@@ -113,7 +120,7 @@ module Bundler
           end
         else
           Bundler.ui.confirm "Settings are listed in order of priority. The top value will be used.\n"
-          Bundler.settings.all.each do |setting|
+          Bundler.settings.all_including_stored_credentials.each do |setting|
             Bundler.ui.confirm setting
             show_pretty_values_for(setting)
             Bundler.ui.confirm ""
@@ -180,7 +187,7 @@ module Bundler
         scopes = %w[global local].select {|s| options[s] }
         case scopes.size
         when 0
-          @scope = "global"
+          @scope = inside_app? ? "local" : "global"
           @explicit_scope = false
         when 1
           @scope = scopes.first
@@ -188,6 +195,15 @@ module Bundler
           raise InvalidOption,
             "The options #{scopes.join " and "} were specified. Please only use one of the switches at a time."
         end
+      end
+
+      private
+
+      def inside_app?
+        Bundler.root
+        true
+      rescue GemfileNotFound
+        false
       end
     end
   end

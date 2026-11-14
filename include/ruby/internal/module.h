@@ -56,8 +56,8 @@ RBIMPL_ATTR_NONNULL(())
  * @post       Top-level constant named `name` refers the returned class.
  * @note       If a class named `name` is already defined and its superclass is
  *             `super`, the function just returns the defined class.
- * @note       The  compaction  GC  does  not move  classes  returned  by  this
- *             function.
+ * @note       The GC does not collect nor move classes returned by this
+ *             function. They are immortal.
  *
  * @internal
  *
@@ -65,6 +65,8 @@ RBIMPL_ATTR_NONNULL(())
  * use other ways to create one.
  */
 VALUE rb_define_class(const char *name, VALUE super);
+
+#define rb_define_class(name, super) rb_define_class_id_under(rb_cObject, rb_intern_const((name)), (super))
 
 RBIMPL_ATTR_NONNULL(())
 /**
@@ -75,8 +77,8 @@ RBIMPL_ATTR_NONNULL(())
  *                            constant is not a module.
  * @return     The created module.
  * @post       Top-level constant named `name` refers the returned module.
- * @note       The  compaction  GC  does  not move  classes  returned  by  this
- *             function.
+ * @note       The GC does not collect nor move modules returned by this
+ *             function. They are immortal.
  *
  * @internal
  *
@@ -84,6 +86,8 @@ RBIMPL_ATTR_NONNULL(())
  * use other ways to create one.
  */
 VALUE rb_define_module(const char *name);
+
+#define rb_define_module(name) rb_define_module_id_under(rb_cObject, rb_intern_const((name)))
 
 RBIMPL_ATTR_NONNULL(())
 /**
@@ -103,10 +107,12 @@ RBIMPL_ATTR_NONNULL(())
  * @post        `outer::name` refers the returned class.
  * @note        If a class  named `name` is already defined  and its superclass
  *              is `super`, the function just returns the defined class.
- * @note        The  compaction  GC does  not  move  classes returned  by  this
- *              function.
+ * @note        The GC does not collect nor move classes returned by this
+ *              function. They are immortal.
  */
 VALUE rb_define_class_under(VALUE outer, const char *name, VALUE super);
+
+#define rb_define_class_under(outer, name, super) rb_define_class_id_under((outer), rb_intern_const((name)), (super))
 
 RBIMPL_ATTR_NONNULL(())
 /**
@@ -118,10 +124,12 @@ RBIMPL_ATTR_NONNULL(())
  *                             the constant is not a class.
  * @return      The created module.
  * @post        `outer::name` refers the returned module.
- * @note        The  compaction  GC does  not  move  classes returned  by  this
- *              function.
+ * @note        The GC does not collect nor move modules returned by this
+ *              function. They are immortal.
  */
 VALUE rb_define_module_under(VALUE outer, const char *name);
+
+#define rb_define_module_under(outer, name) rb_define_module_id_under((outer), rb_intern_const((name)))
 
 /**
  * Includes a module to a class.

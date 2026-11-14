@@ -1,6 +1,10 @@
 require_relative '../../spec_helper'
 
 describe "Kernel#__dir__" do
+  it "is a private method" do
+    Kernel.private_instance_methods(false).should.include?(:__dir__)
+  end
+
   it "returns the real name of the directory containing the currently-executing file" do
     __dir__.should == File.realpath(File.dirname(__FILE__))
   end
@@ -19,19 +23,15 @@ describe "Kernel#__dir__" do
     end
   end
 
-  ruby_version_is ""..."3.0" do
-    context "when used in eval with top level binding" do
-      it "returns the real name of the directory containing the currently-executing file" do
-        eval("__dir__", binding).should == File.realpath(File.dirname(__FILE__))
-      end
+  context "when used in eval with top level binding" do
+    it "returns nil" do
+      eval("__dir__", binding).should == nil
     end
   end
+end
 
-  ruby_version_is "3.0" do
-    context "when used in eval with top level binding" do
-      it "returns nil" do
-        eval("__dir__", binding).should == nil
-      end
-    end
+describe "Kernel.__dir__" do
+  it "is a public method" do
+    Kernel.public_methods(false).should.include?(:__dir__)
   end
 end

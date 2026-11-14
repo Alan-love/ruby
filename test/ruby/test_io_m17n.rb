@@ -404,8 +404,17 @@ EOT
   end
 
   def test_stdin
-    assert_equal(Encoding.default_external, STDIN.external_encoding)
-    assert_equal(nil, STDIN.internal_encoding)
+    encoding = Encoding.default_external
+    internal = nil
+    if /mswin|mingw/ =~ RUBY_PLATFORM and STDIN.tty?
+      # Interactive console input on Windows is read in the locale (console
+      # code page) encoding and transcoded to the default external encoding.
+      encoding = Encoding.find("locale")
+      internal = Encoding.default_internal || Encoding.default_external
+      internal = nil if internal == encoding
+    end
+    assert_equal(encoding, STDIN.external_encoding)
+    assert_equal(internal, STDIN.internal_encoding)
   end
 
   def test_stdout
@@ -868,6 +877,17 @@ EOT
          proc {|r| assert_equal("\xa4\xa2\xa4\xa4\xa4\xa6\n".force_encoding("euc-jp"), r.gets(9)) })
   end
 
+  def test_gets_rs_char_boundary
+    str = "\xa2\xa4\xa4\xa2\xa4\xa4\xa4\xa6\xa4\xa8\xa4\xaa".force_encoding("euc-jp")
+    rs = "\xa4\xa4".force_encoding("euc-jp")
+    pipe("euc-jp",
+         proc {|w| w << str; w.close },
+         proc {|r| assert_equal("\xa2\xa4\xa4\xa2\xa4\xa4".force_encoding("euc-jp"), r.gets(rs)) })
+    pipe("euc-jp",
+         proc {|w| w << str; w.close },
+         proc {|r| assert_equal("\xa2\xa4\xa4\xa2".force_encoding("euc-jp"), r.gets(rs, 3)) })
+  end
+
   def test_gets_invalid
     before = "\u{3042}\u{3044}"
     invalid = "\x80".force_encoding("utf-8")
@@ -1142,9 +1162,91 @@ EOT
     IO.pipe do |r, w|
       assert_nothing_raised(bug5567) do
         assert_warning(/Unsupported/, bug5567) {r.set_encoding("fffffffffffxx")}
+        w.puts("foo")
+        assert_equal("foo\n", r.gets)
         assert_warning(/Unsupported/, bug5567) {r.set_encoding("fffffffffffxx", "us-ascii")}
+        w.puts("bar")
+        assert_equal("bar\n", r.gets)
         assert_warning(/Unsupported/, bug5567) {r.set_encoding("us-ascii", "fffffffffffxx")}
+        w.puts("zot")
+        begin
+          assert_equal("zot\n", r.gets)
+        rescue Encoding::ConverterNotFoundError => e
+          assert_match(/\((\S+) to \1\)/, e.message)
+        end
       end
+    end
+  end
+
+  def test_set_encoding_argument_parsing
+    File.open(File::NULL) do |f|
+      f.set_encoding('binary')
+      assert_equal(Encoding::ASCII_8BIT, f.external_encoding)
+    end
+
+    File.open(File::NULL) do |f|
+      f.set_encoding(Encoding.find('binary'))
+      assert_equal(Encoding::ASCII_8BIT, f.external_encoding)
+    end
+
+    File.open(File::NULL) do |f|
+      f.set_encoding('binary:utf-8')
+      assert_equal(nil, f.internal_encoding)
+      assert_equal(Encoding::ASCII_8BIT, f.external_encoding)
+    end
+
+    File.open(File::NULL) do |f|
+      f.set_encoding('binary', 'utf-8')
+      assert_equal(nil, f.internal_encoding)
+      assert_equal(Encoding::ASCII_8BIT, f.external_encoding)
+    end
+
+    File.open(File::NULL) do |f|
+      f.set_encoding(Encoding.find('binary'), Encoding.find('utf-8'))
+      assert_equal(nil, f.internal_encoding)
+      assert_equal(Encoding::ASCII_8BIT, f.external_encoding)
+    end
+
+    File.open(File::NULL) do |f|
+      f.set_encoding('binary', Encoding.find('utf-8'))
+      assert_equal(nil, f.internal_encoding)
+      assert_equal(Encoding::ASCII_8BIT, f.external_encoding)
+    end
+
+    File.open(File::NULL) do |f|
+      f.set_encoding(Encoding.find('binary'), 'utf-8')
+      assert_equal(nil, f.internal_encoding)
+      assert_equal(Encoding::ASCII_8BIT, f.external_encoding)
+    end
+
+    File.open(File::NULL) do |f|
+      f.set_encoding('iso-8859-1:utf-8')
+      assert_equal(Encoding::UTF_8, f.internal_encoding)
+      assert_equal(Encoding::ISO_8859_1, f.external_encoding)
+    end
+
+    File.open(File::NULL) do |f|
+      f.set_encoding('iso-8859-1', 'utf-8')
+      assert_equal(Encoding::UTF_8, f.internal_encoding)
+      assert_equal(Encoding::ISO_8859_1, f.external_encoding)
+    end
+
+    File.open(File::NULL) do |f|
+      f.set_encoding(Encoding.find('iso-8859-1'), Encoding.find('utf-8'))
+      assert_equal(Encoding::UTF_8, f.internal_encoding)
+      assert_equal(Encoding::ISO_8859_1, f.external_encoding)
+    end
+
+    File.open(File::NULL) do |f|
+      f.set_encoding('iso-8859-1', Encoding.find('utf-8'))
+      assert_equal(Encoding::UTF_8, f.internal_encoding)
+      assert_equal(Encoding::ISO_8859_1, f.external_encoding)
+    end
+
+    File.open(File::NULL) do |f|
+      f.set_encoding(Encoding.find('iso-8859-1'), 'utf-8')
+      assert_equal(Encoding::UTF_8, f.internal_encoding)
+      assert_equal(Encoding::ISO_8859_1, f.external_encoding)
     end
   end
 
@@ -1310,26 +1412,6 @@ EOT
       s = f.read
       assert_equal(Encoding::EUC_JP, s.encoding)
       assert_equal("\x8e\xa1".force_encoding("euc-jp"), s)
-    }
-  end
-
-  def test_open_pipe_r_enc
-    open("|#{EnvUtil.rubybin} -e 'putc 255'", "r:ascii-8bit") {|f|
-      assert_equal(Encoding::ASCII_8BIT, f.external_encoding)
-      assert_equal(nil, f.internal_encoding)
-      s = f.read
-      assert_equal(Encoding::ASCII_8BIT, s.encoding)
-      assert_equal("\xff".force_encoding("ascii-8bit"), s)
-    }
-  end
-
-  def test_open_pipe_r_enc2
-    open("|#{EnvUtil.rubybin} -e 'putc \"\\u3042\"'", "r:UTF-8") {|f|
-      assert_equal(Encoding::UTF_8, f.external_encoding)
-      assert_equal(nil, f.internal_encoding)
-      s = f.read
-      assert_equal(Encoding::UTF_8, s.encoding)
-      assert_equal("\u3042", s)
     }
   end
 
@@ -2225,6 +2307,28 @@ EOT
     }
   end
 
+  def test_read_utf16le_invalid_surrogate_split_across_reads
+    # The converter may hold readagain bytes from the previous fill;
+    # fill_cbuf must not put those back into rbuf.
+    with_pipe("UTF-16LE:UTF-8") {|r, w|
+      w.write("\x00\xD8\x41".b)
+      t = Thread.new {
+        sleep 0.1
+        w.write("\x00\x42\x00\x0a\x00".b)
+        w.close
+      }
+      begin
+        e = assert_raise(Encoding::InvalidByteSequenceError) { r.gets }
+        assert_equal("\x00\xD8".b, e.error_bytes)
+        assert_equal("\x41\x00".b, e.readagain_bytes)
+        assert_equal("AB\n", r.gets)
+        assert_nil(r.gets)
+      ensure
+        t.join
+      end
+    }
+  end
+
   def test_cbuf
     with_tmpdir {
       fn = "tst"
@@ -2325,6 +2429,166 @@ EOT
     }
   end
 
+  def test_binmode_paragraph_widechar_without_conversion
+    with_tmpdir do
+      content = "\n\n\n\nhello\n\n\n\nworld"
+      [Encoding::UTF_32BE, Encoding::UTF_32LE,
+       Encoding::UTF_16BE, Encoding::UTF_16LE].each do |e|
+        encoded = content.encode(e)
+        File.binwrite("widechar", encoded)
+        File.open("widechar", "rb", encoding: e) do |f|
+          assert_equal("hello\n\n".encode(e), f.gets(""), "[Bug #20819]")
+          assert_equal("world".encode(e), f.gets(""), "[Bug #20819]")
+        end
+
+        [1, "\n\n\n\nhello".encode(e).bytesize + 1,
+         "\n\n\n\nhello\n\n".encode(e).bytesize + 1].each do |split|
+          IO.pipe do |r, w|
+            r.binmode
+            r.set_encoding(e)
+            writer = Thread.new do
+              w.binmode
+              w.write(encoded.byteslice(0, split))
+              sleep 0.01
+              w.write(encoded.byteslice(split..))
+              w.close
+            end
+            actual = [r.gets(""), r.gets("")]
+            writer.join
+            message = "[Bug #20819] #{e} split at byte #{split}"
+            assert_equal(["hello\n\n".encode(e), "world".encode(e)],
+                         actual, message)
+          end
+        end
+      end
+
+      e = Encoding::UTF_16BE
+      content = "\n\n\n\nh\n\nworld"
+      encoded = content.encode(e)
+      split = "\n\n\n\nh\n".encode(e).bytesize - 1
+      IO.pipe do |r, w|
+        r.binmode
+        r.set_encoding(e)
+        writer = Thread.new do
+          w.binmode
+          w.write(encoded.byteslice(0, split))
+          sleep 0.01
+          w.write(encoded.byteslice(split..))
+          w.close
+        end
+        actual = [r.gets("", 1000), r.gets("", 1000)]
+        writer.join
+        assert_equal(["h\n\n".encode(e), "world".encode(e)], actual,
+                     "[Bug #20819] finite limit")
+      end
+
+      content = "\n\n\n\nh#{'x' * 10_000}\n\nworld"
+      encoded = content.encode(e)
+      split = "\n\n\n\nh".encode(e).bytesize - 1
+      IO.pipe do |r, w|
+        r.binmode
+        r.set_encoding(e)
+        writer = Thread.new do
+          w.binmode
+          w.write(encoded.byteslice(0, split))
+          sleep 0.01
+          w.write(encoded.byteslice(split..))
+          w.close
+        end
+        actual = [r.gets(""), r.gets("")]
+        writer.join
+        assert_equal(["h#{'x' * 10_000}\n\n".encode(e), "world".encode(e)],
+                     actual, "[Bug #20819] full-buffer lookahead")
+      end
+
+      e = Encoding::UTF_32BE
+      content = "#{'x' * 2_048}\n\nworld"
+      encoded = content.encode(e)
+      IO.pipe do |r, w|
+        r.binmode
+        r.set_encoding(e)
+        writer = Thread.new do
+          w.binmode
+          w.write(encoded.byteslice(0, 8_193))
+          sleep 0.01
+          w.write(encoded.byteslice(8_193..))
+          w.close
+        end
+        actual = [r.gets(""), r.gets("")]
+        writer.join
+        assert_equal(["#{'x' * 2_048}\n\n".encode(e), "world".encode(e)],
+                     actual, "[Bug #20819] partial character after full buffer")
+      end
+    end
+  end
+
+  def test_binmode_widechar_separator_without_conversion
+    with_tmpdir do
+      content = "one\u{3042}two\u{3042}three"
+      [Encoding::UTF_32BE, Encoding::UTF_32LE,
+       Encoding::UTF_16BE, Encoding::UTF_16LE].each do |e|
+        encoded = content.encode(e)
+        separator = "\u{3042}".encode(e)
+        File.binwrite("widechar", encoded)
+        File.open("widechar", "rb", encoding: e) do |f|
+          assert_equal("one\u{3042}".encode(e), f.gets(separator))
+          assert_equal("two\u{3042}".encode(e), f.gets(separator))
+          assert_equal("three".encode(e), f.gets(separator))
+        end
+
+        split = "one\u{3042}".encode(e).bytesize - 1
+        IO.pipe do |r, w|
+          r.binmode
+          r.set_encoding(e)
+          writer = Thread.new do
+            w.binmode
+            w.write(encoded.byteslice(0, split))
+            sleep 0.01
+            w.write(encoded.byteslice(split..))
+            w.close
+          end
+          actual = [r.gets(separator), r.gets(separator), r.gets(separator)]
+          writer.join
+          assert_equal(["one\u{3042}".encode(e), "two\u{3042}".encode(e),
+                        "three".encode(e)], actual)
+        end
+      end
+    end
+  end
+
+  def test_binmode_widechar_separator_at_limit
+    with_tmpdir do
+      [Encoding::UTF_32BE, Encoding::UTF_32LE,
+       Encoding::UTF_16BE, Encoding::UTF_16LE].each do |e|
+        width = "A".encode(e).bytesize
+
+        File.binwrite("paragraph", "\n\nA\n\nB".encode(e))
+        (1..width + 1).each do |limit|
+          File.open("paragraph", "rb", encoding: e) do |f|
+            expected = limit <= width ? "A" : "A\n"
+            assert_equal(expected.encode(e), f.gets("", limit),
+                         "[Bug #20819] #{e} paragraph limit #{limit}")
+          end
+        end
+
+        separator = "\u{3042}".encode(e)
+        File.binwrite("separator", "A\u{3042}B".encode(e))
+        (1..width + 1).each do |limit|
+          File.open("separator", "rb", encoding: e) do |f|
+            expected = limit <= width ? "A" : "A\u{3042}"
+            assert_equal(expected.encode(e), f.gets(separator, limit),
+                         "[Bug #20819] #{e} separator limit #{limit}")
+          end
+        end
+
+        File.open("paragraph", "rb", encoding: e) do |f|
+          assert_equal("A".encode(e), f.gets("", width * 3, chomp: true),
+                       "[Bug #20819] #{e} chomp at exact boundary")
+        end
+      end
+    end
+  end
+
   def test_puts_widechar
     bug = '[ruby-dev:42212]'
     pipe(Encoding::ASCII_8BIT,
@@ -2412,6 +2676,19 @@ EOT
         out_r.close
       end
     end
+  end if /mswin|mingw/ =~ RUBY_PLATFORM
+
+  def test_write_to_console
+    begin
+      con = File.open("CONOUT$", "r+")
+    rescue SystemCallError
+      omit "console is not available"
+    end
+    # non-ASCII, but leaves nothing visible on the console
+    str = "\u00a0\b"
+    assert_equal(str.bytesize, con.write(str))
+  ensure
+    con&.close
   end if /mswin|mingw/ =~ RUBY_PLATFORM
 
   def test_cr_decorator_on_stdout
@@ -2662,8 +2939,8 @@ EOT
   def test_pos_with_buffer_end_cr
     bug6401 = '[ruby-core:44874]'
     with_tmpdir {
-      # Read buffer size is 8191. This generates '\r' at 8191.
-      lines = ["X" * 8187, "X"]
+      # Read buffer size is 8192. This generates '\r' at 8192.
+      lines = ["X" * 8188, "X"]
       generate_file("tmp", lines.join("\r\n") + "\r\n")
 
       open("tmp", "r") do |f|
@@ -2742,6 +3019,48 @@ EOT
     end
     unless failure.empty?
       flunk failure.join("\n---\n")
+    end
+  end
+
+  def test_each_codepoint_encoding_with_ungetc
+    File.open(File::NULL, "rt:utf-8") do |f|
+      f.ungetc(%Q[\u{3042}\u{3044}\u{3046}])
+      assert_equal [0x3042, 0x3044, 0x3046], f.each_codepoint.to_a
+    end
+    File.open(File::NULL, "rt:us-ascii") do |f|
+      f.ungetc(%Q[\u{3042}\u{3044}\u{3046}])
+      assert_raise(ArgumentError) do
+        f.each_codepoint.to_a
+      end
+    end
+  end
+
+  def test_set_encoding_newline
+    with_tmpdir do
+      generate_file("newline.txt", "line1\r\nline2\rline3\n")
+
+      [["UTF-8"], [Encoding::UTF_8],
+      [Encoding::UTF_8, Encoding::UTF_8]].each do |args|
+        File.open("newline.txt", "r") do |f|
+          f.set_encoding(*args, newline: :universal)
+          assert_equal("line1\nline2\nline3\n", f.read, args.inspect)
+        end
+      end
+    end
+  end
+
+  def test_set_encoding_invalid_newline
+    with_tmpdir do
+      generate_file("newline.txt", "")
+
+      [["UTF-8"], [Encoding::UTF_8],
+      [Encoding::UTF_8, Encoding::UTF_8]].each do |args|
+        File.open("newline.txt", "r") do |f|
+          assert_raise(ArgumentError, args.inspect) do
+            f.set_encoding(*args, newline: :invalid)
+          end
+        end
+      end
     end
   end
 end

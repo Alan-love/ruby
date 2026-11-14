@@ -1,8 +1,11 @@
 # frozen_string_literal: true
-#--
+
+# rubocop:disable Style/AsciiComments
+
 # Copyright (C) 2004 Mauricio Julio Fernández Pradier
 # See LICENSE.txt for additional licensing information.
-#++
+
+# rubocop:enable Style/AsciiComments
 
 ##
 # Allows writing of tar files
@@ -92,10 +95,11 @@ class Gem::Package::TarWriter
   end
 
   ##
-  # Adds file +name+ with permissions +mode+, and yields an IO for writing the
-  # file to
+  # Adds file +name+ with permissions +mode+ and mtime +mtime+ (sets
+  # Gem.source_date_epoch if not specified), and yields an IO for
+  # writing the file to
 
-  def add_file(name, mode) # :yields: io
+  def add_file(name, mode, mtime = nil) # :yields: io
     check_closed
 
     name, prefix = split_name name
@@ -113,9 +117,9 @@ class Gem::Package::TarWriter
     final_pos = @io.pos
     @io.pos = init_pos
 
-    header = Gem::Package::TarHeader.new :name => name, :mode => mode,
-                                         :size => size, :prefix => prefix,
-                                         :mtime => Gem.source_date_epoch
+    header = Gem::Package::TarHeader.new name: name, mode: mode,
+                                         size: size, prefix: prefix,
+                                         mtime: mtime || Gem.source_date_epoch
 
     @io.write header
     @io.pos = final_pos
@@ -166,7 +170,7 @@ class Gem::Package::TarWriter
   def add_file_signed(name, mode, signer)
     digest_algorithms = [
       signer.digest_algorithm,
-      Gem::Security.create_digest('SHA512'),
+      Gem::Security.create_digest("SHA512"),
     ].compact.uniq
 
     digests = add_file_digest name, mode, digest_algorithms do |io|
@@ -189,7 +193,7 @@ class Gem::Package::TarWriter
     if signer.key
       signature = signer.sign signature_digest.digest
 
-      add_file_simple "#{name}.sig", 0444, signature.length do |io|
+      add_file_simple "#{name}.sig", 0o444, signature.length do |io|
         io.write signature
       end
     end
@@ -206,9 +210,9 @@ class Gem::Package::TarWriter
 
     name, prefix = split_name name
 
-    header = Gem::Package::TarHeader.new(:name => name, :mode => mode,
-                                         :size => size, :prefix => prefix,
-                                         :mtime => Gem.source_date_epoch).to_s
+    header = Gem::Package::TarHeader.new(name: name, mode: mode,
+                                         size: size, prefix: prefix,
+                                         mtime: Gem.source_date_epoch).to_s
 
     @io.write header
     os = BoundedStream.new @io, size
@@ -232,11 +236,11 @@ class Gem::Package::TarWriter
 
     name, prefix = split_name name
 
-    header = Gem::Package::TarHeader.new(:name => name, :mode => mode,
-                                         :size => 0, :typeflag => "2",
-                                         :linkname => target,
-                                         :prefix => prefix,
-                                         :mtime => Gem.source_date_epoch).to_s
+    header = Gem::Package::TarHeader.new(name: name, mode: mode,
+                                         size: 0, typeflag: "2",
+                                         linkname: target,
+                                         prefix: prefix,
+                                         mtime: Gem.source_date_epoch).to_s
 
     @io.write header
 
@@ -286,10 +290,10 @@ class Gem::Package::TarWriter
 
     name, prefix = split_name(name)
 
-    header = Gem::Package::TarHeader.new :name => name, :mode => mode,
-                                         :typeflag => "5", :size => 0,
-                                         :prefix => prefix,
-                                         :mtime => Gem.source_date_epoch
+    header = Gem::Package::TarHeader.new name: name, mode: mode,
+                                         typeflag: "5", size: 0,
+                                         prefix: prefix,
+                                         mtime: Gem.source_date_epoch
 
     @io.write header
 
@@ -304,17 +308,17 @@ class Gem::Package::TarWriter
       raise Gem::Package::TooLongFileName.new("File \"#{name}\" has a too long path (should be 256 or less)")
     end
 
-    prefix = ''
+    prefix = ""
     if name.bytesize > 100
-      parts = name.split('/', -1) # parts are never empty here
+      parts = name.split("/", -1) # parts are never empty here
       name = parts.pop            # initially empty for names with a trailing slash ("foo/.../bar/")
-      prefix = parts.join('/')    # if empty, then it's impossible to split (parts is empty too)
+      prefix = parts.join("/")    # if empty, then it's impossible to split (parts is empty too)
       while !parts.empty? && (prefix.bytesize > 155 || name.empty?)
-        name = parts.pop + '/' + name
-        prefix = parts.join('/')
+        name = parts.pop + "/" + name
+        prefix = parts.join("/")
       end
 
-      if name.bytesize > 100 or prefix.empty?
+      if name.bytesize > 100 || prefix.empty?
         raise Gem::Package::TooLongFileName.new("File \"#{prefix}/#{name}\" has a too long name (should be 100 or less)")
       end
 
@@ -323,6 +327,6 @@ class Gem::Package::TarWriter
       end
     end
 
-    return name, prefix
+    [name, prefix]
   end
 end

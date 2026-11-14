@@ -7,7 +7,7 @@ describe "Process::Status#success?" do
     end
 
     it "returns true" do
-      $?.success?.should be_true
+      $?.success?.should == true
     end
   end
 
@@ -17,24 +17,24 @@ describe "Process::Status#success?" do
     end
 
     it "returns false" do
-      $?.success?.should be_false
+      $?.success?.should == false
     end
   end
 
   describe "for a child that was terminated" do
     before :each do
-      ruby_exe("Process.kill(:KILL, $$); exit(42)", exit_status: platform_is(:windows) ? 0 : nil)
+      ruby_exe("Process.kill(:KILL, $$); exit(42)", exit_status: platform_is(:windows) ? 0 : :SIGKILL)
     end
 
     platform_is_not :windows do
       it "returns nil" do
-        $?.success?.should be_nil
+        $?.success?.should == nil
       end
     end
 
     platform_is :windows do
       it "always returns true" do
-        $?.success?.should be_true
+        $?.success?.should == true
       end
     end
   end

@@ -1,5 +1,14 @@
 # -*- makefile -*-
 
+!include $(config_make)
+
+# configure.bat writes these into config_make only for nmake, but -gmp-
+# needs them for GNU make too.
+!if "$(make_command)" != "nmake" && "$(optdirs)" != ""
+XINCFLAGS = -I"$(optdirs:;=/include" -I")/include"
+XLDFLAGS = -libpath:"$(optdirs:;=/lib" -libpath:")/lib"
+!endif
+
 !if "$(srcdir)" != ""
 WIN32DIR = $(srcdir)/win32
 !elseif "$(WIN32DIR)" == "win32"
@@ -12,7 +21,11 @@ srcdir = $(WIN32DIR)/..
 !ifndef prefix
 prefix = /usr
 !endif
+!if "$(make_command)" == "nmake"
 BANG = !
+!else
+BANG =
+!endif
 APPEND = echo.>>$(MAKEFILE)
 !ifdef MAKEFILE
 MAKE = $(MAKE) -f $(MAKEFILE)
@@ -22,69 +35,66 @@ MAKEFILE = Makefile
 CPU = PROCESSOR_LEVEL
 CC = $(CC) -nologo
 CPP = $(CC) -EP
+!if "$(HAVE_BASERUBY)" != "no" && "$(BASERUBY)" == ""
+BASERUBY = ruby
+!endif
 
 all: -prologue- -generic- -epilogue-
 i386-mswin32: -prologue- -i386- -epilogue-
 i486-mswin32: -prologue- -i486- -epilogue-
 i586-mswin32: -prologue- -i586- -epilogue-
 i686-mswin32: -prologue- -i686- -epilogue-
-alpha-mswin32: -prologue- -alpha- -epilogue-
 x64-mswin64: -prologue- -x64- -epilogue-
+arm64-mswin64: -prologue- -arm64- -epilogue-
 
--prologue-: -basic-vars-
+-prologue-: -basic-vars- -baseruby- -dependencies- -gmp- -mimalloc-
 -generic-: -osname-
 
 -basic-vars-: nul
-	@type << > $(MAKEFILE)
-### Makefile for ruby $(TARGET_OS) ###
+	@rem <<$(MAKEFILE)
+### Makefile for ruby ###
+!if "$(make_command)" == "nmake"
 MAKE = nmake
+!endif
 srcdir = $(srcdir:\=/)
 prefix = $(prefix:\=/)
-!if defined(libdir_basename)
-libdir_basename = $(libdir_basename)
-!endif
-EXTSTATIC = $(EXTSTATIC)
-!if defined(RDOCTARGET)
-RDOCTARGET = $(RDOCTARGET)
-!endif
-!if defined(EXTOUT) && "$(EXTOUT)" != ".ext"
-EXTOUT = $(EXTOUT)
-!endif
-!if defined(NTVER)
-NTVER = $(NTVER)
-!endif
-!if defined(USE_RUBYGEMS)
-USE_RUBYGEMS = $(USE_RUBYGEMS)
-!endif
-!if defined(ENABLE_DEBUG_ENV)
-ENABLE_DEBUG_ENV = $(ENABLE_DEBUG_ENV)
-!endif
-!if defined(MJIT_SUPPORT)
-MJIT_SUPPORT = $(MJIT_SUPPORT)
+
+<<
+	@type $(config_make) >>$(MAKEFILE)
+	@del $(config_make) > nul
+
+-baseruby-: nul
+!if "$(HAVE_BASERUBY)" != "no"
+	@cd $(srcdir:/=\)\tool && $(BASERUBY:/=\) missing-baseruby.bat --verbose || exit $(HAVE_BASERUBY:yes=non-)0
 !endif
 
-# TOOLS
-<<
-!if defined(BASERUBY)
-	@echo BASERUBY = $(BASERUBY:/=\)>> $(MAKEFILE)
-!else
-	@for %I in (ruby.exe) do @echo BASERUBY = %~s$$PATH:I>> $(MAKEFILE)
+# Unlike -baseruby-, this runs in the build directory, where a just
+# built `ruby.exe` would be found prior to $PATH but cannot load the
+# standard library yet.
+-dependencies-: -baseruby-
+!if "$(HAVE_BASERUBY)" != "no"
+	@$(COMSPEC) /C "set NoDefaultCurrentDirectoryInExePath=1& \
+	$(BASERUBY:/=\) $(srcdir)/tool/mkdepend.rb --root=$(srcdir) \
+	    --scope=core $(BANG:!=--nmake) --output=.deps"
 !endif
-	@type << >> $(MAKEFILE)
-$(BANG)if "$$(BASERUBY)" == ""
-BASERUBY = echo executable host ruby is required.  use --with-baseruby option.^& exit 1
-HAVE_BASERUBY = no
-$(BANG)elseif [($$(BASERUBY) -eexit) > nul 2> nul] == 0
-HAVE_BASERUBY = yes
-$(BANG)else
-HAVE_BASERUBY = no
-$(BANG)endif
+
+-gmp-:
+!if "$(WITH_GMP)" != "no"
+	@($(CC) $(XINCFLAGS) <<conftest.c -link $(XLDFLAGS) gmp.lib > nul && (echo USE_GMP = yes) || exit /b 0) >>$(MAKEFILE)
+#include <gmp.h>
+mpz_t x;
+int main(void) {mpz_init(x); return 0;}
 <<
-!if "$(GIT)" != ""
-	@echo GIT = $(GIT)>> $(MAKEFILE)
+	@$(WIN32DIR:/=\)\rm.bat conftest.*
 !endif
-!if "$(HAVE_GIT)" != ""
-	@echo HAVE_GIT = $(HAVE_GIT)>> $(MAKEFILE)
+
+-mimalloc-:
+!if "$(WITH_MIMALLOC)" == "yes"
+	@$(CC) $(XINCFLAGS) <<conftest.c -link $(XLDFLAGS) mimalloc.dll.lib > nul || ($(WIN32DIR:/=\)\rm.bat conftest.* & echo mimalloc requested but not found 1>&2 & exit /b 1)
+#include <mimalloc.h>
+int main(void) {mi_free(mi_malloc(1)); return 0;}
+<<
+	@$(WIN32DIR:/=\)\rm.bat conftest.*
 !endif
 
 -osname-section-:
@@ -92,20 +102,31 @@ $(BANG)endif
 	@echo # TARGET>>$(MAKEFILE)
 
 -osname32-: -osname-section-
-	@echo TARGET_OS = mswin32>>$(MAKEFILE)
-
--osname64-: -osname-section-
-	@echo TARGET_OS = mswin64>>$(MAKEFILE)
-
--osname-: -osname-section-
-	@echo !ifndef TARGET_OS>>$(MAKEFILE)
-	@($(CC) -c <<conftest.c > nul && (echo TARGET_OS = mswin32) || (echo TARGET_OS = mswin64)) >>$(MAKEFILE)
+	@$(CPP) -Tc <<"checking if target OS is 32bit" >>$(MAKEFILE)
 #ifdef _WIN64
 #error
+#else
+TARGET_OS = mswin32
 #endif
 <<
-	@echo !endif>>$(MAKEFILE)
-	@$(WIN32DIR:/=\)\rm.bat conftest.*
+
+-osname64-: -osname-section-
+	@$(CPP) -Tc <<"checking if target OS is 64bit" >>$(MAKEFILE)
+#ifndef _WIN64
+#error
+#else
+TARGET_OS = mswin64
+#endif
+<<
+
+-osname-: -osname-section-
+	@$(CPP) -Tc <<"checking for target OS" 2>nul | findstr = >>$(MAKEFILE)
+#ifdef _WIN64
+TARGET_OS = mswin64
+#else
+TARGET_OS = mswin32
+#endif
+<<
 
 -compiler-: -compiler-section- -version- -runtime- -headers-
 
@@ -123,22 +144,80 @@ int main(void) {FILE *volatile f = stdin; return 0;}
 
 -headers-: nul
 
-check-psapi.h: nul
-	($(CC) -MD <<conftest.c psapi.lib -link && echo>>$(MAKEFILE) HAVE_PSAPI_H=1) & $(WIN32DIR:/=\)\rm.bat conftest.*
-#include <windows.h>
-#include <psapi.h>
-int main(void) {return (EnumProcesses(NULL,0,NULL) ? 0 : 1);}
+!ifdef VS2022_FP_BUG_CHECK # Fixed In: Visual Studio 2022 version 17.3
+-headers-: vs2022-fp-bug
+!endif
+
+# Check the bug reported at:
+# https://developercommunity.visualstudio.com/t/With-__assume-isnan-after-isinf/1515649
+# https://developercommunity.visualstudio.com/t/Prev-Issue---with-__assume-isnan-/1597317
+vs2022-fp-bug:
+	@echo checking for $(@:-= )
+	@echo <<$@.c > NUL
+/* compile with -O2 */
+#include <math.h>
+#include <float.h>
+#include <stdio.h>
+
+#define value_finite(d) 'f'
+#define value_infinity() 'i'
+#define value_nan() 'n'
+
+#ifdef NO_ASSUME
+# define ASSUME_TRUE() (void)0
+#else
+# define ASSUME_TRUE() __assume(1)
+#endif
+
+static int
+check_value(double value)
+{
+    if (isinf(value)) {
+        return value_infinity();
+    }
+    else if (isnan(value)) {
+        return value_nan();
+    }
+
+    ASSUME_TRUE();
+    return value_finite(value);
+}
+
+int
+main(void)
+{
+    int c = check_value(nan(""));
+    printf("NaN=>%c\n", c);
+    return c != value_nan();
+}
 <<
+	@($(CC) -O2 $@.c && .\$@) || \
+	  (echo This compiler has an optimization bug & \
+	  $(WIN32DIR:/=\)\rm.bat $@.* & exit /b 1)
+	@$(WIN32DIR:/=\)\rm.bat $@.*
 
 -version-: nul verconf.mk
 
+!if !(exist(revision.h) || exist($(srcdir)/revision.h))
+revision_opt = -DRUBY_REVISION=0
+!endif
+
 verconf.mk: nul
-	@$(CPP) -I$(srcdir) -I$(srcdir)/include <<"Creating $(@)" > $(*F).bat && cmd /c $(*F).bat > $(@)
+	@findstr /R /C:"^#define RUBY_ABI_VERSION " $(srcdir:/=\)\include\ruby\internal\abi.h > $(@)
+	@$(CPP) -I$(srcdir) -I$(srcdir)/include $(revision_opt) -Tc <<"Creating $(@)" > $(*F).bat && cmd /c .\$(*F).bat > $(@)
 @echo off
-#define RUBY_REVISION 0
 #define STRINGIZE0(expr) #expr
 #define STRINGIZE(x) STRINGIZE0(x)
 #include "version.h"
+#ifndef RUBY_RELEASE_YEAR
+# define RUBY_RELEASE_YEAR 0000
+#endif
+#ifndef RUBY_RELEASE_MONTH
+# define RUBY_RELEASE_MONTH 00
+#endif
+#ifndef RUBY_RELEASE_DAY
+# define RUBY_RELEASE_DAY 00
+#endif
 set ruby_release_year=RUBY_RELEASE_YEAR
 set ruby_release_month=RUBY_RELEASE_MONTH
 set ruby_release_day=RUBY_RELEASE_DAY
@@ -154,53 +233,72 @@ echo MAJOR = RUBY_VERSION_MAJOR
 echo MINOR = RUBY_VERSION_MINOR
 echo TEENY = RUBY_VERSION_TEENY
 #if defined RUBY_PATCHLEVEL && RUBY_PATCHLEVEL < 0
-echo RUBY_DEVEL = yes
+#include "$(@F)"
+echo ABI_VERSION = RUBY_ABI_VERSION
 #endif
 set /a MSC_VER = _MSC_VER
-#if _MSC_VER > 1900
+#ifndef _MSC_VER
+# error _MSC_VER not defined
+#elif _MSC_VER >= 1920
+set /a MSC_VER_LOWER = MSC_VER/20*20+0
+set /a MSC_VER_UPPER = MSC_VER/20*20+19
+#elif _MSC_VER >= 1915
 set /a MSC_VER_LOWER = MSC_VER/10*10+0
 set /a MSC_VER_UPPER = MSC_VER/10*10+9
+#else
+# error MSVC 1915 (Visual Studio 2017 version 15.8) or later is required
 #endif
 set MSC_VER
+#ifdef __clang__
+#if __clang_major__ < 15
+# error clang-cl 15 or later is required
+#endif
+echo CLANG_VER = __clang_major__
+#endif
 del %0 & exit
 <<
 
--program-name-:
-	@type << >>$(MAKEFILE)
-
-# PROGRAM-NAME
-!ifdef PROGRAM_PREFIX
-PROGRAM_PREFIX = $(PROGRAM_PREFIX)
-!endif
-!ifdef PROGRAM_SUFFIX
-PROGRAM_SUFFIX = $(PROGRAM_SUFFIX)
-!endif
-!ifdef RUBY_INSTALL_NAME
-RUBY_INSTALL_NAME = $(RUBY_INSTALL_NAME)
-!endif
-!ifdef RUBY_SO_NAME
-RUBY_SO_NAME = $(RUBY_SO_NAME)
-!endif
-<<
-
 -generic-: nul
-	@$(CPP) <<conftest.c 2>nul | findstr = >>$(MAKEFILE)
-#if defined _M_X64
+	@$(CPP) -Tc <<checking-target 2>nul | findstr = >>$(MAKEFILE)
+#if defined _M_ARM64
+MACHINE = arm64
+#elif defined _M_X64
 MACHINE = x64
 #else
 MACHINE = x86
+!if defined($(CPU))
+$(CPU) = $(PROCESSOR_LEVEL)
+!endif
 #endif
 <<
-!if defined($(CPU))
-	@echo>>$(MAKEFILE) $(CPU) = $(PROCESSOR_LEVEL)
-!endif
 
--alpha-: -osname32-
-	@echo MACHINE = alpha>>$(MAKEFILE)
 -x64-: -osname64-
-	@echo MACHINE = x64>>$(MAKEFILE)
+	@$(CPP) -Tc <<"checking if compiler is for $(@:-=)" >>$(MAKEFILE)
+#ifndef _M_AMD64
+#error Not compiler for $(@:-=)
+#else
+MACHINE = $(@:-=)
+#endif
+<<
+
 -ix86-: -osname32-
-	@echo MACHINE = x86>>$(MAKEFILE)
+	@$(CPP) -Tc <<"checking if compiler is for $(@:-=)" >>$(MAKEFILE)
+#ifndef _M_IX86
+#error Not compiler for $(@:-=)
+#else
+#define ix86 x86
+MACHINE = $(@:-=)
+#endif
+<<
+
+-arm64-: -osname64-
+	@$(CPP) -Tc <<"checking if compiler is for $(@:-=)" >>$(MAKEFILE)
+#ifndef _M_ARM64
+#error Not compiler for $(@:-=)
+#else
+MACHINE = $(@:-=)
+#endif
+<<
 
 -i386-: -ix86-
 	@echo $(CPU) = 3>>$(MAKEFILE)
@@ -211,7 +309,7 @@ MACHINE = x86
 -i686-: -ix86-
 	@echo $(CPU) = 6>>$(MAKEFILE)
 
--epilogue-: -compiler- -program-name- -encs-
+-epilogue-: -compiler- -encs-
 
 -encs-: nul
 	@$(APPEND)
@@ -219,23 +317,18 @@ MACHINE = x86
 	@$(MAKE) -l -f $(srcdir)/win32/enc-setup.mak srcdir="$(srcdir)" MAKEFILE=$(MAKEFILE)
 
 -epilogue-: nul
-!if exist(confargs.c)
-	@$(APPEND)
-	@$(CPP) confargs.c 2>&1 | findstr "! =" >> $(MAKEFILE)
-	@del confargs.c
-!endif
 	@type << >>$(MAKEFILE)
 
 # RUBY_INSTALL_NAME = ruby
 # RUBY_SO_NAME = $$(RT)-$$(RUBY_INSTALL_NAME)$$(MAJOR)$$(MINOR)
-# CFLAGS = $$(RUNTIMEFLAG) $$(DEBUGFLAGS) $$(WARNFLAGS) $$(OPTFLAGS) $$(PROCESSOR_FLAG) $$(COMPILERFLAG)
+# CFLAGS = $$(RUNTIMEFLAG) $$(DEBUGFLAGS) $$(WARNFLAGS) $$(OPTFLAGS) $$(COMPILERFLAG)
 # CPPFLAGS =
 # STACK = 0x2000000
 # LDFLAGS = $$(CFLAGS) -Fm
 # XLDFLAGS =
 # RFLAGS = -r
 # EXTLIBS =
-CC = $(CC)
+CC = $(CC) -source-charset:utf-8
 !if "$(AS)" != "ml64"
 AS = $(AS) -nologo
 !endif
@@ -245,10 +338,11 @@ AS = $(AS) -nologo
 	(echo AS = $(AS:64=) -nologo) || \
 	(echo AS = $(AS) -nologo) ) >>$(MAKEFILE)
 !endif
-	@(for %I in (cl.exe) do @set MJIT_CC=%~$$PATH:I) && (call echo MJIT_CC = "%MJIT_CC:\=/%" -nologo>>$(MAKEFILE))
 	@type << >>$(MAKEFILE)
 
-$(BANG)include $$(srcdir)/win32/Makefile.sub
+$(BANG)include $$(srcdir)/win32/$(MAKEFILE:.new=).sub
 <<
 	@$(COMSPEC) /C $(srcdir:/=\)\win32\rm.bat config.h config.status
-	@echo "type `nmake' to make ruby."
+	-@move /y $(MAKEFILE_NEW) $(MAKEFILE_BACK) > nul 2> nul
+	@move /y $(MAKEFILE) $(MAKEFILE_NEW) > nul
+	@echo type '$(make_command)' to make ruby.

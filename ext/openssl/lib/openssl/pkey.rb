@@ -7,6 +7,9 @@
 require_relative 'marshal'
 
 module OpenSSL::PKey
+  # Alias of PKeyError. Before version 4.0.0, this was a subclass of PKeyError.
+  DHError = PKeyError
+
   class DH
     include OpenSSL::Marshal
 
@@ -35,6 +38,18 @@ module OpenSSL::PKey
     end
 
     # :call-seq:
+    #    dh.params -> hash
+    #
+    # Stores all parameters of key to a Hash.
+    #
+    # The hash has keys 'p', 'q', 'g', 'pub_key', and 'priv_key'.
+    def params
+      %w{p q g pub_key priv_key}.map { |name|
+        [name, send(name)]
+      }.to_h
+    end
+
+    # :call-seq:
     #    dh.compute_key(pub_bn) -> string
     #
     # Returns a String containing a shared secret computed from the other
@@ -47,9 +62,19 @@ module OpenSSL::PKey
     # * _pub_bn_ is a OpenSSL::BN, *not* the DH instance returned by
     #   DH#public_key as that contains the DH parameters only.
     def compute_key(pub_bn)
-      peer = dup
-      peer.set_key(pub_bn, nil)
-      derive(peer)
+      # FIXME: This is constructing an X.509 SubjectPublicKeyInfo and is very
+      # inefficient
+      obj = OpenSSL::ASN1.Sequence([
+        OpenSSL::ASN1.Sequence([
+          OpenSSL::ASN1.ObjectId("dhKeyAgreement"),
+          OpenSSL::ASN1.Sequence([
+            OpenSSL::ASN1.Integer(p),
+            OpenSSL::ASN1.Integer(g),
+          ]),
+        ]),
+        OpenSSL::ASN1.BitString(OpenSSL::ASN1.Integer(pub_bn).to_der),
+      ])
+      derive(OpenSSL::PKey.read(obj.to_der))
     end
 
     # :call-seq:
@@ -61,14 +86,29 @@ module OpenSSL::PKey
     # called first in order to generate the per-session keys before performing
     # the actual key exchange.
     #
+    # <b>Deprecated in version 3.0</b>. This method is incompatible with
+    # OpenSSL 3.0.0 or later.
+    #
     # See also OpenSSL::PKey.generate_key.
     #
     # Example:
-    #   dh = OpenSSL::PKey::DH.new(2048)
-    #   public_key = dh.public_key #contains no private/public key yet
-    #   public_key.generate_key!
-    #   puts public_key.private? # => true
+    #   # DEPRECATED USAGE: This will not work on OpenSSL 3.0 or later
+    #   dh0 = OpenSSL::PKey::DH.new(2048)
+    #   dh = dh0.public_key # #public_key only copies the DH parameters (contrary to the name)
+    #   dh.generate_key!
+    #   puts dh.private? # => true
+    #   puts dh0.pub_key == dh.pub_key #=> false
+    #
+    #   # With OpenSSL::PKey.generate_key
+    #   dh0 = OpenSSL::PKey::DH.new(2048)
+    #   dh = OpenSSL::PKey.generate_key(dh0)
+    #   puts dh0.pub_key == dh.pub_key #=> false
     def generate_key!
+      if OpenSSL::OPENSSL_VERSION_NUMBER >= 0x30000000
+        raise PKeyError, "OpenSSL::PKey::DH is immutable on OpenSSL 3.0; " \
+        "use OpenSSL::PKey.generate_key instead"
+      end
+
       unless priv_key
         tmp = OpenSSL::PKey.generate_key(self)
         set_key(tmp.pub_key, tmp.priv_key)
@@ -110,6 +150,9 @@ module OpenSSL::PKey
     end
   end
 
+  # Alias of PKeyError. Before version 4.0.0, this was a subclass of PKeyError.
+  DSAError = PKeyError
+
   class DSA
     include OpenSSL::Marshal
 
@@ -129,6 +172,18 @@ module OpenSSL::PKey
       OpenSSL::PKey.read(public_to_der)
     end
 
+    # :call-seq:
+    #    dsa.params -> hash
+    #
+    # Stores all parameters of key to a Hash.
+    #
+    # The hash has keys 'p', 'q', 'g', 'pub_key', and 'priv_key'.
+    def params
+      %w{p q g pub_key priv_key}.map { |name|
+        [name, send(name)]
+      }.to_h
+    end
+
     class << self
       # :call-seq:
       #    DSA.generate(size) -> dsa
@@ -142,8 +197,16 @@ module OpenSSL::PKey
       # +size+::
       #   The desired key size in bits.
       def generate(size, &blk)
+        # FIPS 186-4 specifies four (L,N) pairs: (1024,160), (2048,224),
+        # (2048,256), and (3072,256).
+        #
+        # q size is derived here with compatibility with
+        # DSA_generator_parameters_ex() which previous versions of ruby/openssl
+        # used to call.
+        qsize = size >= 2048 ? 256 : 160
         dsaparams = OpenSSL::PKey.generate_parameters("DSA", {
           "dsa_paramgen_bits" => size,
+          "dsa_paramgen_q_bits" => qsize,
         }, &blk)
         OpenSSL::PKey.generate_key(dsaparams)
       end
@@ -185,13 +248,9 @@ module OpenSSL::PKey
     #   sig = dsa.sign_raw(nil, digest)
     #   p dsa.verify_raw(nil, sig, digest) #=> true
     def syssign(string)
-      q or raise OpenSSL::PKey::DSAError, "incomplete DSA"
-      private? or raise OpenSSL::PKey::DSAError, "Private DSA key needed!"
-      begin
-        sign_raw(nil, string)
-      rescue OpenSSL::PKey::PKeyError
-        raise OpenSSL::PKey::DSAError, $!.message
-      end
+      q or raise PKeyError, "incomplete DSA"
+      private? or raise PKeyError, "Private DSA key needed!"
+      sign_raw(nil, string)
     end
 
     # :call-seq:
@@ -209,12 +268,13 @@ module OpenSSL::PKey
     #   A \DSA signature value.
     def sysverify(digest, sig)
       verify_raw(nil, sig, digest)
-    rescue OpenSSL::PKey::PKeyError
-      raise OpenSSL::PKey::DSAError, $!.message
     end
   end
 
   if defined?(EC)
+  # Alias of PKeyError. Before version 4.0.0, this was a subclass of PKeyError.
+  ECError = PKeyError
+
   class EC
     include OpenSSL::Marshal
 
@@ -225,8 +285,6 @@ module OpenSSL::PKey
     # Consider using PKey::PKey#sign_raw and PKey::PKey#verify_raw instead.
     def dsa_sign_asn1(data)
       sign_raw(nil, data)
-    rescue OpenSSL::PKey::PKeyError
-      raise OpenSSL::PKey::ECError, $!.message
     end
 
     # :call-seq:
@@ -236,8 +294,6 @@ module OpenSSL::PKey
     # Consider using PKey::PKey#sign_raw and PKey::PKey#verify_raw instead.
     def dsa_verify_asn1(data, sig)
       verify_raw(nil, sig, data)
-    rescue OpenSSL::PKey::PKeyError
-      raise OpenSSL::PKey::ECError, $!.message
     end
 
     # :call-seq:
@@ -249,9 +305,14 @@ module OpenSSL::PKey
     # This method is provided for backwards compatibility, and calls #derive
     # internally.
     def dh_compute_key(pubkey)
-      peer = OpenSSL::PKey::EC.new(group)
-      peer.public_key = pubkey
-      derive(peer)
+      obj = OpenSSL::ASN1.Sequence([
+        OpenSSL::ASN1.Sequence([
+          OpenSSL::ASN1.ObjectId("id-ecPublicKey"),
+          group.to_der,
+        ]),
+        OpenSSL::ASN1.BitString(pubkey.to_octet_string(:uncompressed)),
+      ])
+      derive(OpenSSL::PKey.read(obj.to_der))
     end
   end
 
@@ -272,6 +333,9 @@ module OpenSSL::PKey
   end
   end
 
+  # Alias of PKeyError. Before version 4.0.0, this was a subclass of PKeyError.
+  RSAError = PKeyError
+
   class RSA
     include OpenSSL::Marshal
 
@@ -288,6 +352,18 @@ module OpenSSL::PKey
     # PKey#public_to_der.
     def public_key
       OpenSSL::PKey.read(public_to_der)
+    end
+
+    # :call-seq:
+    #    rsa.params -> hash
+    #
+    # Stores all parameters of key to a Hash.
+    #
+    # The hash has keys 'n', 'e', 'd', 'p', 'q', 'dmp1', 'dmq1', and 'iqmp'.
+    def params
+      %w{n e d p q dmp1 dmq1 iqmp}.map { |name|
+        [name, send(name)]
+      }.to_h
     end
 
     class << self
@@ -325,22 +401,19 @@ module OpenSSL::PKey
     #    rsa.private_encrypt(string, padding) -> String
     #
     # Encrypt +string+ with the private key.  +padding+ defaults to
-    # PKCS1_PADDING. The encrypted string output can be decrypted using
+    # PKCS1_PADDING, which is known to be insecure but is kept for backwards
+    # compatibility. The encrypted string output can be decrypted using
     # #public_decrypt.
     #
     # <b>Deprecated in version 3.0</b>.
     # Consider using PKey::PKey#sign_raw and PKey::PKey#verify_raw, and
     # PKey::PKey#verify_recover instead.
     def private_encrypt(string, padding = PKCS1_PADDING)
-      n or raise OpenSSL::PKey::RSAError, "incomplete RSA"
-      private? or raise OpenSSL::PKey::RSAError, "private key needed."
-      begin
-        sign_raw(nil, string, {
-          "rsa_padding_mode" => translate_padding_mode(padding),
-        })
-      rescue OpenSSL::PKey::PKeyError
-        raise OpenSSL::PKey::RSAError, $!.message
-      end
+      n or raise PKeyError, "incomplete RSA"
+      private? or raise PKeyError, "private key needed."
+      sign_raw(nil, string, {
+        "rsa_padding_mode" => translate_padding_mode(padding),
+      })
     end
 
     # :call-seq:
@@ -348,20 +421,17 @@ module OpenSSL::PKey
     #    rsa.public_decrypt(string, padding) -> String
     #
     # Decrypt +string+, which has been encrypted with the private key, with the
-    # public key.  +padding+ defaults to PKCS1_PADDING.
+    # public key.  +padding+ defaults to PKCS1_PADDING which is known to be
+    # insecure but is kept for backwards compatibility.
     #
     # <b>Deprecated in version 3.0</b>.
     # Consider using PKey::PKey#sign_raw and PKey::PKey#verify_raw, and
     # PKey::PKey#verify_recover instead.
     def public_decrypt(string, padding = PKCS1_PADDING)
-      n or raise OpenSSL::PKey::RSAError, "incomplete RSA"
-      begin
-        verify_recover(nil, string, {
-          "rsa_padding_mode" => translate_padding_mode(padding),
-        })
-      rescue OpenSSL::PKey::PKeyError
-        raise OpenSSL::PKey::RSAError, $!.message
-      end
+      n or raise PKeyError, "incomplete RSA"
+      verify_recover(nil, string, {
+        "rsa_padding_mode" => translate_padding_mode(padding),
+      })
     end
 
     # :call-seq:
@@ -369,20 +439,17 @@ module OpenSSL::PKey
     #    rsa.public_encrypt(string, padding) -> String
     #
     # Encrypt +string+ with the public key.  +padding+ defaults to
-    # PKCS1_PADDING. The encrypted string output can be decrypted using
+    # PKCS1_PADDING, which is known to be insecure but is kept for backwards
+    # compatibility. The encrypted string output can be decrypted using
     # #private_decrypt.
     #
     # <b>Deprecated in version 3.0</b>.
     # Consider using PKey::PKey#encrypt and PKey::PKey#decrypt instead.
     def public_encrypt(data, padding = PKCS1_PADDING)
-      n or raise OpenSSL::PKey::RSAError, "incomplete RSA"
-      begin
-        encrypt(data, {
-          "rsa_padding_mode" => translate_padding_mode(padding),
-        })
-      rescue OpenSSL::PKey::PKeyError
-        raise OpenSSL::PKey::RSAError, $!.message
-      end
+      n or raise PKeyError, "incomplete RSA"
+      encrypt(data, {
+        "rsa_padding_mode" => translate_padding_mode(padding),
+      })
     end
 
     # :call-seq:
@@ -390,20 +457,17 @@ module OpenSSL::PKey
     #    rsa.private_decrypt(string, padding) -> String
     #
     # Decrypt +string+, which has been encrypted with the public key, with the
-    # private key. +padding+ defaults to PKCS1_PADDING.
+    # private key. +padding+ defaults to PKCS1_PADDING, which is known to be
+    # insecure but is kept for backwards compatibility.
     #
     # <b>Deprecated in version 3.0</b>.
     # Consider using PKey::PKey#encrypt and PKey::PKey#decrypt instead.
     def private_decrypt(data, padding = PKCS1_PADDING)
-      n or raise OpenSSL::PKey::RSAError, "incomplete RSA"
-      private? or raise OpenSSL::PKey::RSAError, "private key needed."
-      begin
-        decrypt(data, {
-          "rsa_padding_mode" => translate_padding_mode(padding),
-        })
-      rescue OpenSSL::PKey::PKeyError
-        raise OpenSSL::PKey::RSAError, $!.message
-      end
+      n or raise PKeyError, "incomplete RSA"
+      private? or raise PKeyError, "private key needed."
+      decrypt(data, {
+        "rsa_padding_mode" => translate_padding_mode(padding),
+      })
     end
 
     PKCS1_PADDING = 1
@@ -422,7 +486,7 @@ module OpenSSL::PKey
       when PKCS1_OAEP_PADDING
         "oaep"
       else
-        raise OpenSSL::PKey::PKeyError, "unsupported padding mode"
+        raise PKeyError, "unsupported padding mode"
       end
     end
   end

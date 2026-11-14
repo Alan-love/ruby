@@ -217,9 +217,29 @@ VALUE rb_ractor_make_shareable(VALUE obj);
  *
  * @param[in]   obj              Arbitrary ruby object to duplicate.
  * @exception   rb_eRactorError  Ractors cannot share `obj` by nature.
- * @return      A deep copy of `obj` which is sharable among Ractors.
+ * @return      A deep copy of `obj` which is shareable among Ractors.
  */
 VALUE rb_ractor_make_shareable_copy(VALUE obj);
+
+/**
+ * Marks the passed object as shareable, without any check.  This is for
+ * objects which the caller knows are safe to be shared among Ractors, for
+ * instance because they are frozen and only refer to shareable objects.
+ *
+ * @param[out]  obj  Arbitrary ruby object, except special constants.
+ * @return      Passed `obj`.
+ * @post        Multiple Ractors can share `obj`.
+ * @warning     No check is done.  Marking an unsafe object as shareable
+ *              breaks the Ractor isolation.
+ * @warning     Do not make objects shareable more than needed.  A shareable
+ *              object is out of the reach of a local GC, so it is not
+ *              collected until a global GC runs.  This is for the few objects
+ *              which live as long as the process, typically internal
+ *              constants, not for objects created per call.
+ * @note        Do not call this directly; use #RB_OBJ_SET_SHAREABLE, or
+ *              #RB_OBJ_SET_FROZEN_SHAREABLE to freeze at the same time.
+ */
+VALUE rb_obj_set_shareable(VALUE obj);
 
 RBIMPL_SYMBOL_EXPORT_END()
 
@@ -259,6 +279,30 @@ rb_ractor_shareable_p(VALUE obj)
     else {
         return rb_ractor_shareable_p_continue(obj);
     }
+}
+
+// TODO: optimize on interpreter core
+
+/**
+ * Wrapper of rb_obj_set_shareable().  Use this macro, not the function.
+ */
+#ifndef RB_OBJ_SET_SHAREABLE
+#define RB_OBJ_SET_SHAREABLE(obj) rb_obj_set_shareable(obj)
+#endif
+
+/**
+ * Freezes and marks the object as shareable.  The same warning and note as
+ * rb_obj_set_shareable() apply.
+ *
+ * @param[out]  obj  Arbitrary ruby object, except special constants.
+ * @return      Passed `obj`.
+ */
+static inline VALUE
+RB_OBJ_SET_FROZEN_SHAREABLE(VALUE obj)
+{
+    RB_OBJ_FREEZE(obj);
+    RB_OBJ_SET_SHAREABLE(obj);
+    return obj;
 }
 
 #endif /* RUBY_RACTOR_H */

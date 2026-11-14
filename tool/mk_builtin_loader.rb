@@ -1,195 +1,237 @@
 # Parse built-in script and make rbinc file
 
-require 'ripper'
+require 'json'
+require 'open3'
 require 'stringio'
 require_relative 'ruby_vm/helpers/c_escape'
 
-def string_literal(lit, str = [])
-  while lit
-    case lit.first
-    when :string_concat, :string_embexpr, :string_content
-      _, *lit = lit
-      lit.each {|s| string_literal(s, str)}
-      return str
-    when :string_literal
-      _, lit = lit
-    when :@tstring_content
-      str << lit[1]
-      return str
-    else
-      raise "unexpected #{lit.first}"
-    end
+SUBLIBS = {}
+REQUIRED = {}
+BUILTIN_ATTRS = %w[leaf inline_block use_block c_trace without_interrupts caller_user_box always_inline]
+
+module CompileWarning
+  @@warnings = 0
+
+  def warn(message)
+    @@warnings += 1
+    super
+  end
+
+  def self.reset
+    w, @@warnings = @@warnings, 0
+    w.nonzero?
   end
 end
 
-def inline_text argc, arg1
-  raise "argc (#{argc}) of inline! should be 1" unless argc == 1
-  arg1 = string_literal(arg1)
-  raise "1st argument should be string literal" unless arg1
-  arg1.join("").rstrip
-end
+Warning.extend CompileWarning
 
-def make_cfunc_name inlines, name, lineno
-  case name
-  when /\[\]/
-    name = '_GETTER'
-  when /\[\]=/
-    name = '_SETTER'
-  else
-    name = name.tr('!?', 'EP')
-  end
-
-  base = "builtin_inline_#{name}_#{lineno}"
-  if inlines[base]
-    1000.times{|i|
-      name = "#{base}_#{i}"
-      return name unless inlines[name]
-    }
-    raise "too many functions in same line..."
-  else
-    base
-  end
-end
-
-def collect_locals tree
-  _type, name, (line, _cols) = tree
-  if locals = LOCALS_DB[[name, line]]
-    locals
-  else
-    if false # for debugging
-      pp LOCALS_DB
-      raise "not found: [#{name}, #{line}]"
-    end
-  end
-end
-
-def collect_builtin base, tree, name, bs, inlines, locals = nil
-  while tree
-    recv = sep = mid = args = nil
-    case tree.first
-    when :def
-      locals = collect_locals(tree[1])
-      tree = tree[3]
-      next
-    when :defs
-      locals = collect_locals(tree[3])
-      tree = tree[5]
-      next
-    when :class
-      name = 'class'
-      tree = tree[3]
-      next
-    when :sclass, :module
-      name = 'class'
-      tree = tree[2]
-      next
-    when :method_add_arg
-      _, mid, (_, (_, args)) = tree
-      case mid.first
-      when :call
-        _, recv, sep, mid = mid
-      when :fcall
-        _, mid = mid
-      else
-        mid = nil
-      end
-    when :vcall
-      _, mid = tree
-    when :command               # FCALL
-      _, mid, (_, args) = tree
-    when :call, :command_call   # CALL
-      _, recv, sep, mid, (_, args) = tree
-    end
-
-    if mid
-      raise "unknown sexp: #{mid.inspect}" unless %i[@ident @const].include?(mid.first)
-      _, mid, (lineno,) = mid
-      if recv
-        func_name = nil
-        case recv.first
-        when :var_ref
-          _, recv = recv
-          if recv.first == :@const and recv[1] == "Primitive"
-            func_name = mid.to_s
-          end
-        when :vcall
-          _, recv = recv
-          if recv.first == :@ident and recv[1] == "__builtin"
-            func_name = mid.to_s
-          end
-        end
-        collect_builtin(base, recv, name, bs, inlines) unless func_name
-      else
-        func_name = mid[/\A__builtin_(.+)/, 1]
-      end
-      if func_name
-        cfunc_name = func_name
-        args.pop unless (args ||= []).last
-        argc = args.size
-
-        if /(.+)[\!\?]\z/ =~ func_name
-          case $1
-          when 'attr'
-            text = inline_text(argc, args.first)
-            if text != 'inline'
-              raise "Only 'inline' is allowed to be annotated (but got: '#{text}')"
-            end
-            break
-          when 'cstmt'
-            text = inline_text argc, args.first
-
-            func_name = "_bi#{inlines.size}"
-            cfunc_name = make_cfunc_name(inlines, name, lineno)
-            inlines[cfunc_name] = [lineno, text, locals, func_name]
-            argc -= 1
-          when 'cexpr', 'cconst'
-            text = inline_text argc, args.first
-            code = "return #{text};"
-
-            func_name = "_bi#{inlines.size}"
-            cfunc_name = make_cfunc_name(inlines, name, lineno)
-
-            locals = [] if $1 == 'cconst'
-            inlines[cfunc_name] = [lineno, code, locals, func_name]
-            argc -= 1
-          when 'cinit'
-            text = inline_text argc, args.first
-            func_name = nil # required
-            inlines[inlines.size] = [lineno, text, nil, nil]
-            argc -= 1
-          when 'mandatory_only'
-            func_name = nil
-          when 'arg'
-            argc == 1 or raise "unexpected argument number #{argc}"
-            (arg = args.first)[0] == :symbol_literal or raise "symbol literal expected #{args}"
-            (arg = arg[1])[0] == :symbol or raise "symbol expected #{arg}"
-            (var = arg[1] and var = var[1]) or raise "argument name expected #{arg}"
-            func_name = nil
-          end
-        end
-
-        if bs[func_name] &&
-           bs[func_name] != [argc, cfunc_name]
-          raise "same builtin function \"#{func_name}\", but different arity (was #{bs[func_name]} but #{argc})"
-        end
-
-        bs[func_name] = [argc, cfunc_name] if func_name
-      end
-      break unless tree = args
-    end
-
-    tree.each do |t|
-      collect_builtin base, t, name, bs, inlines, locals if Array === t
-    end
-    break
-  end
-end
-
-# ruby mk_builtin_loader.rb TARGET_FILE.rb
+# ruby mk_builtin_loader.rb path/to/dump_ast TARGET_FILE.rb
 # #=> generate TARGET_FILE.rbinc
 #
+# dump_ast is a standalone C program (tool/dump_ast.c) that parses Ruby files
+# with prism and dumps the AST as JSON. It must be compiled with CC before this
+# script can run, which means rbinc generation is skipped during `make up`
+# (where CC=false). The rbinc files are gitignored build artifacts, so they do
+# not need to be present in srcdir after `make up` — they will be generated in
+# the build directory during `make all` once dump_ast has been compiled.
 
 LOCALS_DB = {} # [method_name, first_line] = locals
+
+# Extract the contents of the given string node.
+def extract_string_literal(node)
+  case node["type"]
+  when "StringNode"
+    node["unescaped"]
+  when "InterpolatedStringNode"
+    node["parts"].map { |part| extract_string_literal(part) }.join
+  else
+    raise "unexpected #{node["type"]}"
+  end
+end
+
+# Retrieve the line number of the given node in the source.
+def line_number(source, node)
+  source.b.byteslice(0, node["location"]["start"]).count("\n") + 1
+end
+
+def visit_call_node(source, node, name, locals, requires, bs, inlines)
+  # If this is a call to require or require relative with a single string node
+  # argument, then we will attempt to find the file that is being required and
+  # add it to the files that should be processed.
+  if %w[require require_relative].include?(node["name"]) && !node["arguments"].nil? && (argument = node["arguments"]["arguments"][0])["type"] == "StringNode"
+    requires << argument["unescaped"]
+    return true
+  end
+
+  primitive_name = nil
+
+  receiver = node["receiver"]
+
+  if (!receiver.nil? && receiver["type"] == "ConstantReadNode" && receiver["name"] == "Primitive") ||
+     (!receiver.nil? && receiver["type"] == "CallNode" && receiver["flags"].include?("VARIABLE_CALL") && receiver["name"] == "__builtin")
+    primitive_name = node["name"]
+  elsif node["name"].start_with?("__builtin_")
+    primitive_name = node["name"][10..-1]
+  else
+    # If we get here, then this isn't a primitive function call and we can
+    # continue the visit.
+    return true
+  end
+
+  # The name of the C function that we will be calling for this call node. It
+  # may change later in this method depending on the type of primitive.
+  cfunction_name = primitive_name
+
+  args = node["arguments"].nil? ? [] : node["arguments"]["arguments"]
+  argc = args.size
+
+  if primitive_name.match?(/[\!\?]$/)
+    case (primitive_macro = primitive_name[0...-1])
+    when "arg"
+      # This is a call to Primitive.arg!, which expects a single symbol argument
+      # detailing the name of the argument.
+      raise "unexpected argument number #{argc}" if argc != 1
+      raise "symbol literal expected, got #{args[0]["type"]}" if args[0]["type"] != "SymbolNode"
+      return true
+    when "attr"
+      # This is a call to Primitive.attr!, which expects a list of known
+      # symbols. We will check that each of the arguments is a symbol and that
+      # the symbol is one of the known symbols.
+      raise "args was empty" if argc == 0
+
+      args.each do |arg|
+        raise "#{arg["type"]} was not a SymbolNode" if arg["type"] != "SymbolNode"
+        raise "attr (#{arg["unescaped"]}) was not in: #{BUILTIN_ATTRS.join(", ")}" unless BUILTIN_ATTRS.include?(arg["unescaped"])
+      end
+
+      return true
+    when "local_self"
+      raise "`local_self` args must be empty" if argc != 0
+      raise "`local_self` requires `self` local to be present" unless locals.include?(:self)
+      return true
+    when "mandatory_only"
+      # This is a call to Primitive.mandatory_only?. This method does not
+      # require any further processing.
+      return true
+    when "cstmt", "cexpr", "cconst", "cinit"
+      # This is a call to Primitive.cstmt!, Primitive.cexpr!, Primitive.cconst!,
+      # or Primitive.cinit!. These methods expect a single string argument that
+      # is the C code that should be executed. We will extract the string, emit
+      # an inline function, and then continue the visit.
+      raise "argc (#{argc}) of inline! should be 1" if argc != 1
+
+      # The string literal keeps the line endings of the source file; normalize
+      # them so the generated code does not depend on how it was checked out.
+      text = extract_string_literal(args[0]).encode(universal_newline: true).rstrip
+      lineno = line_number(source, node)
+
+      case primitive_macro
+      when "cstmt", "cexpr", "cconst"
+        cfunction_name = "builtin_inline_#{name}_#{lineno}"
+        primitive_name = "_bi#{lineno}"
+
+        if primitive_macro == "cstmt"
+          inlines << [cfunction_name, lineno, text, locals, primitive_name]
+        else
+          inlines << [cfunction_name, lineno, "return #{text};", primitive_macro == "cexpr" ? locals : nil, primitive_name]
+        end
+      when "cinit"
+        inlines << [inlines.size, lineno, text, nil, nil]
+        return true
+      end
+
+      argc -= 1
+    else
+      # This is a call to Primitive that is not a known method, so it must be a
+      # regular C function. In this case we do not need any special processing.
+    end
+  end
+
+  bs << [primitive_name, argc, cfunction_name]
+  return true
+end
+
+def each_node(root, &blk)
+  return unless yield root
+
+  root.each do |key, value|
+    next if key == "type" || key == "location"
+
+    if value.is_a?(Hash)
+      each_node(value, &blk) if value.key?("type")
+    elsif value.is_a?(Array) && value[0].is_a?(Hash)
+      value.each { |node| each_node(node, &blk) }
+    end
+  end
+end
+
+def visit_node(source, root, name, locals, requires, bs, inlines)
+  each_node(root) do |node|
+    case node["type"]
+    when "CallNode"
+      visit_call_node(source, node, name, locals, requires, bs, inlines)
+    when "DefNode"
+      lineno = line_number(source, node)
+      visit_node(source, node["body"], name, LOCALS_DB[[node["name"], lineno]], requires, bs, inlines) if node["body"]
+      false
+    when "ClassNode", "ModuleNode", "SingletonClassNode"
+      visit_node(source, node["body"], "class", nil, requires, bs, inlines) if node["body"]
+      false
+    else
+      true
+    end
+  end
+end
+
+def collect_builtins(dump_ast, file)
+  stdout, stderr, status = Open3.capture3(dump_ast, file)
+  unless status.success?
+    warn(stderr)
+    exit(1)
+  end
+
+  # dump_ast reports byte offsets against the raw file bytes, so the source
+  # must be read in binary mode; text mode would convert CRLF to LF on Windows
+  # and shift every offset.
+  source = File.binread(file)
+  root = JSON.parse(stdout)
+  visit_node(source, root, "top", nil, requires = [], builtins = [], inlines = [])
+
+  requires.each do |sublib|
+    if File.exist?(f = File.join(@dir, sublib)+".rb")
+      puts "- #{@base}.rb requires #{sublib}"
+      if REQUIRED[sublib]
+        warn "!!! #{sublib} is required from #{REQUIRED[sublib]} already; ignored"
+      else
+        REQUIRED[sublib] = @base
+        (SUBLIBS[@base] ||= []) << sublib
+      end
+      ARGV.push(f)
+    end
+  end
+
+  processed_builtins = {}
+  builtins.each do |(primitive_name, argc, cfunction_name)|
+    if processed_builtins.key?(primitive_name) && processed_builtins[primitive_name] != [argc, cfunction_name]
+      raise "same builtin function \"#{primitive_name}\", but different arity (was #{processed_builtins[primitive_name]} but #{argc})"
+    end
+
+    processed_builtins[primitive_name] = [argc, cfunction_name]
+  end
+
+  processed_inlines = {}
+  inlines.each do |(cfunction_name, lineno, text, locals, primitive_name)|
+    if processed_inlines.key?(cfunction_name)
+      found = 1000.times.find { |i| !processed_inlines.key?("#{cfunction_name}_#{i}") }
+      raise "too many functions in same line..." unless found
+      cfunction_name = "#{cfunction_name}_#{found}"
+    end
+
+    processed_inlines[cfunction_name] = [lineno, text, locals, primitive_name]
+  end
+
+  [processed_builtins, processed_inlines]
+end
 
 def collect_iseq iseq_ary
   # iseq_ary.each_with_index{|e, i| p [i, e]}
@@ -220,11 +262,19 @@ end
 
 def generate_cexpr(ofile, lineno, line_file, body_lineno, text, locals, func_name)
   f = StringIO.new
+
+  # Avoid generating fetches of lvars we don't need. This is imperfect as it
+  # will match text inside strings or other false positives.
+  local_candidates = text.scan(/[a-zA-Z_][a-zA-Z0-9_]*/)
+
   f.puts '{'
   lineno += 1
-  locals.reverse_each.with_index{|param, i|
+  # locals is nil outside methods
+  locals&.reverse_each&.with_index{|param, i|
     next unless Symbol === param
-    f.puts "MAYBE_UNUSED(const VALUE) #{param} = rb_vm_lvar(ec, #{-3 - i});"
+    param = param.to_s
+    next unless local_candidates.include?(param)
+    f.puts "MAYBE_UNUSED(const VALUE) #{param} = ec->cfp->ep[#{-3 - i}];"
     lineno += 1
   }
   f.puts "#line #{body_lineno} \"#{line_file}\""
@@ -241,22 +291,26 @@ def generate_cexpr(ofile, lineno, line_file, body_lineno, text, locals, func_nam
   return lineno, f.string
 end
 
-def mk_builtin_header file
+def mk_builtin_header dump_ast, file
+  @dir = File.dirname(file)
   base = File.basename(file, '.rb')
+  @base = base
   ofile = "#{file}inc"
 
-  # bs = { func_name => argc }
-  code = File.read(file)
-  collect_iseq RubyVM::InstructionSequence.compile(code).to_a
-  collect_builtin(base, Ripper.sexp(code), 'top', bs = {}, inlines = {})
-
   begin
-    f = open(ofile, 'w')
-  rescue Errno::EACCES
-    # Fall back to the current directory
-    f = open(File.basename(ofile), 'w')
+    verbose, $VERBOSE = $VERBOSE, true
+    collect_iseq RubyVM::InstructionSequence.compile_file(file).to_a
+  ensure
+    $VERBOSE = verbose
   end
-  begin
+  if warnings = CompileWarning.reset
+    raise "#{warnings} warnings in #{file}"
+  end
+
+  # bs = { func_name => argc }
+  bs, inlines = collect_builtins(dump_ast, file)
+
+  StringIO.open do |f|
     if File::ALT_SEPARATOR
       file = file.tr(File::ALT_SEPARATOR, File::SEPARATOR)
       ofile = ofile.tr(File::ALT_SEPARATOR, File::SEPARATOR)
@@ -293,43 +347,13 @@ def mk_builtin_header file
       end
     }
 
-    bs.each_pair{|func, (argc, cfunc_name)|
-      decl = ', VALUE' * argc
-      argv = argc                    \
-           . times                   \
-           . map {|i|", argv[#{i}]"} \
-           . join('')
-      f.puts %'static void'
-      f.puts %'mjit_compile_invokebuiltin_for_#{func}(FILE *f, long index, unsigned stack_size, bool inlinable_p)'
-      f.puts %'{'
-      f.puts %'    fprintf(f, "    VALUE self = GET_SELF();\\n");'
-      f.puts %'    fprintf(f, "    typedef VALUE (*func)(rb_execution_context_t *, VALUE#{decl});\\n");'
-      if inlines.has_key? cfunc_name
-        body_lineno, text, locals, func_name = inlines[cfunc_name]
-        lineno, str = generate_cexpr(ofile, lineno, line_file, body_lineno, text, locals, func_name)
-        f.puts %'    if (inlinable_p) {'
-        str.gsub(/^(?!#)/, '    ').each_line {|i|
-          j = RubyVM::CEscape.rstring2cstr(i).dup
-          j.sub!(/^    return\b/ , '    val =')
-          f.printf(%'        fprintf(f, "%%s", %s);\n', j)
-        }
-        f.puts(%'        return;')
-        f.puts(%'    }')
+    if SUBLIBS[base]
+      f.puts "// sub libraries"
+      SUBLIBS[base].each do |sub|
+        f.puts %[#include #{(sub+".rbinc").dump}]
       end
-      if argc > 0
-        f.puts %'    if (index == -1) {'
-        f.puts %'        fprintf(f, "    const VALUE *argv = &stack[%d];\\n", stack_size - #{argc});'
-        f.puts %'    }'
-        f.puts %'    else {'
-        f.puts %'        fprintf(f, "    const unsigned int lnum = GET_ISEQ()->body->local_table_size;\\n");'
-        f.puts %'        fprintf(f, "    const VALUE *argv = GET_EP() - lnum - VM_ENV_DATA_SIZE + 1 + %ld;\\n", index);'
-        f.puts %'    }'
-      end
-      f.puts %'    fprintf(f, "    func f = (func)%"PRIuVALUE"; /* == #{cfunc_name} */\\n", (VALUE)#{cfunc_name});'
-      f.puts %'    fprintf(f, "    val = f(ec, self#{argv});\\n");'
-      f.puts %'}'
       f.puts
-    }
+    end
 
     f.puts "void Init_builtin_#{base}(void)"
     f.puts "{"
@@ -338,9 +362,9 @@ def mk_builtin_header file
     f.puts "  // table definition"
     f.puts "  static const struct rb_builtin_function #{table}[] = {"
     bs.each.with_index{|(func, (argc, cfunc_name)), i|
-      f.puts "    RB_BUILTIN_FUNCTION(#{i}, #{func}, #{cfunc_name}, #{argc}, mjit_compile_invokebuiltin_for_#{func}),"
+      f.puts "    RB_BUILTIN_FUNCTION(#{i}, #{func}, #{cfunc_name}, #{argc}),"
     }
-    f.puts "    RB_BUILTIN_FUNCTION(-1, NULL, NULL, 0, 0),"
+    f.puts "    RB_BUILTIN_FUNCTION(-1, NULL, NULL, 0),"
     f.puts "  };"
 
     f.puts
@@ -354,17 +378,32 @@ def mk_builtin_header file
     }
     f.puts "COMPILER_WARNING_POP"
 
+    if SUBLIBS[base]
+      f.puts
+      f.puts "  // sub libraries"
+      SUBLIBS[base].each do |sub|
+        f.puts "  Init_builtin_#{sub}();"
+      end
+    end
+
     f.puts
     f.puts "  // load"
     f.puts "  rb_load_with_builtin_functions(#{base.dump}, #{table});"
 
     f.puts "}"
-  ensure
-    f.close
+
+    begin
+      File.write(ofile, f.string)
+    rescue SystemCallError # EACCES, EPERM, EROFS, etc.
+      # Fall back to the current directory
+      File.write(File.basename(ofile), f.string)
+    end
   end
 end
 
+dump_ast = ARGV.shift
+
 ARGV.each{|file|
   # feature.rb => load_feature.inc
-  mk_builtin_header file
+  mk_builtin_header dump_ast, file
 }

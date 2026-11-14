@@ -35,7 +35,7 @@ class TestSocket_BasicSocket < Test::Unit::TestCase
       rescue Test::Unit::AssertionFailedError
         s.close
         if /aix/ =~ RUBY_PLATFORM
-          skip "Known bug in getsockopt(2) on AIX"
+          omit "Known bug in getsockopt(2) on AIX"
         end
         raise $!
       end
@@ -139,6 +139,23 @@ class TestSocket_BasicSocket < Test::Unit::TestCase
       # close_write raises if socket is not open
       assert_nothing_raised { csock.close }
       assert_raise(IOError) { csock.close_write }
+    end
+  end
+
+  def test_close_write_flushes_buffered_data
+    socks do |sserv, ssock, csock|
+      ssock.sync = false
+      ssock.write("buffered")
+
+      # close_write must flush the buffered bytes to the peer instead of
+      # silently dropping them and leaving them to be re-sent (and fail)
+      # on the subsequent #close.
+      ssock.close_write
+      assert_equal "buffered", csock.read(8)
+
+      # #close after #close_write must not raise Errno::EPIPE from trying
+      # to flush an orphaned write buffer into the shutdown socket.
+      assert_nothing_raised { ssock.close }
     end
   end
 

@@ -1,0 +1,127 @@
+require "test/unit"
+
+class TestObjSpaceRactor < Test::Unit::TestCase
+  def test_tracing_does_not_crash
+    assert_ractor(<<~RUBY, require: 'objspace')
+      ObjectSpace.trace_object_allocations do
+        r = Ractor.new do
+          _obj = 'a' * 1024
+        end
+
+        r.join
+      end
+    RUBY
+  end
+
+  # dump_all / memsize_of_all cover every Ractor's objspace, including other Ractors'
+  # unshareable objects
+  def test_dump_all_covers_all_ractors
+    assert_ractor(<<~'RUBY', require: 'objspace')
+      ready = Ractor::Port.new
+      ch = Ractor.new(ready) do |port|
+        marker = +"DUMP_ALL_MARKER_FOREIGN"
+        port << :built
+        Ractor.receive
+        marker.size
+      end
+      ready.receive
+
+      dump = ObjectSpace.dump_all(output: :string)
+      assert_include dump, "DUMP_ALL_MARKER_FOREIGN"
+
+      ch.send(:go)
+      ch.value
+    RUBY
+  end
+
+  def test_undefine_finalizer
+    assert_ractor(<<~'RUBY', timeout: 20, require: 'objspace', signal: :SEGV)
+      def fin
+        ->(id) { }
+      end
+      ractors = 5.times.map do
+        Ractor.new do
+          10_000.times do
+            o = Object.new
+            ObjectSpace.define_finalizer(o, fin)
+            ObjectSpace.undefine_finalizer(o)
+          end
+        end
+      end
+
+      ractors.each(&:join)
+    RUBY
+  end
+
+  def test_copy_finalizer
+    assert_ractor(<<~'RUBY', require: 'objspace')
+      def fin
+        ->(id) { }
+      end
+      OBJ = Object.new
+      ObjectSpace.define_finalizer(OBJ, fin)
+      OBJ.freeze
+
+      ractors = 5.times.map do
+        Ractor.new do
+          10_000.times do
+            OBJ.clone
+          end
+        end
+      end
+
+      ractors.each(&:join)
+    RUBY
+  end
+
+  # A joined-but-not-valued Ractor keeps its objspace as a zombie.
+  # ObjectSpace.dump_all should still walk it for shareables.
+  def test_dump_all_includes_zombie_objspace
+    assert_ractor(<<~'RUBY', require: ['objspace', 'json'])
+      port = Ractor::Port.new
+      ch = Ractor.new(port) do |port|
+        port << Object.new.freeze
+        Ractor.receive
+      end
+      obj = port.receive
+      ch.send(:go)
+      ch.join
+      loop until ch.inspect =~ /terminated/ # unfortunate
+
+      needle = JSON.parse(ObjectSpace.dump(obj))["address"] # relies on non-moving collector
+      found = ObjectSpace.dump_all(output: :string).each_line.any? do |line|
+        json = JSON.parse(line) rescue nil
+        json && json["address"] == needle
+      end
+      assert found, "zombie objspace object missing from dump_all"
+    RUBY
+  end
+
+  def test_trace_object_allocations_with_ractor_tracepoint
+    # Test that ObjectSpace.trace_object_allocations works globally across all Ractors
+    assert_ractor(<<~'RUBY', require: 'objspace')
+      ObjectSpace.trace_object_allocations do
+        obj1 = Object.new; line1 = __LINE__
+        assert_equal __FILE__, ObjectSpace.allocation_sourcefile(obj1)
+        assert_equal line1, ObjectSpace.allocation_sourceline(obj1)
+
+        r = Ractor.new {
+          obj = Object.new; line = __LINE__
+          [line, obj]
+        }
+
+        obj2 = Object.new; line2 = __LINE__
+        assert_equal __FILE__, ObjectSpace.allocation_sourcefile(obj2)
+        assert_equal line2, ObjectSpace.allocation_sourceline(obj2)
+
+        expected_line, ractor_obj = r.value
+        assert_equal __FILE__, ObjectSpace.allocation_sourcefile(ractor_obj)
+        assert_equal expected_line, ObjectSpace.allocation_sourceline(ractor_obj)
+
+        obj3 = Object.new; line3 = __LINE__
+        assert_equal __FILE__, ObjectSpace.allocation_sourcefile(obj3)
+        assert_equal line3, ObjectSpace.allocation_sourceline(obj3)
+      end
+    RUBY
+  end
+end

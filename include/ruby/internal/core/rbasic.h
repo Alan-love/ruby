@@ -55,23 +55,27 @@ enum ruby_rvalue_flags {
     RVALUE_EMBED_LEN_MAX = RBIMPL_RVALUE_EMBED_LEN_MAX
 };
 
+#if (SIZEOF_VALUE < SIZEOF_UINT64_T)
+#define RBASIC_SHAPE_ID_FIELD 1
+#else
+#define RBASIC_SHAPE_ID_FIELD 0
+#endif
+
 /**
- * Ruby's object's,  base components.  Every  single ruby objects have  them in
- * common.
+ * Ruby object's base components. All Ruby objects have them in common.
  */
 struct
 RUBY_ALIGNAS(SIZEOF_VALUE)
 RBasic {
 
     /**
-     * Per-object  flags.  Each  ruby  objects have  their own  characteristics
-     * apart from their  classes.  For instance whether an object  is frozen or
-     * not is not  controlled by its class.  This is  where such properties are
-     * stored.
+     * Per-object flags.   Each Ruby object  has its own  characteristics apart
+     * from its class.  For instance, whether an object is frozen or not is not
+     * controlled by its class.  This is where such properties are stored.
      *
      * @see enum ::ruby_fl_type
      *
-     * @note  This is ::VALUE rather than  an enum for alignment purpose.  Back
+     * @note  This is ::VALUE rather than  an enum for alignment purposes.  Back
      *        in the 1990s there were no such thing like `_Alignas` in C.
      */
     VALUE flags;
@@ -79,13 +83,17 @@ RBasic {
     /**
      * Class of an object.  Every object has its class.  Also, everything is an
      * object  in Ruby.   This means  classes are  also objects.   Classes have
-     * their own classes,  classes of classes have their classes,  too ...  and
-     * it recursively continues forever.
+     * their own classes,  classes  of classes have their classes too,  and  it
+     * recursively continues forever.
      *
-     * Also note the `const` qualifier.  In  ruby an object cannot "change" its
+     * Also note the `const` qualifier.  In Ruby, an object cannot "change" its
      * class.
      */
     const VALUE klass;
+
+#if RBASIC_SHAPE_ID_FIELD
+    VALUE shape_id;
+#endif
 
 #ifdef __cplusplus
   public:
@@ -102,8 +110,14 @@ RBasic {
     RBasic() :
         flags(RBIMPL_VALUE_NULL),
         klass(RBIMPL_VALUE_NULL)
+#if RBASIC_SHAPE_ID_FIELD
+        , shape_id(RBIMPL_VALUE_NULL)
+#endif
     {
     }
+# define RBASIC_INIT RBasic()
+#else
+# define RBASIC_INIT {RBIMPL_VALUE_NULL}
 #endif
 };
 

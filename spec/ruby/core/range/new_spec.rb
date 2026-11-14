@@ -25,12 +25,12 @@ describe "Range.new" do
   end
 
   it "raises an ArgumentError when the given start and end can't be compared by using #<=>" do
-    -> { Range.new(1, mock('x'))         }.should raise_error(ArgumentError)
-    -> { Range.new(mock('x'), mock('y')) }.should raise_error(ArgumentError)
+    -> { Range.new(1, mock('x'))         }.should.raise(ArgumentError)
+    -> { Range.new(mock('x'), mock('y')) }.should.raise(ArgumentError)
 
     b = mock('x')
     (a = mock('nil')).should_receive(:<=>).with(b).and_return(nil)
-    -> { Range.new(a, b) }.should raise_error(ArgumentError)
+    -> { Range.new(a, b) }.should.raise(ArgumentError)
   end
 
   it "does not rescue exception raised in #<=> when compares the given start and end" do
@@ -38,28 +38,20 @@ describe "Range.new" do
     a = mock('b')
     a.should_receive(:<=>).with(b).and_raise(RangeSpecs::ComparisonError)
 
-    -> { Range.new(a, b) }.should raise_error(RangeSpecs::ComparisonError)
+    -> { Range.new(a, b) }.should.raise(RangeSpecs::ComparisonError)
   end
 
   describe "beginless/endless range" do
-    ruby_version_is ""..."2.7" do
-      it "does not allow range without left boundary" do
-        -> { Range.new(nil, 1) }.should raise_error(ArgumentError, /bad value for range/)
-      end
+    it "allows beginless left boundary" do
+      range = Range.new(nil, 1)
+      range.begin.should == nil
     end
 
-    ruby_version_is "2.7" do
-      it "allows beginless left boundary" do
-        range = Range.new(nil, 1)
-        range.begin.should == nil
-      end
+    it "distinguishes ranges with included and excluded right boundary" do
+      range_exclude = Range.new(nil, 1, true)
+      range_include = Range.new(nil, 1, false)
 
-      it "distinguishes ranges with included and excluded right boundary" do
-        range_exclude = Range.new(nil, 1, true)
-        range_include = Range.new(nil, 1, false)
-
-        range_exclude.should_not == range_include
-      end
+      range_exclude.should_not == range_include
     end
 
     it "allows endless right boundary" do
@@ -72,6 +64,14 @@ describe "Range.new" do
       range_include = Range.new(1, nil, false)
 
       range_exclude.should_not == range_include
+    end
+
+    it "creates a frozen range if the class is Range.class" do
+      Range.new(1, 2).should.frozen?
+    end
+
+    it "does not create a frozen range if the class is not Range.class" do
+      Class.new(Range).new(1, 2).should_not.frozen?
     end
   end
 end

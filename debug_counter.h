@@ -49,7 +49,7 @@ RB_DEBUG_COUNTER(cc_temp)       //           dummy CC (stack-allocated)
 RB_DEBUG_COUNTER(cc_found_in_ccs)      // count for CC lookup success in CCS
 RB_DEBUG_COUNTER(cc_not_found_in_ccs)  // count for CC lookup success in CCS
 
-RB_DEBUG_COUNTER(cc_ent_invalidate) // count for invalidating cc (cc->klass = 0)
+RB_DEBUG_COUNTER(cc_ent_invalidate) // count for invalidating cc (cc->klass = Qundef)
 RB_DEBUG_COUNTER(cc_cme_invalidate) // count for invalidating CME
 
 RB_DEBUG_COUNTER(cc_invalidate_leaf)          // count for invalidating klass if klass has no-subclasses
@@ -100,6 +100,14 @@ RB_DEBUG_COUNTER(ccf_opt_block_call)
 RB_DEBUG_COUNTER(ccf_opt_struct_aref)
 RB_DEBUG_COUNTER(ccf_opt_struct_aset)
 RB_DEBUG_COUNTER(ccf_super_method)
+RB_DEBUG_COUNTER(ccf_cfunc_other)
+RB_DEBUG_COUNTER(ccf_cfunc_only_splat)
+RB_DEBUG_COUNTER(ccf_cfunc_only_splat_kw)
+RB_DEBUG_COUNTER(ccf_iseq_bmethod)
+RB_DEBUG_COUNTER(ccf_noniseq_bmethod)
+RB_DEBUG_COUNTER(ccf_opt_send_complex)
+RB_DEBUG_COUNTER(ccf_opt_send_simple)
+RB_DEBUG_COUNTER(ccf_uncached)
 
 /*
  * control frame push counts.
@@ -127,30 +135,22 @@ RB_DEBUG_COUNTER(frame_R2C)
 RB_DEBUG_COUNTER(frame_C2C)
 RB_DEBUG_COUNTER(frame_C2R)
 
-/* instance variable counts
- *
- * * ivar_get_ic_hit/miss: ivar_get inline cache (ic) hit/miss counts (VM insn)
- * * ivar_get_ic_miss_serial: ivar_get ic miss reason by serial (VM insn)
- * * ivar_get_ic_miss_unset:                      ... by unset (VM insn)
- * * ivar_get_ic_miss_noobject:                   ... by "not T_OBJECT" (VM insn)
- * * ivar_set_...: same counts with ivar_set (VM insn)
- * * ivar_get/set_base: call counts of "rb_ivar_get/set()".
- *                      because of (1) ic miss.
- *                                 (2) direct call by C extensions.
- */
-RB_DEBUG_COUNTER(ivar_get_ic_hit)
-RB_DEBUG_COUNTER(ivar_get_ic_miss)
-RB_DEBUG_COUNTER(ivar_get_ic_miss_serial)
-RB_DEBUG_COUNTER(ivar_get_ic_miss_unset)
-RB_DEBUG_COUNTER(ivar_get_ic_miss_noobject)
-RB_DEBUG_COUNTER(ivar_set_ic_hit)
-RB_DEBUG_COUNTER(ivar_set_ic_miss)
-RB_DEBUG_COUNTER(ivar_set_ic_miss_serial)
-RB_DEBUG_COUNTER(ivar_set_ic_miss_unset)
-RB_DEBUG_COUNTER(ivar_set_ic_miss_iv_hit)
-RB_DEBUG_COUNTER(ivar_set_ic_miss_noobject)
-RB_DEBUG_COUNTER(ivar_get_base)
-RB_DEBUG_COUNTER(ivar_set_base)
+/* instance variable counts */
+RB_DEBUG_COUNTER(ivar_get_obj_hit)  // Only T_OBJECT hits
+RB_DEBUG_COUNTER(ivar_get_obj_miss) // Only T_OBJECT misses
+RB_DEBUG_COUNTER(ivar_get_ic_hit)   // All hits
+RB_DEBUG_COUNTER(ivar_get_ic_miss)  // All misses
+RB_DEBUG_COUNTER(ivar_set_ic_hit)   // All hits
+RB_DEBUG_COUNTER(ivar_set_obj_hit)  // Only T_OBJECT hits
+RB_DEBUG_COUNTER(ivar_set_obj_miss) // Only T_OBJECT misses
+RB_DEBUG_COUNTER(ivar_set_ic_miss)  // All misses
+RB_DEBUG_COUNTER(ivar_set_ic_miss_noobject)  // Miss because non T_OBJECT
+RB_DEBUG_COUNTER(ivar_get_base) // Calls to `rb_ivar_get` (very slow path)
+RB_DEBUG_COUNTER(ivar_set_base) // Calls to `ivar_set` (very slow path)
+RB_DEBUG_COUNTER(ivar_get_ic_miss_set)   // Misses on IV reads where the cache was wrong
+RB_DEBUG_COUNTER(ivar_get_cc_miss_set)   // Misses on attr_reader where the cache was wrong
+RB_DEBUG_COUNTER(ivar_get_ic_miss_unset) // Misses on IV read where the cache wasn't set
+RB_DEBUG_COUNTER(ivar_get_cc_miss_unset) // Misses on attr_reader where the cache wasn't set
 
 /* local variable counts
  *
@@ -186,8 +186,7 @@ RB_DEBUG_COUNTER(gc_major_force)
 RB_DEBUG_COUNTER(gc_major_oldmalloc)
 
 RB_DEBUG_COUNTER(gc_enter_start)
-RB_DEBUG_COUNTER(gc_enter_mark_continue)
-RB_DEBUG_COUNTER(gc_enter_sweep_continue)
+RB_DEBUG_COUNTER(gc_enter_continue)
 RB_DEBUG_COUNTER(gc_enter_rest)
 RB_DEBUG_COUNTER(gc_enter_finalizer)
 
@@ -216,7 +215,6 @@ RB_DEBUG_COUNTER(gc_isptr_maybe)
  * * [attr]
  *   * _ptr: R?? is not embed.
  *   * _embed: R?? is embed.
- *   * _transient: R?? uses transient heap.
  * * type specific attr.
  *   * str_shared: str is shared.
  *   * str_nofree:        nofree
@@ -242,8 +240,8 @@ RB_DEBUG_COUNTER(obj_promote)
 RB_DEBUG_COUNTER(obj_wb_unprotect)
 
 RB_DEBUG_COUNTER(obj_obj_embed)
-RB_DEBUG_COUNTER(obj_obj_transient)
 RB_DEBUG_COUNTER(obj_obj_ptr)
+RB_DEBUG_COUNTER(obj_obj_complex)
 
 RB_DEBUG_COUNTER(obj_str_ptr)
 RB_DEBUG_COUNTER(obj_str_embed)
@@ -252,7 +250,6 @@ RB_DEBUG_COUNTER(obj_str_nofree)
 RB_DEBUG_COUNTER(obj_str_fstr)
 
 RB_DEBUG_COUNTER(obj_ary_embed)
-RB_DEBUG_COUNTER(obj_ary_transient)
 RB_DEBUG_COUNTER(obj_ary_ptr)
 RB_DEBUG_COUNTER(obj_ary_extracapa)
 /*
@@ -276,11 +273,9 @@ RB_DEBUG_COUNTER(obj_hash_g8)
 RB_DEBUG_COUNTER(obj_hash_null)
 RB_DEBUG_COUNTER(obj_hash_ar)
 RB_DEBUG_COUNTER(obj_hash_st)
-RB_DEBUG_COUNTER(obj_hash_transient)
 RB_DEBUG_COUNTER(obj_hash_force_convert)
 
 RB_DEBUG_COUNTER(obj_struct_embed)
-RB_DEBUG_COUNTER(obj_struct_transient)
 RB_DEBUG_COUNTER(obj_struct_ptr)
 
 RB_DEBUG_COUNTER(obj_data_empty)
@@ -311,16 +306,21 @@ RB_DEBUG_COUNTER(obj_imemo_ment)
 RB_DEBUG_COUNTER(obj_imemo_iseq)
 RB_DEBUG_COUNTER(obj_imemo_env)
 RB_DEBUG_COUNTER(obj_imemo_tmpbuf)
-RB_DEBUG_COUNTER(obj_imemo_ast)
+RB_DEBUG_COUNTER(obj_imemo_cvar_entry)
 RB_DEBUG_COUNTER(obj_imemo_cref)
 RB_DEBUG_COUNTER(obj_imemo_svar)
 RB_DEBUG_COUNTER(obj_imemo_throw_data)
 RB_DEBUG_COUNTER(obj_imemo_ifunc)
 RB_DEBUG_COUNTER(obj_imemo_memo)
-RB_DEBUG_COUNTER(obj_imemo_parser_strterm)
 RB_DEBUG_COUNTER(obj_imemo_callinfo)
 RB_DEBUG_COUNTER(obj_imemo_callcache)
 RB_DEBUG_COUNTER(obj_imemo_constcache)
+RB_DEBUG_COUNTER(obj_imemo_fields)
+RB_DEBUG_COUNTER(obj_imemo_subclasses)
+RB_DEBUG_COUNTER(obj_imemo_cdhash)
+
+RB_DEBUG_COUNTER(opt_new_hit)
+RB_DEBUG_COUNTER(opt_new_miss)
 
 /* ar_table */
 RB_DEBUG_COUNTER(artable_hint_hit)
@@ -335,52 +335,12 @@ RB_DEBUG_COUNTER(heap_xmalloc)
 RB_DEBUG_COUNTER(heap_xrealloc)
 RB_DEBUG_COUNTER(heap_xfree)
 
-/* transient_heap */
-RB_DEBUG_COUNTER(theap_alloc)
-RB_DEBUG_COUNTER(theap_alloc_fail)
-RB_DEBUG_COUNTER(theap_evacuate)
-
 // VM sync
 RB_DEBUG_COUNTER(vm_sync_lock)
 RB_DEBUG_COUNTER(vm_sync_lock_enter)
 RB_DEBUG_COUNTER(vm_sync_lock_enter_nb)
 RB_DEBUG_COUNTER(vm_sync_lock_enter_cr)
 RB_DEBUG_COUNTER(vm_sync_barrier)
-
-/* mjit_exec() counts */
-RB_DEBUG_COUNTER(mjit_exec)
-RB_DEBUG_COUNTER(mjit_exec_not_added)
-RB_DEBUG_COUNTER(mjit_exec_not_ready)
-RB_DEBUG_COUNTER(mjit_exec_not_compiled)
-RB_DEBUG_COUNTER(mjit_exec_call_func)
-
-/* MJIT enqueue / unload */
-RB_DEBUG_COUNTER(mjit_add_iseq_to_process)
-RB_DEBUG_COUNTER(mjit_unload_units)
-
-/* MJIT <-> VM frame push counts */
-RB_DEBUG_COUNTER(mjit_frame_VM2VM)
-RB_DEBUG_COUNTER(mjit_frame_VM2JT)
-RB_DEBUG_COUNTER(mjit_frame_JT2JT)
-RB_DEBUG_COUNTER(mjit_frame_JT2VM)
-
-/* MJIT cancel counters */
-RB_DEBUG_COUNTER(mjit_cancel)
-RB_DEBUG_COUNTER(mjit_cancel_ivar_inline)
-RB_DEBUG_COUNTER(mjit_cancel_exivar_inline)
-RB_DEBUG_COUNTER(mjit_cancel_send_inline)
-RB_DEBUG_COUNTER(mjit_cancel_opt_insn) /* CALL_SIMPLE_METHOD */
-RB_DEBUG_COUNTER(mjit_cancel_invalidate_all)
-RB_DEBUG_COUNTER(mjit_cancel_leave)
-
-/* rb_mjit_unit_list length */
-RB_DEBUG_COUNTER(mjit_length_unit_queue)
-RB_DEBUG_COUNTER(mjit_length_active_units)
-RB_DEBUG_COUNTER(mjit_length_compact_units)
-RB_DEBUG_COUNTER(mjit_length_stale_units)
-
-/* Other MJIT counters */
-RB_DEBUG_COUNTER(mjit_compile_failures)
 
 /* load (not implemented yet) */
 /*
@@ -402,7 +362,7 @@ RB_DEBUG_COUNTER(load_path_is_not_realpath)
 
 enum rb_debug_counter_type {
 #define RB_DEBUG_COUNTER(name) RB_DEBUG_COUNTER_##name,
-#include __FILE__
+#include "debug_counter.h"
     RB_DEBUG_COUNTER_MAX
 #undef RB_DEBUG_COUNTER
 };

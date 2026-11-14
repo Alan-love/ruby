@@ -26,6 +26,10 @@
 # include <stddef.h>
 #endif
 
+#ifdef HAVE_SYS_TYPES_H
+# include <sys/types.h>         /* for ssize_t (note: on Windows ssize_t is */
+#endif                          /* `#define`d in ruby/config.h) */
+
 #include "ruby/internal/attr/nonnull.h"
 #include "ruby/internal/dllexport.h"
 #include "ruby/internal/value.h"
@@ -51,7 +55,7 @@ RBIMPL_SYMBOL_EXPORT_BEGIN()
 VALUE rb_big_new(size_t len, int sign);
 
 /**
- * Queries if  the passed bignum  instance is a  "bigzro".  What is  a bigzero?
+ * Queries if  the passed bignum  instance is a  "bigzero".  What is a bigzero?
  * Well, bignums  are for very big  integers, but can also  represent tiny ones
  * like -1,  0, 1.   Bigzero are  instances of bignums  whose values  are zero.
  * Knowing if a bignum is bigzero can  be handy on occasions, like for instance
@@ -793,7 +797,7 @@ size_t rb_absint_size(VALUE val, int *nlz_bits_ret);
  * @exception   rb_eTypeError  `val` doesn't respond to `#to_int`.
  * @retval      (size_t)-1     Overflowed.
  * @retval      otherwise
-                `((val_numbits * CHAR_BIT + word_numbits - 1) / word_numbits)`,
+ *              `((val_numbits * CHAR_BIT + word_numbits - 1) / word_numbits)`,
  *              where val_numbits is the number of bits of `abs(val)`.
  * @post        If  `nlz_bits_ret` is  not  `NULL` and  there  is no  overflow,
  *              `(return_value * word_numbits - val_numbits)`   is  stored   in
@@ -840,6 +844,47 @@ size_t rb_absint_numwords(VALUE val, size_t word_numbits, size_t *nlz_bits_ret);
  * ```
  */
 int rb_absint_singlebit_p(VALUE val);
+
+/**
+ * @name Flags for rb_int_parse_cstr()
+ * @{
+ */
+
+/** Allows a leading sign (`+` or `-`). */
+#define RB_INT_PARSE_SIGN       0x01
+
+/** Allows underscores between digits. */
+#define RB_INT_PARSE_UNDERSCORE 0x02
+
+/** Allows a base prefix (`0x`, `0b`, `0o`, `0d`). */
+#define RB_INT_PARSE_PREFIX     0x04
+
+/** Shorthand for all of the above flags combined. */
+#define RB_INT_PARSE_ALL        0x07
+
+/** Default flags (all features enabled). */
+#define RB_INT_PARSE_DEFAULT    0x07
+
+/** @} */
+
+/**
+ * Parses a C string to convert into a Ruby integer, with detailed control over
+ * parsing behaviour.  Unlike rb_cstr_to_inum(), this function can report the
+ * end position of the parsed integer and the number of parsed digits.
+ *
+ * @param[in]   str       Pointer to the string to parse.
+ * @param[in]   len       Length of `str` in bytes, or `-1` to use `strlen(str)`.
+ * @param[out]  endp      If not `NULL`, the pointer to the first unparsed
+ *                        character is stored here on return.
+ * @param[out]  ndigits   If not `NULL`, the number of parsed digits (excluding
+ *                        prefix, sign, and underscores) is stored here.
+ * @param[in]   base      Base of conversion.  `0` means auto-detect from
+ *                        prefix.  `2..36` for explicit base.
+ * @param[in]   flags     Bitwise or of `RB_INT_PARSE_*` macros.
+ * @return      A Ruby Integer (Fixnum or Bignum), or `Qnil` on parse failure
+ *              (when no digits are found).
+ */
+VALUE rb_int_parse_cstr(const char *str, ssize_t len, char **endp, size_t *ndigits, int base, int flags);
 
 RBIMPL_SYMBOL_EXPORT_END()
 

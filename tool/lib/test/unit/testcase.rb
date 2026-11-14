@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 require_relative 'assertions'
 require_relative '../../core_assertions'
+require_relative '../../ractor_assertions'
 
 module Test
   module Unit
@@ -137,6 +138,9 @@ module Test
 
       attr_reader :__name__ # :nodoc:
 
+      # Method name of this test.
+      alias method_name __name__
+
       PASSTHROUGH_EXCEPTIONS = [NoMemoryError, SignalException,
                                 Interrupt, SystemExit] # :nodoc:
 
@@ -144,8 +148,7 @@ module Test
       # Runs the tests reporting the status to +runner+
 
       def run runner
-        @options = runner.options
-
+        @__runner_options__ = runner.options
         trap "INFO" do
           runner.report.each_with_index do |msg, i|
             warn "\n%3d) %s" % [i + 1, msg]
@@ -161,7 +164,7 @@ module Test
         result = ""
 
         begin
-          @passed = nil
+          @__passed__ = nil
           self.before_setup
           self.setup
           self.after_setup
@@ -169,11 +172,11 @@ module Test
           result = "." unless io?
           time = Time.now - start_time
           runner.record self.class, self.__name__, self._assertions, time, nil
-          @passed = true
+          @__passed__ = true
         rescue *PASSTHROUGH_EXCEPTIONS
           raise
         rescue Exception => e
-          @passed = Test::Unit::PendedError === e
+          @__passed__ = Test::Unit::PendedError === e
           time = Time.now - start_time
           runner.record self.class, self.__name__, self._assertions, time, e
           result = runner.puke self.class, self.__name__, e
@@ -184,7 +187,7 @@ module Test
             rescue *PASSTHROUGH_EXCEPTIONS
               raise
             rescue Exception => e
-              @passed = false
+              @__passed__ = false
               runner.record self.class, self.__name__, self._assertions, time, e
               result = runner.puke self.class, self.__name__, e
             end
@@ -206,12 +209,12 @@ module Test
       def initialize name # :nodoc:
         @__name__ = name
         @__io__ = nil
-        @passed = nil
-        @@current = self # FIX: make thread local
+        @__passed__ = nil
+        @@__current__ = self # FIX: make thread local
       end
 
       def self.current # :nodoc:
-        @@current # FIX: make thread local
+        @@__current__ # FIX: make thread local
       end
 
       ##
@@ -263,7 +266,7 @@ module Test
       # Returns true if the test passed.
 
       def passed?
-        @passed
+        @__passed__
       end
 
       ##

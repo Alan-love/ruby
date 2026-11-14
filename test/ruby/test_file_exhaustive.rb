@@ -6,9 +6,10 @@ require "socket"
 require '-test-/file'
 
 class TestFileExhaustive < Test::Unit::TestCase
-  DRIVE = Dir.pwd[%r'\A(?:[a-z]:|//[^/]+/[^/]+)'i]
-  POSIX = /cygwin|mswin|bccwin|mingw|emx/ !~ RUBY_PLATFORM
-  NTFS = !(/mingw|mswin|bccwin/ !~ RUBY_PLATFORM)
+  ROOT_REGEXP = %r'\A(?:[a-z]:(?=(/))|//[^/]+/[^/]+)'i
+  DRIVE = Dir.pwd[ROOT_REGEXP]
+  POSIX = /cygwin|mswin|mingw/ !~ RUBY_PLATFORM
+  NTFS = !(/mingw|mswin/ !~ RUBY_PLATFORM)
 
   def assert_incompatible_encoding
     d = "\u{3042}\u{3044}".encode("utf-16le")
@@ -173,9 +174,7 @@ class TestFileExhaustive < Test::Unit::TestCase
   end
 
   def chardev
-    return @chardev if defined? @chardev
-    @chardev = File::NULL == "/dev/null" ? "/dev/null" : nil
-    @chardev
+    File::NULL
   end
 
   def blockdev
@@ -188,16 +187,42 @@ class TestFileExhaustive < Test::Unit::TestCase
     @blockdev
   end
 
+  def root_without_capabilities?
+    return false unless Process.uid == 0
+    return false unless system('command', '-v', 'capsh', out: File::NULL)
+    !system('capsh', '--has-p=CAP_DAC_OVERRIDE', out: File::NULL, err: File::NULL)
+  end
+
   def test_path
     [regular_file, utf8_file].each do |file|
       assert_equal(file, File.open(file) {|f| f.path})
       assert_equal(file, File.path(file))
-      o = Object.new
-      class << o; self; end.class_eval do
-        define_method(:to_path) { file }
-      end
+      o = Struct.new(:to_path).new(file)
+      assert_equal(file, File.path(o))
+      o = Struct.new(:to_str).new(file)
       assert_equal(file, File.path(o))
     end
+
+    conv_error = ->(method, msg = "converting with #{method}") {
+      test = ->(&new) do
+        o = new.(42)
+        assert_raise(TypeError, msg) {File.path(o)}
+
+        o = new.("abc".encode(Encoding::UTF_32BE))
+        assert_raise(Encoding::CompatibilityError, msg) {File.path(o)}
+
+        ["\0", "a\0", "a\0c"].each do |path|
+          o = new.(path)
+          assert_raise(ArgumentError, msg) {File.path(o)}
+        end
+      end
+
+      test.call(&:itself)
+      test.call(&Struct.new(method).method(:new))
+    }
+
+    conv_error[:to_path]
+    conv_error[:to_str]
   end
 
   def assert_integer(n)
@@ -233,7 +258,7 @@ class TestFileExhaustive < Test::Unit::TestCase
       assert_integer_or_nil(fs1.rdev_minor)
       assert_integer(fs1.ino)
       assert_integer(fs1.mode)
-      unless /emx|mswin|mingw/ =~ RUBY_PLATFORM
+      unless /mswin|mingw/ =~ RUBY_PLATFORM
         # on Windows, nlink is always 1. but this behavior will be changed
         # in the future.
         assert_equal(hardlinkfile ? 2 : 1, fs1.nlink)
@@ -275,6 +300,21 @@ class TestFileExhaustive < Test::Unit::TestCase
       end
     end
   end if NTFS
+
+  def test_stat_symlink_loop
+    return unless symlinkfile
+    path = make_tmp_filename("symlink_loop")
+    File.symlink(File.basename(path), path)
+    assert_predicate(File.lstat(path), :symlink?)
+    assert_raise(Errno::ELOOP) { File.stat(path) }
+  end
+
+  def test_exist_p_symlink_loop
+    return unless symlinkfile
+    path = make_tmp_filename("symlink_loop")
+    File.symlink(File.basename(path), path)
+    assert_file.not_exist?(path)
+  end
 
   def test_lstat
     return unless symlinkfile
@@ -332,7 +372,7 @@ class TestFileExhaustive < Test::Unit::TestCase
     assert_file.not_chardev?(regular_file)
     assert_file.not_chardev?(utf8_file)
     assert_file.not_chardev?(nofile)
-    assert_file.chardev?(chardev) if chardev
+    assert_file.chardev?(chardev)
   end
 
   def test_exist_p
@@ -640,7 +680,7 @@ class TestFileExhaustive < Test::Unit::TestCase
   end
 
   def test_birthtime
-    skip if RUBY_PLATFORM =~ /android/
+    omit if RUBY_PLATFORM =~ /android/
     [regular_file, utf8_file].each do |file|
       t1 = File.birthtime(file)
       t2 = File.open(file) {|f| f.birthtime}
@@ -651,7 +691,7 @@ class TestFileExhaustive < Test::Unit::TestCase
       # ignore unsupporting filesystems
     rescue Errno::EPERM
       # Docker prohibits statx syscall by the default.
-      skip("statx(2) is prohibited by seccomp")
+      omit("statx(2) is prohibited by seccomp")
     end
     assert_raise(Errno::ENOENT) { File.birthtime(nofile) }
   end if File.respond_to?(:birthtime)
@@ -688,6 +728,28 @@ class TestFileExhaustive < Test::Unit::TestCase
     assert_equal("link", File.ftype(symlinkfile))
     assert_raise(Errno::EEXIST) { File.symlink(regular_file, regular_file) }
     assert_raise(Errno::EEXIST) { File.symlink(utf8_file, utf8_file) }
+  end
+
+  def test_symlink_to_relative_directory
+    # A relative target is interpreted relative to the link's directory, not the
+    # current directory.  A relative target pointing at a directory must produce
+    # a directory symlink even when the current directory differs from the link's
+    # directory; otherwise Dir operations on the link fail (Windows).
+    Dir.mktmpdir(__method__.to_s) do |tmpdir|
+      Dir.chdir(tmpdir) do
+        Dir.mkdir("subdir")
+        Dir.mkdir(File.join("subdir", "target"))
+        link = File.join("subdir", "link")
+        begin
+          File.symlink("target", link)
+        rescue NotImplementedError, Errno::EACCES, Errno::EPERM => e
+          omit e.message
+        end
+        assert_file.symlink?(link)
+        assert_file.directory?(link)
+        assert(Dir.exist?(link), "relative directory symlink should be a directory")
+      end
+    end
   end
 
   def test_utime
@@ -772,20 +834,54 @@ class TestFileExhaustive < Test::Unit::TestCase
   if NTFS
     def test_readlink_junction
       base = File.basename(nofile)
-      err = IO.popen(%W"cmd.exe /c mklink /j #{base} .", chdir: @dir, err: %i[child out], &:read)
-      skip err unless $?.success?
+      err = IO.popen(%W"mklink /j #{base} .", chdir: @dir, err: %i[child out], &:read)
+      omit err unless $?.success?
       assert_equal(@dir, File.readlink(nofile))
     end
 
     def test_realpath_mount_point
       vol = IO.popen(["mountvol", DRIVE, "/l"], &:read).strip
       Dir.mkdir(mnt = File.join(@dir, mntpnt = "mntpnt"))
-      system("mountvol", mntpnt, vol, chdir: @dir)
+      err = IO.popen(%W"mountvol #{mntpnt} #{vol}", chdir: @dir, err: %i[child out], &:read)
+      omit err unless $?.success?
       assert_equal(mnt, File.realpath(mnt))
     ensure
-      system("mountvol", mntpnt, "/d", chdir: @dir)
+      system("mountvol", mntpnt, "/d", chdir: @dir, out: IO::NULL, err: IO::NULL)
     end
   end
+
+  def test_realpath_drive_relative_path
+    bug14640 = '[Bug #14640]'
+    drive = @dir[/\A[a-z]:/i]
+    omit "#{@dir} is not on a drive letter" unless drive
+    make_file("", File.join(@dir, "t"))
+    Dir.mkdir(File.join(@dir, "~"))
+    make_file("", File.join(@dir, "~", "t"))
+    assert_equal(File.realpath("t", @dir), File.realpath("#{drive}t", @dir), bug14640)
+    Dir.chdir(@dir) do
+      assert_equal(File.realpath("t"), File.realpath("#{drive}t"), bug14640)
+      assert_equal(File.realpath("."), File.realpath(drive), bug14640)
+      assert_equal(File.realdirpath("nofile"), File.realdirpath("#{drive}nofile"), bug14640)
+      assert_equal(File.realpath("t"), File.realpath("t", drive), bug14640)
+      assert_equal(File.realpath("t", "~"), File.realpath("#{drive}t", "~"), bug14640)
+      assert_equal(File.realpath("~"), File.realpath("~", drive), bug14640)
+      if other = ("A".."Z").find {|d| !"#{d}:".casecmp?(drive) && File.directory?("#{d}:/")}
+        Dir.chdir("#{other}:/") do
+          assert_equal(File.realpath("t", @dir), File.realpath("#{drive}t"), bug14640)
+          assert_equal(File.realpath("t", @dir), File.realpath("#{drive}t", "#{other}:/"), bug14640)
+        end
+      end
+    end
+    Dir.mkdir(dir = File.join(@dir, "\u3042"))
+    make_file("", File.join(dir, "t"))
+    Dir.chdir(dir) do
+      %w[US-ASCII ASCII-8BIT].each do |enc|
+        t = "t".encode(enc)
+        assert_equal(File.realpath(t), File.realpath("#{drive}t".encode(enc)), bug14640)
+        assert_equal(File.realpath(t), File.realpath(t, drive.encode(enc)), bug14640)
+      end
+    end
+  end if DRIVE
 
   def test_unlink
     assert_equal(1, File.unlink(regular_file))
@@ -820,6 +916,9 @@ class TestFileExhaustive < Test::Unit::TestCase
   def test_expand_path
     assert_equal(regular_file, File.expand_path(File.basename(regular_file), File.dirname(regular_file)))
     assert_equal(utf8_file, File.expand_path(File.basename(utf8_file), File.dirname(utf8_file)))
+    # On POSIX expand_path reaches the backward scan in strrdirsep too.  See
+    # test_extname for what that scan must not do.
+    assert_equal(File.expand_path("/" * 4096), File.expand_path("/" * 4096 + ".."))
   end
 
   if NTFS
@@ -872,9 +971,12 @@ class TestFileExhaustive < Test::Unit::TestCase
     bug9934 = '[ruby-core:63114] [Bug #9934]'
     require "objspace"
     path = File.expand_path("/foo")
-    assert_operator(ObjectSpace.memsize_of(path), :<=, path.bytesize + GC::INTERNAL_CONSTANTS[:RVALUE_SIZE], bug9934)
+    slot_size = Integer(ObjectSpace.dump(path)[/"slot_size":(\d+)/, 1])
+    assert_operator(ObjectSpace.memsize_of(path), :<=, path.bytesize + slot_size, bug9934)
     path = File.expand_path("/a"*25)
-    assert_equal(path.bytesize+1 + GC::INTERNAL_CONSTANTS[:RVALUE_SIZE], ObjectSpace.memsize_of(path), bug9934)
+    slot_size = Integer(ObjectSpace.dump(path)[/"slot_size":(\d+)/, 1])
+    assert_operator(ObjectSpace.memsize_of(path), :<=,
+                    (path.bytesize + 1) * 2 + slot_size, bug9934)
   end
 
   def test_expand_path_encoding
@@ -1119,7 +1221,7 @@ class TestFileExhaustive < Test::Unit::TestCase
 
   def test_expand_path_for_existent_username
     user = ENV['USER']
-    skip "ENV['USER'] is not set" unless user
+    omit "ENV['USER'] is not set" unless user
     assert_equal(ENV['HOME'], File.expand_path("~#{user}"))
   end unless DRIVE
 
@@ -1209,6 +1311,7 @@ class TestFileExhaustive < Test::Unit::TestCase
     assert_equal("foo", File.basename("foo", ".ext"))
     assert_equal("foo", File.basename("foo.ext", ".ext"))
     assert_equal("foo", File.basename("foo.ext", ".*"))
+    assert_raise(ArgumentError) {File.basename("", "\0")}
   end
 
   if NTFS
@@ -1273,9 +1376,10 @@ class TestFileExhaustive < Test::Unit::TestCase
     assert_equal(regular_file, File.dirname(regular_file, 0))
     assert_equal(@dir, File.dirname(regular_file, 1))
     assert_equal(File.dirname(@dir), File.dirname(regular_file, 2))
-    return if /mswin/ =~ RUBY_PLATFORM && ENV.key?('GITHUB_ACTIONS') # rootdir and tmpdir are in different drives
-    assert_equal(rootdir, File.dirname(regular_file, regular_file.count('/')))
     assert_raise(ArgumentError) {File.dirname(regular_file, -1)}
+    root = "#{@dir[ROOT_REGEXP]||?/}#{$1}"
+    assert_equal(root, File.dirname(regular_file, regular_file.count('/')))
+    assert_equal(root, File.dirname(regular_file, regular_file.count('/') + 100))
   end
 
   def test_dirname_encoding
@@ -1318,6 +1422,20 @@ class TestFileExhaustive < Test::Unit::TestCase
     bug3175 = '[ruby-core:29627]'
     assert_equal(".rb", File.extname("/tmp//bla.rb"), bug3175)
 
+    assert_equal("", File.extname(""))
+
+    # A path consisting only of separators must not make the backward scan in
+    # strrdirsep read before the beginning of the string.  The return value is
+    # correct either way, so a regression shows up only on a sanitizer build,
+    # and only once the string is too long to be embedded in its RVALUE.
+    seps = [File::SEPARATOR, File::ALT_SEPARATOR].compact
+    seps.each do |sep|
+      [1, 2, 4096].each do |len|
+        path = sep * len
+        assert_equal("", File.extname(path), "File.extname(#{sep.inspect} * #{len})")
+      end
+    end
+
     assert_incompatible_encoding {|d| File.extname(d)}
   end
 
@@ -1330,14 +1448,19 @@ class TestFileExhaustive < Test::Unit::TestCase
   end
 
   def test_join
-    s = "foo" + File::SEPARATOR + "bar" + File::SEPARATOR + "baz"
+    sep = File::SEPARATOR
+    s = "foo" + sep + "bar" + sep + "baz"
     assert_equal(s, File.join("foo", "bar", "baz"))
     assert_equal(s, File.join(["foo", "bar", "baz"]))
+    assert_equal(s, File.join("foo" + sep, "bar", sep + "baz"))
+    assert_equal(s, File.join("foo" + sep, sep + "bar" + sep, sep + "baz"))
 
     o = Object.new
     def o.to_path; "foo"; end
     assert_equal(s, File.join(o, "bar", "baz"))
-    assert_equal(s, File.join("foo" + File::SEPARATOR, "bar", File::SEPARATOR + "baz"))
+
+    s = sep + "foo"
+    assert_equal(s, File.join(sep, s))
   end
 
   def test_join_alt_separator
@@ -1408,7 +1531,7 @@ class TestFileExhaustive < Test::Unit::TestCase
   end
 
   def test_flock_exclusive
-    timeout = EnvUtil.apply_timeout_scale(0.1).to_s
+    timeout = EnvUtil.apply_timeout_scale(1).to_s
     File.open(regular_file, "r+") do |f|
       f.flock(File::LOCK_EX)
       assert_separately(["-rtimeout", "-", regular_file, timeout], "#{<<-"begin;"}\n#{<<-'end;'}")
@@ -1437,7 +1560,7 @@ class TestFileExhaustive < Test::Unit::TestCase
   end
 
   def test_flock_shared
-    timeout = EnvUtil.apply_timeout_scale(0.1).to_s
+    timeout = EnvUtil.apply_timeout_scale(1).to_s
     File.open(regular_file, "r+") do |f|
       f.flock(File::LOCK_SH)
       assert_separately(["-rtimeout", "-", regular_file, timeout], "#{<<-"begin;"}\n#{<<-'end;'}")
@@ -1466,6 +1589,7 @@ class TestFileExhaustive < Test::Unit::TestCase
   end
 
   def test_test
+    omit 'timestamp check is unstable on macOS' if RUBY_PLATFORM =~ /darwin/
     fn1 = regular_file
     hardlinkfile
     sleep(1.1)
@@ -1512,6 +1636,43 @@ class TestFileExhaustive < Test::Unit::TestCase
       assert_equal(File.executable?(f), test(?x, f), f)
       assert_equal(File.executable_real?(f), test(?X, f), f)
       assert_equal(File.zero?(f), test(?z, f), f)
+
+      stat = File.stat(f)
+      unless stat.chardev?
+        # null device may be accessed by other processes
+        assert_equal(stat.atime, File.atime(f), f)
+        assert_equal(stat.ctime, File.ctime(f), f)
+        assert_equal(stat.mtime, File.mtime(f), f)
+      end
+      assert_bool_equal(stat.blockdev?, File.blockdev?(f), f)
+      assert_bool_equal(stat.chardev?, File.chardev?(f), f)
+      assert_bool_equal(stat.directory?, File.directory?(f), f)
+      assert_bool_equal(stat.file?, File.file?(f), f)
+      assert_bool_equal(stat.setgid?, File.setgid?(f), f)
+      assert_bool_equal(stat.grpowned?, File.grpowned?(f), f)
+      assert_bool_equal(stat.sticky?, File.sticky?(f), f)
+      assert_bool_equal(File.lstat(f).symlink?, File.symlink?(f), f)
+      assert_bool_equal(stat.owned?, File.owned?(f), f)
+      assert_bool_equal(stat.pipe?, File.pipe?(f), f)
+      assert_bool_equal(stat.readable?, File.readable?(f), f)
+      assert_bool_equal(stat.readable_real?, File.readable_real?(f), f)
+      assert_equal(stat.size?, File.size?(f), f)
+      assert_bool_equal(stat.socket?, File.socket?(f), f)
+      assert_bool_equal(stat.setuid?, File.setuid?(f), f)
+      # It's possible in Linux to be uid 0, but not to have the CAP_DAC_OVERRIDE
+      # capability that allows skipping file permissions checks (e.g. some kinds
+      # of "rootless" container setups). In these cases, stat.writable? will be
+      # true (because it always returns true if Process.uid == 0), but
+      # File.writeable? will be false (because it actually asks the kernel to do
+      # an access check).
+      # Skip these two assertions in that case.
+      unless root_without_capabilities?
+        assert_bool_equal(stat.writable?, File.writable?(f), f)
+        assert_bool_equal(stat.writable_real?, File.writable_real?(f), f)
+      end
+      assert_bool_equal(stat.executable?, File.executable?(f), f)
+      assert_bool_equal(stat.executable_real?, File.executable_real?(f), f)
+      assert_bool_equal(stat.zero?, File.zero?(f), f)
     end
     assert_equal(false, test(?-, @dir, fn1))
     assert_equal(true, test(?-, fn1, fn1))
@@ -1575,6 +1736,13 @@ class TestFileExhaustive < Test::Unit::TestCase
     end
   end
 
+  def test_stat_subclass_allocate
+    # [Bug #22411]
+    klass = Class.new(File::Stat)
+    assert_instance_of(klass, klass.allocate)
+    assert_instance_of(klass, klass.new(regular_file))
+  end
+
   def test_stat_ftype
     assert_equal("directory", File::Stat.new(@dir).ftype)
     assert_equal("file", File::Stat.new(regular_file).ftype)
@@ -1621,7 +1789,7 @@ class TestFileExhaustive < Test::Unit::TestCase
   def test_stat_chardev_p
     assert_not_predicate(File::Stat.new(@dir), :chardev?)
     assert_not_predicate(File::Stat.new(regular_file), :chardev?)
-    assert_predicate(File::Stat.new(chardev), :chardev?) if chardev
+    assert_predicate(File::Stat.new(chardev), :chardev?)
   end
 
   def test_stat_readable_p
@@ -1763,5 +1931,9 @@ class TestFileExhaustive < Test::Unit::TestCase
     assert_equal(File.join(Dir.pwd, "~foo"), File.absolute_path("~foo"))
     dir = File.expand_path("/bar")
     assert_equal(File.join(dir, "~foo"), File.absolute_path("~foo", dir))
+  end
+
+  def assert_bool_equal(expected, result, *messages)
+    assert_equal(expected, true & result, *messages)
   end
 end

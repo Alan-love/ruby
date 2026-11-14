@@ -1,16 +1,8 @@
 /*
  * This program is licensed under the same licence as Ruby.
- * (See the file 'LICENCE'.)
+ * (See the file 'COPYING'.)
  */
 #include "ossl.h"
-
-#define NewPKCS12(klass) \
-    TypedData_Wrap_Struct((klass), &ossl_pkcs12_type, 0)
-
-#define SetPKCS12(obj, p12) do { \
-    if(!(p12)) ossl_raise(rb_eRuntimeError, "PKCS12 wasn't initialized."); \
-    RTYPEDDATA_DATA(obj) = (p12); \
-} while (0)
 
 #define GetPKCS12(obj, p12) do { \
     TypedData_Get_Struct((obj), PKCS12, &ossl_pkcs12_type, (p12)); \
@@ -27,8 +19,8 @@
 /*
  * Classes
  */
-VALUE cPKCS12;
-VALUE ePKCS12Error;
+static VALUE cPKCS12;
+static VALUE ePKCS12Error;
 
 /*
  * Private
@@ -42,39 +34,31 @@ ossl_pkcs12_free(void *ptr)
 static const rb_data_type_t ossl_pkcs12_type = {
     "OpenSSL/PKCS12",
     {
-	0, ossl_pkcs12_free,
+        0, ossl_pkcs12_free,
     },
-    0, 0, RUBY_TYPED_FREE_IMMEDIATELY,
+    0, 0, RUBY_TYPED_THREAD_SAFE_FREE | RUBY_TYPED_WB_PROTECTED,
 };
 
 static VALUE
 ossl_pkcs12_s_allocate(VALUE klass)
 {
-    PKCS12 *p12;
-    VALUE obj;
-
-    obj = NewPKCS12(klass);
-    if(!(p12 = PKCS12_new())) ossl_raise(ePKCS12Error, NULL);
-    SetPKCS12(obj, p12);
-
-    return obj;
+    return TypedData_Wrap_Struct(klass, &ossl_pkcs12_type, NULL);
 }
 
+/* :nodoc: */
 static VALUE
 ossl_pkcs12_initialize_copy(VALUE self, VALUE other)
 {
-    PKCS12 *p12, *p12_old, *p12_new;
+    PKCS12 *p12, *p12_new;
 
-    rb_check_frozen(self);
-    GetPKCS12(self, p12_old);
+    ossl_want_uninitialized(self, &ossl_pkcs12_type);
     GetPKCS12(other, p12);
 
-    p12_new = ASN1_dup((i2d_of_void *)i2d_PKCS12, (d2i_of_void *)d2i_PKCS12, (char *)p12);
+    p12_new = ASN1_dup((i2d_of_void *)i2d_PKCS12, (d2i_of_void *)d2i_PKCS12,
+                       p12);
     if (!p12_new)
-	ossl_raise(ePKCS12Error, "ASN1_dup");
-
-    SetPKCS12(self, p12_new);
-    PKCS12_free(p12_old);
+        ossl_raise(ePKCS12Error, "ASN1_dup");
+    RTYPEDDATA_DATA(self) = p12_new;
 
     return self;
 }
@@ -121,11 +105,11 @@ ossl_pkcs12_s_create(int argc, VALUE *argv, VALUE self)
 /* TODO: make a VALUE to nid function */
     if (!NIL_P(key_nid)) {
         if ((nkey = OBJ_txt2nid(StringValueCStr(key_nid))) == NID_undef)
-	    ossl_raise(rb_eArgError, "Unknown PBE algorithm %"PRIsVALUE, key_nid);
+            ossl_raise(rb_eArgError, "Unknown PBE algorithm %"PRIsVALUE, key_nid);
     }
     if (!NIL_P(cert_nid)) {
         if ((ncert = OBJ_txt2nid(StringValueCStr(cert_nid))) == NID_undef)
-	    ossl_raise(rb_eArgError, "Unknown PBE algorithm %"PRIsVALUE, cert_nid);
+            ossl_raise(rb_eArgError, "Unknown PBE algorithm %"PRIsVALUE, cert_nid);
     }
     if (!NIL_P(key_iter))
         kiter = NUM2INT(key_iter);
@@ -134,13 +118,23 @@ ossl_pkcs12_s_create(int argc, VALUE *argv, VALUE self)
     if (!NIL_P(keytype))
         ktype = NUM2INT(keytype);
 
-    obj = NewPKCS12(cPKCS12);
+#if defined(OPENSSL_IS_AWSLC)
+    if (ktype != 0) {
+        ossl_raise(rb_eArgError, "Unknown key usage type %"PRIsVALUE, INT2NUM(ktype));
+    }
+#else
+    if (ktype != 0 && ktype != KEY_SIG && ktype != KEY_EX) {
+        ossl_raise(rb_eArgError, "Unknown key usage type %"PRIsVALUE, INT2NUM(ktype));
+    }
+#endif
+
+    obj = ossl_pkcs12_s_allocate(cPKCS12);
     x509s = NIL_P(ca) ? NULL : ossl_x509_ary2sk(ca);
     p12 = PKCS12_create(passphrase, friendlyname, key, x509, x509s,
                         nkey, ncert, kiter, miter, ktype);
     sk_X509_pop_free(x509s, X509_free);
     if(!p12) ossl_raise(ePKCS12Error, NULL);
-    SetPKCS12(obj, p12);
+    RTYPEDDATA_DATA(obj) = p12;
 
     ossl_pkcs12_set_key(obj, pkey);
     ossl_pkcs12_set_cert(obj, cert);
@@ -150,9 +144,9 @@ ossl_pkcs12_s_create(int argc, VALUE *argv, VALUE self)
 }
 
 static VALUE
-ossl_pkey_new_i(VALUE arg)
+ossl_pkey_wrap_i(VALUE arg)
 {
-    return ossl_pkey_new((EVP_PKEY *)arg);
+    return ossl_pkey_wrap((EVP_PKEY *)arg);
 }
 
 static VALUE
@@ -180,6 +174,7 @@ ossl_x509_sk2ary_i(VALUE arg)
 static VALUE
 ossl_pkcs12_initialize(int argc, VALUE *argv, VALUE self)
 {
+    PKCS12 *p12;
     BIO *in;
     VALUE arg, pass, pkey, cert, ca;
     char *passphrase;
@@ -187,33 +182,38 @@ ossl_pkcs12_initialize(int argc, VALUE *argv, VALUE self)
     X509 *x509;
     STACK_OF(X509) *x509s = NULL;
     int st = 0;
-    PKCS12 *pkcs = DATA_PTR(self);
 
-    if(rb_scan_args(argc, argv, "02", &arg, &pass) == 0) return self;
+    rb_scan_args(argc, argv, "02", &arg, &pass);
+    ossl_want_uninitialized(self, &ossl_pkcs12_type);
+    if (argc == 0) {
+        p12 = PKCS12_new();
+        if (!p12)
+            ossl_raise(ePKCS12Error, "PKCS12_new");
+        RTYPEDDATA_DATA(self) = p12;
+        return self;
+    }
     passphrase = NIL_P(pass) ? NULL : StringValueCStr(pass);
     in = ossl_obj2bio(&arg);
-    d2i_PKCS12_bio(in, &pkcs);
-    DATA_PTR(self) = pkcs;
+    p12 = d2i_PKCS12_bio(in, NULL);
     BIO_free(in);
+    if (!p12)
+        ossl_raise(ePKCS12Error, "d2i_PKCS12_bio");
+    RTYPEDDATA_DATA(self) = p12;
 
     pkey = cert = ca = Qnil;
-    /* OpenSSL's bug; PKCS12_parse() puts errors even if it succeeds.
-     * Fixed in OpenSSL 1.0.0t, 1.0.1p, 1.0.2d */
-    ERR_set_mark();
-    if(!PKCS12_parse(pkcs, passphrase, &key, &x509, &x509s))
-	ossl_raise(ePKCS12Error, "PKCS12_parse");
-    ERR_pop_to_mark();
+    if (!PKCS12_parse(p12, passphrase, &key, &x509, &x509s))
+        ossl_raise(ePKCS12Error, "PKCS12_parse");
     if (key) {
-	pkey = rb_protect(ossl_pkey_new_i, (VALUE)key, &st);
-	if (st) goto err;
+        pkey = rb_protect(ossl_pkey_wrap_i, (VALUE)key, &st);
+        if (st) goto err;
     }
     if (x509) {
-	cert = rb_protect(ossl_x509_new_i, (VALUE)x509, &st);
-	if (st) goto err;
+        cert = rb_protect(ossl_x509_new_i, (VALUE)x509, &st);
+        if (st) goto err;
     }
     if (x509s) {
-	ca = rb_protect(ossl_x509_sk2ary_i, (VALUE)x509s, &st);
-	if (st) goto err;
+        ca = rb_protect(ossl_x509_sk2ary_i, (VALUE)x509s, &st);
+        if (st) goto err;
     }
 
   err:
@@ -237,25 +237,62 @@ ossl_pkcs12_to_der(VALUE self)
 
     GetPKCS12(self, p12);
     if((len = i2d_PKCS12(p12, NULL)) <= 0)
-	ossl_raise(ePKCS12Error, NULL);
+        ossl_raise(ePKCS12Error, NULL);
     str = rb_str_new(0, len);
     p = (unsigned char *)RSTRING_PTR(str);
     if(i2d_PKCS12(p12, &p) <= 0)
-	ossl_raise(ePKCS12Error, NULL);
+        ossl_raise(ePKCS12Error, NULL);
     ossl_str_adjust(str, p);
 
     return str;
+}
+
+/*
+ * call-seq:
+ *    pkcs12.set_mac(pass, salt = nil, iter = nil, md_type = nil)
+ *
+ * Sets MAC parameters and generates MAC over the PKCS #12 structure.
+ *
+ * This method uses HMAC and the PKCS #12 specific password-based KDF as
+ * specified in the original PKCS #12.
+ *
+ * See also the man page PKCS12_set_mac(3).
+ *
+ * Added in version 3.3.0.
+ */
+static VALUE
+pkcs12_set_mac(int argc, VALUE *argv, VALUE self)
+{
+    PKCS12 *p12;
+    VALUE pass, salt, iter, md_name, md_holder = Qnil;
+    int iter_i = 0;
+    const EVP_MD *md_type = NULL;
+
+    rb_scan_args(argc, argv, "13", &pass, &salt, &iter, &md_name);
+    rb_check_frozen(self);
+    GetPKCS12(self, p12);
+
+    StringValue(pass);
+    if (!NIL_P(salt))
+        StringValue(salt);
+    if (!NIL_P(iter))
+        iter_i = NUM2INT(iter);
+    if (!NIL_P(md_name))
+        md_type = ossl_evp_md_fetch(md_name, &md_holder);
+
+    if (!PKCS12_set_mac(p12, RSTRING_PTR(pass), RSTRING_LENINT(pass),
+                        !NIL_P(salt) ? (unsigned char *)RSTRING_PTR(salt) : NULL,
+                        !NIL_P(salt) ? RSTRING_LENINT(salt) : 0,
+                        iter_i, md_type))
+        ossl_raise(ePKCS12Error, "PKCS12_set_mac");
+
+    return Qnil;
 }
 
 void
 Init_ossl_pkcs12(void)
 {
 #undef rb_intern
-#if 0
-    mOSSL = rb_define_module("OpenSSL");
-    eOSSLError = rb_define_class_under(mOSSL, "OpenSSLError", rb_eStandardError);
-#endif
-
     /*
      * Defines a file format commonly used to store private keys with
      * accompanying public key certificates, protected with a password-based
@@ -272,4 +309,11 @@ Init_ossl_pkcs12(void)
     rb_attr(cPKCS12, rb_intern("ca_certs"), 1, 0, Qfalse);
     rb_define_method(cPKCS12, "initialize", ossl_pkcs12_initialize, -1);
     rb_define_method(cPKCS12, "to_der", ossl_pkcs12_to_der, 0);
+    rb_define_method(cPKCS12, "set_mac", pkcs12_set_mac, -1);
+
+#if !defined(OPENSSL_IS_AWSLC)
+    /* MSIE specific PKCS12 key usage extensions */
+    rb_define_const(cPKCS12, "KEY_EX", INT2NUM(KEY_EX));
+    rb_define_const(cPKCS12, "KEY_SIG", INT2NUM(KEY_SIG));
+#endif
 }

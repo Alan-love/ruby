@@ -1,5 +1,6 @@
 # frozen_string_literal: false
 require 'test/unit'
+require 'rbconfig/sizeof'
 
 class TestRand < Test::Unit::TestCase
   def assert_random_int(m, init = 0, iterate: 5)
@@ -317,7 +318,7 @@ class TestRand < Test::Unit::TestCase
     assert_equal(r1, r2, bug5661)
 
     assert_fork_status(1, '[ruby-core:82100] [Bug #13753]') do
-      Random::DEFAULT.rand(4)
+      Random.rand(4)
     end
   rescue NotImplementedError
   end
@@ -334,6 +335,14 @@ class TestRand < Test::Unit::TestCase
       r2 = Random.new(b).rand
       assert_equal(r1, r2)
     }
+  end
+
+  def test_seed_leading_zero_guard
+    guard = 1<<32
+    range = 0...(1<<32)
+    all_assertions_foreach(nil, 0, 1, 2) do |i|
+      assert_not_equal(Random.new(i).rand(range), Random.new(i+guard).rand(range))
+    end
   end
 
   def test_marshal
@@ -395,8 +404,8 @@ class TestRand < Test::Unit::TestCase
     assert_separately([], "#{<<~"begin;"}\n#{<<~'end;'}")
     begin;
       verbose, $VERBOSE = $VERBOSE, nil
-      seed = Random::DEFAULT::seed
-      rand1 = Random::DEFAULT::rand
+      seed = Random.seed
+      rand1 = Random.rand
       $VERBOSE = verbose
       rand2 = Random.new(seed).rand
       assert_equal(rand1, rand2)
@@ -415,6 +424,15 @@ class TestRand < Test::Unit::TestCase
     end
   end
 
+  def test_urandom_size_errors
+    beyond_len = 2 ** (RbConfig::SIZEOF['rb_len_t'] * 8 - 1)
+    assert_raise(ArgumentError) { Random.urandom(-1) }
+    assert_raise(RangeError) { Random.urandom(beyond_len) }
+    # Random#bytes converts its size the same way, so the classes have to agree
+    assert_raise(ArgumentError) { Random.new.bytes(-1) }
+    assert_raise(RangeError) { Random.new.bytes(beyond_len) }
+  end
+
   def test_new_seed
     size = 0
     n = 8
@@ -425,5 +443,10 @@ class TestRand < Test::Unit::TestCase
     end
     # probability of failure <= 1/256**8
     assert_operator(size.fdiv(n), :>, 15)
+  end
+
+  def test_broken_marshal
+    assert_raise(ArgumentError) { Marshal.load("\x04\bU:\vRandom" + Marshal.dump([1,0,1])[2..]) }
+    assert_raise(ArgumentError) { Marshal.load("\x04\bU:\vRandom" + Marshal.dump([1,-1,1])[2..]) }
   end
 end

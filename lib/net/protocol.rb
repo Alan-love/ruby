@@ -21,12 +21,12 @@
 
 require 'socket'
 require 'timeout'
-require 'io/wait'
+require 'io/wait' if RUBY_VERSION < '3.2'
 
 module Net # :nodoc:
 
   class Protocol   #:nodoc: internal use only
-    VERSION = "0.1.2"
+    VERSION = "0.4.0"
 
     private
     def Protocol.protocol_param(name, val)
@@ -54,9 +54,20 @@ module Net # :nodoc:
         s.connect
       end
     end
+
+    tcp_socket_parameters = TCPSocket.instance_method(:initialize).parameters
+    TCP_SOCKET_NEW_HAS_OPEN_TIMEOUT = if tcp_socket_parameters != [[:rest]]
+      tcp_socket_parameters.include?([:key, :open_timeout])
+    else
+      # Use Socket.tcp to find out since there is no parameters information for TCPSocket#initialize
+      # See discussion in https://github.com/ruby/net-http/pull/224
+      Socket.method(:tcp).parameters.include?([:key, :open_timeout])
+    end
+    private_constant :TCP_SOCKET_NEW_HAS_OPEN_TIMEOUT
   end
 
 
+  # :stopdoc:
   class ProtocolError          < StandardError; end
   class ProtoSyntaxError       < ProtocolError; end
   class ProtoFatalError        < ProtocolError; end
@@ -66,6 +77,29 @@ module Net # :nodoc:
   class ProtoCommandError      < ProtocolError; end
   class ProtoRetriableError    < ProtocolError; end
   ProtocRetryError = ProtoRetriableError
+  # :startdoc:
+
+  ##
+  # ReadLimitExceeded, a subclass of ProtocolError, is raised if the
+  # terminator is not found within the byte limit given to
+  # Net::BufferedIO#readuntil.
+  #
+  # The limit is the largest result readuntil may return, counting the
+  # terminator itself, so a limit of 4 accepts "abc\n" and rejects
+  # "abcd\n". Unlike the limit of IO#gets it never truncates a result to
+  # fit. Either the whole thing comes back or this is raised, except
+  # under ignore_eof, which still returns what was buffered when the
+  # stream ended. The count is in bytes while the IO hands back binary
+  # strings, which every real one does.
+  #
+  # It bounds one call, not a connection. The unconsumed buffer can
+  # still run one BUFSIZE past the limit, and a peer sending endless
+  # short lines is not bounded at all.
+  #
+  # Nothing is consumed when this is raised, so the usual response is to
+  # close the connection rather than read on under a wider limit.
+
+  class ReadLimitExceeded < ProtocolError; end
 
   ##
   # OpenTimeout, a subclass of Timeout::Error, is raised if a connection cannot
@@ -78,6 +112,7 @@ module Net # :nodoc:
   # response cannot be read within the read_timeout.
 
   class ReadTimeout < Timeout::Error
+    # :stopdoc:
     def initialize(io = nil)
       @io = io
     end
@@ -97,6 +132,7 @@ module Net # :nodoc:
   # response cannot be written within the write_timeout.  Not raised on Windows.
 
   class WriteTimeout < Timeout::Error
+    # :stopdoc:
     def initialize(io = nil)
       @io = io
     end
@@ -120,6 +156,8 @@ module Net # :nodoc:
       @continue_timeout = continue_timeout
       @debug_output = debug_output
       @rbuf = ''.b
+      @rbuf_empty = true
+      @rbuf_offset = 0
     end
 
     attr_reader :io
@@ -151,17 +189,19 @@ module Net # :nodoc:
     public
 
     def read(len, dest = ''.b, ignore_eof = false)
+      raise ArgumentError, "negative length #{len} given" if len < 0
       LOG "reading #{len} bytes..."
       read_bytes = 0
       begin
-        while read_bytes + @rbuf.size < len
-          s = rbuf_consume(@rbuf.size)
-          read_bytes += s.size
-          dest << s
+        while read_bytes + rbuf_size < len
+          if s = rbuf_consume_all
+            read_bytes += s.bytesize
+            dest << s
+          end
           rbuf_fill
         end
         s = rbuf_consume(len - read_bytes)
-        read_bytes += s.size
+        read_bytes += s.bytesize
         dest << s
       rescue EOFError
         raise unless ignore_eof
@@ -175,9 +215,10 @@ module Net # :nodoc:
       read_bytes = 0
       begin
         while true
-          s = rbuf_consume(@rbuf.size)
-          read_bytes += s.size
-          dest << s
+          if s = rbuf_consume_all
+            read_bytes += s.bytesize
+            dest << s
+          end
           rbuf_fill
         end
       rescue EOFError
@@ -187,15 +228,34 @@ module Net # :nodoc:
       dest
     end
 
-    def readuntil(terminator, ignore_eof = false)
+    def readuntil(terminator, ignore_eof = false, limit: nil)
+      unless limit.nil? || (Integer === limit && limit > 0)
+        # Integer === calls nothing on limit, and only an Integer is
+        # echoed back, so validation never runs the caller's code.
+        got = Integer === limit ? limit : "a non-Integer"
+        raise ArgumentError, "limit must be a positive Integer, got #{got}"
+      end
+      offset = @rbuf_offset
       begin
-        until idx = @rbuf.index(terminator)
+        until idx = @rbuf.index(terminator, offset)
+          if limit && rbuf_size > limit
+            raise ReadLimitExceeded, "exceeded the #{limit} byte read limit"
+          end
+          # Rewind so a terminator split across reads is still found. The
+          # floor guards two things. String#index reads a negative offset
+          # as counting from the end, and an offset below @rbuf_offset
+          # matches inside bytes already returned.
+          offset = [@rbuf.bytesize - terminator.bytesize + 1, @rbuf_offset].max
           rbuf_fill
         end
-        return rbuf_consume(idx + terminator.size)
+        len = idx + terminator.bytesize - @rbuf_offset
+        if limit && len > limit
+          raise ReadLimitExceeded, "exceeded the #{limit} byte read limit"
+        end
+        return rbuf_consume(len)
       rescue EOFError
         raise unless ignore_eof
-        return rbuf_consume(@rbuf.size)
+        return rbuf_consume
       end
     end
 
@@ -208,12 +268,16 @@ module Net # :nodoc:
     BUFSIZE = 1024 * 16
 
     def rbuf_fill
-      tmp = @rbuf.empty? ? @rbuf : nil
+      tmp = @rbuf_empty ? @rbuf : nil
       case rv = @io.read_nonblock(BUFSIZE, tmp, exception: false)
       when String
-        return if rv.equal?(tmp)
-        @rbuf << rv
-        rv.clear
+        @rbuf_empty = false
+        if rv.equal?(tmp)
+          @rbuf_offset = 0
+        else
+          @rbuf << rv
+          rv.clear
+        end
         return
       when :wait_readable
         (io = @io.to_io).wait_readable(@read_timeout) or raise Net::ReadTimeout.new(io)
@@ -228,13 +292,40 @@ module Net # :nodoc:
       end while true
     end
 
-    def rbuf_consume(len)
-      if len == @rbuf.size
+    def rbuf_flush
+      if @rbuf_empty
+        @rbuf.clear
+        @rbuf_offset = 0
+      end
+      nil
+    end
+
+    def rbuf_size
+      @rbuf.bytesize - @rbuf_offset
+    end
+
+    def rbuf_consume_all
+      rbuf_consume if rbuf_size > 0
+    end
+
+    def rbuf_consume(len = nil)
+      if @rbuf_offset == 0 && (len.nil? || len == @rbuf.bytesize)
         s = @rbuf
         @rbuf = ''.b
+        @rbuf_offset = 0
+        @rbuf_empty = true
+      elsif len.nil?
+        s = @rbuf.byteslice(@rbuf_offset..-1)
+        @rbuf = ''.b
+        @rbuf_offset = 0
+        @rbuf_empty = true
       else
-        s = @rbuf.slice!(0, len)
+        s = @rbuf.byteslice(@rbuf_offset, len)
+        @rbuf_offset += len
+        @rbuf_empty = @rbuf_offset == @rbuf.bytesize
+        rbuf_flush
       end
+
       @debug_output << %Q[-> #{s.dump}\n] if @debug_output
       s
     end
@@ -266,9 +357,9 @@ module Net # :nodoc:
       @debug_output << '<- ' if @debug_output
       yield
       @debug_output << "\n" if @debug_output
-      bytes = @written_bytes
+      @written_bytes
+    ensure
       @written_bytes = nil
-      bytes
     end
 
     def write0(*strs)
@@ -293,6 +384,9 @@ module Net # :nodoc:
             need_retry = false
             # next string
           end
+          # continue looping
+        when :wait_readable
+          (io = @io.to_io).wait_readable(@write_timeout) or raise Net::WriteTimeout.new(io)
           # continue looping
         when :wait_writable
           (io = @io.to_io).wait_writable(@write_timeout) or raise Net::WriteTimeout.new(io)
@@ -336,12 +430,15 @@ module Net # :nodoc:
     def each_message_chunk
       LOG 'reading message...'
       LOG_off()
-      read_bytes = 0
-      while (line = readuntil("\r\n")) != ".\r\n"
-        read_bytes += line.size
-        yield line.delete_prefix('.')
+      begin
+        read_bytes = 0
+        while (line = readuntil("\r\n")) != ".\r\n"
+          read_bytes += line.size
+          yield line.delete_prefix('.')
+        end
+      ensure
+        LOG_on()
       end
-      LOG_on()
       LOG "read message (#{read_bytes} bytes)"
     end
 
@@ -367,12 +464,15 @@ module Net # :nodoc:
     def write_message(src)
       LOG "writing message from #{src.class}"
       LOG_off()
-      len = writing {
-        using_each_crlf_line {
-          write_message_0 src
+      begin
+        len = writing {
+          using_each_crlf_line {
+            write_message_0 src
+          }
         }
-      }
-      LOG_on()
+      ensure
+        LOG_on()
+      end
       LOG "wrote #{len} bytes"
       len
     end
@@ -380,16 +480,19 @@ module Net # :nodoc:
     def write_message_by_block(&block)
       LOG 'writing message from block'
       LOG_off()
-      len = writing {
-        using_each_crlf_line {
-          begin
-            block.call(WriteAdapter.new(self.method(:write_message_0)))
-          rescue LocalJumpError
-            # allow `break' from writer block
-          end
+      begin
+        len = writing {
+          using_each_crlf_line {
+            begin
+              block.call(WriteAdapter.new(self.method(:write_message_0)))
+            rescue LocalJumpError
+              # allow `break' from writer block
+            end
+          }
         }
-      }
-      LOG_on()
+      ensure
+        LOG_on()
+      end
       LOG "wrote #{len} bytes"
       len
     end
@@ -409,6 +512,8 @@ module Net # :nodoc:
         write0 "\r\n"
       end
       write0 ".\r\n"
+      nil
+    ensure
       @wbuf = nil
     end
 
@@ -447,6 +552,7 @@ module Net # :nodoc:
   # The writer adapter class
   #
   class WriteAdapter
+    # :stopdoc:
     def initialize(writer)
       @writer = writer
     end

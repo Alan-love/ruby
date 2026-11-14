@@ -1,3 +1,5 @@
+require 'mspec/utils/deprecate'
+
 module MSpecMatchers
 end
 
@@ -16,15 +18,32 @@ class SpecPositiveOperatorMatcher < BasicObject
   end
 
   def ==(expected)
-    method_missing(:==, expected)
+    result = @actual == expected
+    unless result
+      ::SpecExpectation.fail_single_arg_predicate(@actual, :==, expected, result, "to be truthy")
+    end
   end
 
   def !=(expected)
-    method_missing(:!=, expected)
+    result = @actual != expected
+    unless result
+      ::SpecExpectation.fail_single_arg_predicate(@actual, :!=, expected, result, "to be truthy")
+    end
   end
 
   def equal?(expected)
-    method_missing(:equal?, expected)
+    result = @actual.equal?(expected)
+    unless result
+      ::SpecExpectation.fail_single_arg_predicate(@actual, :equal?, expected, result, "to be truthy")
+    end
+  end
+
+  def raise(exception = ::Exception, message = nil, options = nil, &block)
+    matcher = ::RaiseErrorMatcher.new(exception, message, options, &block)
+    unless matcher.matches? @actual
+      expected, actual = matcher.failure_message
+      ::SpecExpectation.fail_with(expected, actual)
+    end
   end
 
   def method_missing(name, *args, &block)
@@ -41,15 +60,32 @@ class SpecNegativeOperatorMatcher < BasicObject
   end
 
   def ==(expected)
-    method_missing(:==, expected)
+    result = @actual == expected
+    if result
+      ::SpecExpectation.fail_single_arg_predicate(@actual, :==, expected, result, "to be falsy")
+    end
   end
 
   def !=(expected)
-    method_missing(:!=, expected)
+    result = @actual != expected
+    if result
+      ::SpecExpectation.fail_single_arg_predicate(@actual, :!=, expected, result, "to be falsy")
+    end
   end
 
   def equal?(expected)
-    method_missing(:equal?, expected)
+    result = @actual.equal?(expected)
+    if result
+      ::SpecExpectation.fail_single_arg_predicate(@actual, :equal?, expected, result, "to be falsy")
+    end
+  end
+
+  def raise(exception = ::Exception, message = nil, options = nil, &block)
+    matcher = ::RaiseErrorMatcher.new(exception, message, options, &block)
+    if matcher.matches? @actual
+      expected, actual = matcher.negative_failure_message
+      ::SpecExpectation.fail_with(expected, actual)
+    end
   end
 
   def method_missing(name, *args, &block)

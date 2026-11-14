@@ -63,23 +63,8 @@ typedef struct re_pattern_buffer Regexp;
  * But why on earth it has to be visible from extension libraries?
  */
 struct rmatch_offset {
-    long beg; /**< Beginning of a group. */
-    long end; /**< End of a group. */
-};
-
-/** Represents a match. */
-struct rmatch {
-    /**
-     * "Registers"  of a  match.   This  is a  quasi-opaque  struct that  holds
-     * execution result of a match.  Roughly resembles `&~`.
-     */
-    struct re_registers regs;
-
-    /** Capture group offsets, in C array. */
-    struct rmatch_offset *char_offset;
-
-    /** Number of ::rmatch_offset that ::rmatch::char_offset holds. */
-    int char_offset_num_allocated;
+    rb_len_t beg; /**< Beginning of a group. */
+    rb_len_t end; /**< End of a group. */
 };
 
 /**
@@ -102,18 +87,44 @@ struct RMatch {
     VALUE str;
 
     /**
-     * The result of this match.
-     */
-    struct rmatch *rmatch;
-
-    /**
      * The expression of this match.
      */
     VALUE regexp;  /* RRegexp */
+
+    /** Number of ::rmatch_offset that ::rmatch::char_offset holds. */
+    int char_offset_num_allocated;
+
+    /** Capture group offsets, in C array. */
+    struct rmatch_offset *char_offset;
+
+    /** Number of capture-group registers. */
+    int num_regs;
+
+    /** Capacity of `as.embed`, in OnigPosition slots. */
+    int capa;
+
+    /**
+     * "Registers" of a match.  This is a quasi-opaque struct that holds
+     * execution result of a match.  Roughly resembles `$~`.
+     */
+    union {
+        OnigPosition embed[1];
+        struct re_registers onig;
+    } as;
 };
 
-RBIMPL_ATTR_PURE_UNLESS_DEBUG()
-RBIMPL_ATTR_ARTIFICIAL()
+RBIMPL_SYMBOL_EXPORT_BEGIN()
+/**
+ * @private
+ *
+ * Converts an  embedded match  to onig  form.  This  is an  implementation
+ * detail of #RMATCH_REGS.  People don't use it directly.
+ *
+ * @param[out]  match  A match object, possibly in embedded form.
+ */
+void rb_match_ensure_onig(VALUE match);
+RBIMPL_SYMBOL_EXPORT_END()
+
 /**
  * Queries the raw ::re_registers.
  *
@@ -139,8 +150,8 @@ static inline struct re_registers *
 RMATCH_REGS(VALUE match)
 {
     RBIMPL_ASSERT_TYPE(match, RUBY_T_MATCH);
-    RBIMPL_ASSERT_OR_ASSUME(RMATCH(match)->rmatch != NULL);
-    return &RMATCH(match)->rmatch->regs;
+    rb_match_ensure_onig(match);
+    return &RMATCH(match)->as.onig;
 }
 
 #endif /* RBIMPL_RMATCH_H */

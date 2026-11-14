@@ -1,10 +1,8 @@
 require_relative '../../spec_helper'
+require 'matrix'
 
-ruby_version_is ""..."3.1" do
-  require_relative 'shared/trace'
-  require 'matrix'
-
-  describe "Matrix#tr" do
-    it_behaves_like :trace, :tr
+describe "Matrix#tr" do
+  it "is an alias of Matrix#trace" do
+    Matrix.instance_method(:tr).should == Matrix.instance_method(:trace)
   end
 end

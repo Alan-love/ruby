@@ -1,4 +1,5 @@
 #!./miniruby -s
+# frozen-string-literal: true
 
 # This script, which is run when ruby is built, generates rbconfig.rb by
 # parsing information from config.status.  rbconfig.rb contains build
@@ -63,8 +64,6 @@ File.foreach "config.status" do |line|
     when /^(?:X|(?:MINI|RUN|(?:HAVE_)?BASE|BOOTSTRAP|BTEST)RUBY(?:_COMMAND)?$)/; next
     when /^INSTALLDOC|TARGET$/; next
     when /^DTRACE/; next
-    when /^MJIT_(CC|SUPPORT)$/; # pass
-    when /^MJIT_/; next
     when /^(?:MAJOR|MINOR|TEENY)$/; vars[name] = val; next
     when /^LIBRUBY_D?LD/; next
     when /^RUBY_INSTALL_NAME$/; next vars[name] = (install_name = val).dup if $install_name
@@ -72,6 +71,7 @@ File.foreach "config.status" do |line|
     when /^arch$/; if val.empty? then val = arch else arch = val end
     when /^sitearch$/; val = '$(arch)' if val.empty?
     when /^DESTDIR$/; next
+    when /^PROGRAM_LIBS$/; next
     when /RUBYGEMS/; next
     end
     case val
@@ -122,8 +122,16 @@ File.foreach "config.status" do |line|
       universal, val = val, 'universal' if universal
     when /^arch$/
       if universal
-        platform = val.sub(/universal/, %q[#{arch && universal[/(?:\A|\s)#{Regexp.quote(arch)}=(\S+)/, 1] || RUBY_PLATFORM[/\A[^-]*/]}])
+        platform = val.sub(/universal/, '$(arch)')
       end
+    when /^target_cpu$/
+      if universal
+        val = 'cpu'
+      end
+    when /^target$/
+      val = '"$(target_cpu)-$(target_vendor)-$(target_os)"'
+    when /^host(?:_(?:os|vendor|cpu|alias))?$/
+      val = %["$(#{name.sub(/^host/, 'target')})"]
     when /^includedir$/
       val = '"$(SDKROOT)"'+val if /darwin/ =~ arch
     end
@@ -161,8 +169,8 @@ def vars.expand(val, config = self)
   val.replace(newval) unless newval == val
   val
 end
-prefix = vars.expand(vars["prefix"] ||= "")
-rubyarchdir = vars.expand(vars["rubyarchdir"] ||= "")
+prefix = vars.expand(vars["prefix"] ||= +"")
+rubyarchdir = vars.expand(vars["rubyarchdir"] ||= +"")
 relative_archdir = rubyarchdir.rindex(prefix, 0) ? rubyarchdir[prefix.size..-1] : rubyarchdir
 
 puts %[\
@@ -185,17 +193,19 @@ print "  # Ruby installed directory.\n"
 print "  TOPDIR = File.dirname(__FILE__).chomp!(#{relative_archdir.dump})\n"
 print "  # DESTDIR on make install.\n"
 print "  DESTDIR = ", (drive ? "TOPDIR && TOPDIR[/\\A[a-z]:/i] || " : ""), "'' unless defined? DESTDIR\n"
-print <<'ARCH' if universal
+print <<"UNIVERSAL", <<'ARCH' if universal
+  universal = #{universal}
+UNIVERSAL
   arch_flag = ENV['ARCHFLAGS'] || ((e = ENV['RC_ARCHS']) && e.split.uniq.map {|a| "-arch #{a}"}.join(' '))
   arch = arch_flag && arch_flag[/\A\s*-arch\s+(\S+)\s*\z/, 1]
+  cpu = arch && universal[/(?:\A|\s)#{Regexp.quote(arch)}=(\S+)/, 1] || RUBY_PLATFORM[/\A[^-]*/]
 ARCH
-print "  universal = #{universal}\n" if universal
 print "  # The hash configurations stored.\n"
 print "  CONFIG = {}\n"
 print "  CONFIG[\"DESTDIR\"] = DESTDIR\n"
 
 versions = {}
-IO.foreach(File.join(srcdir, "version.h")) do |l|
+File.foreach(File.join(srcdir, "version.h")) do |l|
   m = /^\s*#\s*define\s+RUBY_(PATCHLEVEL)\s+(-?\d+)/.match(l)
   if m
     versions[m[1]] = m[2]
@@ -216,7 +226,7 @@ IO.foreach(File.join(srcdir, "version.h")) do |l|
   end
 end
 if versions.size != 4
-  IO.foreach(File.join(srcdir, "include/ruby/version.h")) do |l|
+  File.foreach(File.join(srcdir, "include/ruby/version.h")) do |l|
     m = /^\s*#\s*define\s+RUBY_API_VERSION_(\w+)\s+(-?\d+)/.match(l)
     if m
       versions[m[1]] ||= m[2]
@@ -247,14 +257,14 @@ end
 v_others.compact!
 
 if $install_name
-  if install_name and vars.expand("$(RUBY_INSTALL_NAME)") == $install_name
+  if install_name and vars.expand(+"$(RUBY_INSTALL_NAME)") == $install_name
     $install_name = install_name
   end
   v_fast << "  CONFIG[\"ruby_install_name\"] = \"" + $install_name + "\"\n"
   v_fast << "  CONFIG[\"RUBY_INSTALL_NAME\"] = \"" + $install_name + "\"\n"
 end
 if $so_name
-  if so_name and vars.expand("$(RUBY_SO_NAME)") == $so_name
+  if so_name and vars.expand(+"$(RUBY_SO_NAME)") == $so_name
     $so_name = so_name
   end
   v_fast << "  CONFIG[\"RUBY_SO_NAME\"] = \"" + $so_name + "\"\n"
@@ -268,7 +278,7 @@ EOS
 print <<EOS if $unicode_emoji_version
   CONFIG["UNICODE_EMOJI_VERSION"] = #{$unicode_emoji_version.dump}
 EOS
-print <<EOS if /darwin/ =~ arch
+print prefix.start_with?("/System/") ? <<EOS : <<EOS if /darwin/ =~ arch
   if sdkroot = ENV["SDKROOT"]
     sdkroot = sdkroot.dup
   elsif File.exist?(File.join(CONFIG["prefix"], "include")) ||
@@ -278,6 +288,8 @@ print <<EOS if /darwin/ =~ arch
     sdkroot.chomp!
   end
   CONFIG["SDKROOT"] = sdkroot
+EOS
+  CONFIG["SDKROOT"] = ""
 EOS
 print <<EOS
   CONFIG["platform"] = #{platform || '"$(arch)"'}
@@ -340,7 +352,6 @@ print <<EOS
     RbConfig::expand(val)
   end
 
-  # :nodoc:
   # call-seq:
   #
   #   RbConfig.fire_update!(key, val)               -> array
@@ -356,7 +367,7 @@ print <<EOS
   #   RbConfig::CONFIG.values_at("CC", "LDSHARED")          # => ["gcc-8", "gcc-8 -shared"]
   #
   # returns updated keys list, or +nil+ if nothing changed.
-  def RbConfig.fire_update!(key, val, mkconf = MAKEFILE_CONFIG, conf = CONFIG)
+  def RbConfig.fire_update!(key, val, mkconf = MAKEFILE_CONFIG, conf = CONFIG) # :nodoc:
     return if mkconf[key] == val
     mkconf[key] = val
     keys = [key]
@@ -384,6 +395,7 @@ print <<EOS
     )
   end
 end
+# Non-nil if configured for cross compiling.
 CROSS_COMPILING = nil unless defined? CROSS_COMPILING
 EOS
 

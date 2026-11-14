@@ -2,11 +2,20 @@
 # See common.mk and Makefile.in for details.
 
 class File
-  sep = ("\\" if RUBY_PLATFORM =~ /mswin|bccwin|mingw/)
+  sep = ("\\" if RUBY_PLATFORM =~ /mswin|mingw/)
   if sep != ALT_SEPARATOR
     remove_const :ALT_SEPARATOR
     ALT_SEPARATOR = sep
   end
+end
+
+[[libpathenv, "."], [preloadenv, libruby_so]].each do |env, path|
+  env or next
+  e = ENV[env] or next
+  e = e.split(File::PATH_SEPARATOR)
+  path = File.realpath(path, builddir) rescue next
+  e.delete(path) or next
+  ENV[env] = (e.join(File::PATH_SEPARATOR) unless e.empty?)
 end
 
 static = !!(defined?($static) && $static)
@@ -18,7 +27,15 @@ posthook = proc do
   if $extmk
     $ruby = "$(topdir)/miniruby -I'$(topdir)' -I'$(top_srcdir)/lib' -I'$(extout)/$(arch)' -I'$(extout)/common'"
   else
-    $ruby = baseruby
+    # `CROSS_COMPILING` holds the platform of the ruby that loaded this fake.
+    # When it matches the built ruby's platform we are not really cross
+    # compiling, so the just-built ruby runs on this host and matches the build
+    # tree. Prefer it over baseruby, which may be an older release whose version
+    # check rejects the freshly built standard library when building gems with
+    # native extensions (e.g. the bundler spec's test gems run via
+    # `make test-bundler[-parallel]`).
+    native = defined?(CROSS_COMPILING) && CROSS_COMPILING == RUBY_PLATFORM
+    $ruby = native && File.exist?($builtruby) ? $builtruby : baseruby
   end
   $static = static
   untrace_var(:$ruby, posthook)
@@ -45,13 +62,17 @@ prehook = proc do |extmk|
   $extout_prefix = '$(extout)$(target_prefix)/'
   config = RbConfig::CONFIG
   mkconfig = RbConfig::MAKEFILE_CONFIG
+  $builtruby ||= File.join(builddir, config['RUBY_INSTALL_NAME'] + config['EXEEXT'])
   RbConfig.fire_update!("builddir", builddir)
   RbConfig.fire_update!("buildlibdir", builddir)
   RbConfig.fire_update!("libdir", builddir)
+  RbConfig.fire_update!("prefix", $topdir)
   RbConfig.fire_update!("top_srcdir", $top_srcdir ||= top_srcdir)
   RbConfig.fire_update!("extout", $extout)
   RbConfig.fire_update!("rubyhdrdir", "$(top_srcdir)/include")
   RbConfig.fire_update!("rubyarchhdrdir", "$(extout)/include/$(arch)")
+  RbConfig.fire_update!("rubyarchdir", "$(extout)/$(arch)")
+  RbConfig.fire_update!("rubylibdir", "$(extout)/common")
   RbConfig.fire_update!("libdirname", "buildlibdir")
   trace_var(:$ruby, posthook)
   untrace_var(:$extmk, prehook)

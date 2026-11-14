@@ -1,0 +1,233 @@
+name: Setup directories etc.
+description: >-
+  Set up the source code and build directories (plus some
+  environmental tweaks)
+
+inputs:
+  srcdir:
+    required: false
+    default: ${{ github.workspace }}
+    description: >-
+      Directory to (re-)checkout source codes.  This will be created
+      if absent.  If there is no `configure` file that is also
+      generated inside.
+
+  builddir:
+    required: false
+    default: ${{ github.workspace }}
+    description: >-
+      Where binaries and other generated contents go.  This will be
+      created if absent.
+
+  make-command:
+    required: false
+    type: string
+    default: 'make'
+    description: >-
+      The command of `make`.
+
+  makeup:
+    required: false
+    type: boolean
+    # Note that `default: false` evaluates to a string constant
+    # `'false'`, which is a truthy value :sigh:
+    # https://github.com/actions/runner/issues/2238
+    default: ''
+    description: >-
+      If set to true, additionally runs `make up`.
+
+  checkout:
+    required: false
+    type: boolean
+    default: true
+    description: >-
+      If set to '' (false), skip running actions/checkout. This is useful when
+      you don't want to overwrite a GitHub token that is already set up.
+
+  dummy-files:
+    required: false
+    type: boolean
+    default: ''
+    description: >-
+      If set to true, creates dummy files in build dir.
+
+  fetch-depth:
+    required: false
+    default: '1'
+    description: The depth of commit history fetched from the remote repository
+
+  clean:
+    required: false
+    type: boolean
+    default: ''
+    description: >-
+      If set to true, clean build directory.
+
+  bundled-gems-src-cache:
+    required: false
+    type: boolean
+    default: ''
+    description: >-
+      If set to true, cache the cloned bundled gem sources (gems/src).
+      Enable only on jobs that clone every bundled gem (test-bundled-gems),
+      so the cache shared by the os/arch is always saved with the complete
+      set of gems instead of the partial set that `make up` leaves behind.
+
+outputs: {} # nothing?
+
+runs:
+  using: composite
+
+  steps:
+    # Note that `shell: bash` works on both Windows and Linux, but not
+    # `shell: sh`.  This is because GitHub hosted Windows runners have
+    # their bash manually installed.
+    - shell: bash
+      run: |
+        mkdir -p "${INPUT_SRCDIR}"
+        mkdir -p "${INPUT_BUILDDIR}"
+      env:
+        INPUT_SRCDIR: ${{ inputs.srcdir }}
+        INPUT_BUILDDIR: ${{ inputs.builddir }}
+
+    # Did you know that actions/checkout works without git(1)?  We are
+    # checking that here.
+    - id: which
+      shell: bash
+      run: |
+        echo "git=`command -v git`" >> "$GITHUB_OUTPUT"
+        echo "sudo=`sudo true && command -v sudo`" >> "$GITHUB_OUTPUT"
+        echo "autoreconf=`command -v autoreconf`" >> "$GITHUB_OUTPUT"
+
+    - if: steps.which.outputs.git
+      shell: bash
+      run: |
+        git config --global core.autocrlf false
+        git config --global core.eol lf
+        git config --global advice.detachedHead 0
+        git config --global init.defaultBranch garbage
+
+    - if: inputs.checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        path: ${{ inputs.srcdir }}
+        fetch-depth: ${{ inputs.fetch-depth }}
+        persist-credentials: false
+
+    - id: gems-key
+      shell: bash
+      run: |
+        echo "hash=$hash" >> "$GITHUB_OUTPUT"
+      env:
+        hash: ${{ hashFiles(format('{0}/gems/bundled_gems', inputs.srcdir)) }}
+
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ inputs.srcdir }}/.downloaded-cache
+        key: downloaded-cache-${{ steps.gems-key.outputs.hash }}
+        restore-keys: |
+          downloaded-cache-
+          ${{ runner.os }}-${{ runner.arch }}-downloaded-cache
+
+    # Cache cloned bundled gem sources so a transient DNS/network failure
+    # while cloning from github.com (e.g. "Could not resolve host") does not
+    # abort the build. The key is invalidated when gems/bundled_gems changes,
+    # and restore-keys falls back to the latest cache so only bumped gems are
+    # re-fetched. Only test-bundled-gems jobs opt in (bundled-gems-src-cache),
+    # because they are the ones that clone the complete set into gems/src; other
+    # jobs would otherwise save a partial gems/src and poison the shared key.
+    - if: inputs.bundled-gems-src-cache == 'true'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ inputs.srcdir }}/gems/src
+        key: bundled-gems-src-${{ steps.gems-key.outputs.hash }}
+        restore-keys: |
+          bundled-gems-src-
+          ${{ runner.os }}-${{ runner.arch }}-bundled-gems-src-
+
+    - if: steps.which.outputs.autoreconf
+      shell: bash
+      working-directory: ${{ inputs.srcdir }}
+      run: ./autogen.sh --install
+
+    # This is for MinGW.
+    - if: runner.os == 'Windows'
+      shell: bash
+      run: echo "GNUMAKEFLAGS=-j$((2 * NUMBER_OF_PROCESSORS))" >> $GITHUB_ENV # zizmor: ignore[github-env]
+
+    - if: runner.os == 'Linux'
+      shell: bash
+      run: echo "GNUMAKEFLAGS=-sj$((1 + $(nproc)))" >> "$GITHUB_ENV" # zizmor: ignore[github-env]
+
+    # macOS' GNU make is so old that they doesn't understand `GNUMAKEFLAGS`.
+    - if: runner.os == 'macOS'
+      shell: bash
+      run: echo "MAKEFLAGS=-j$((1 + $(sysctl -n hw.activecpu)))" >> "$GITHUB_ENV" # zizmor: ignore[github-env]
+
+    - if: inputs.makeup
+      shell: bash
+      working-directory: ${{ inputs.srcdir }}
+      env:
+        HAVE_GIT: yes
+        GIT: git
+      run: |
+        ruby tool/missing-baseruby.bat --verbose
+        bash tool/gen-sources.bash ${{ case(inputs.makeup == 'true', 'up', inputs.makeup) }} HAVE_GIT=yes
+        echo RUBY_DUMP_AST=./dump_ast-required-unexpectedly >> "$GITHUB_ENV"
+
+    - if: steps.which.outputs.sudo
+      shell: bash
+      run: |
+        sudo chmod -R go-w /usr/share
+        chmod -v go-w $HOME $HOME/.config || :
+        declare -a dirs # -A is not supported by old bash, e.g. macos
+        SAVE_IFS="$IFS" IFS=:; set $PATH
+        for d do
+          while [ -d "$d" ]; do
+            case "$IFS${dirs[*]}$IFS" in *"$IFS$d$IFS"*) ;; *) dirs+=("$d");; esac
+            d="${d%/*}"
+          done
+        done
+        IFS="$SAVE_IFS"
+        sudo chmod -v go-w "${dirs[@]}" || :
+
+    - if: inputs.dummy-files == 'true'
+      shell: bash
+      id: dummy-files
+      working-directory: ${{ inputs.builddir }}
+      run: |
+        : Create dummy files in build dir
+        set {{a..z},{A..Z},{0..9},foo,bar,test,zzz}.rb
+        for file; do \
+          echo > $file "raise 'do not load $file'"; \
+        done
+        # drop {a..z}.rb if case-insensitive filesystem
+        grep -F A.rb a.rb > /dev/null && set "${@:27}"
+        echo clean_files="$*" >> $GITHUB_OUTPUT
+      env:
+        INPUT_BUILDDIR: ${{ inputs.builddir }}
+
+    - name: clean
+      if: inputs.clean == 'true'
+      uses: gacts/run-and-post-run@fc6503862aba998e2f2123225ad63c09a92ed46e # v1.4.5
+      env:
+        INPUT_BUILDDIR: ${{ inputs.builddir }}
+        INPUT_SRCDIR: ${{ inputs.srcdir }}
+        INPUT_MAKE_COMMAND: ${{ inputs.make-command }}
+        CLEAN_FILES: ${{ steps.dummy-files.outputs.clean_files }}
+      with:
+        working-directory:
+        post: |
+          (cd "${INPUT_BUILDDIR}"; \
+          rm -f ${CLEAN_FILES}; \
+          ${INPUT_MAKE_COMMAND} distclean; \
+          )
+          if [ "${INPUT_BUILDDIR}" = "${INPUT_SRCDIR}" ]; then \
+            echo "In-place build"; \
+          elif (cd "${INPUT_BUILDDIR}" && ls -ARl); then \
+            rmdir -v "${INPUT_BUILDDIR}"; \
+          else \
+            echo "Already removed: ${INPUT_BUILDDIR}"; \
+          fi
+      # rmdir randomly fails due to launchable files
+      continue-on-error: true

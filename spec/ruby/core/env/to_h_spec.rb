@@ -18,6 +18,18 @@ describe "ENV.to_h" do
       ENV.to_h { |k, v| [k, v.upcase] }.should == { 'a' => "B", 'c' => "D" }
     end
 
+    it "passes to a block each pair's key and value as separate arguments" do
+      ENV.replace("a" => "b", "c" => "d")
+
+      ScratchPad.record []
+      ENV.to_h { |k, v| ScratchPad << [k, v]; [k, v] }
+      ScratchPad.recorded.sort.should == [["a", "b"], ["c", "d"]]
+
+      ScratchPad.record []
+      ENV.to_h { |*args| ScratchPad << args; [args[0], args[1]] }
+      ScratchPad.recorded.sort.should == [["a", "b"], ["c", "d"]]
+    end
+
     it "does not require the array elements to be strings" do
       ENV.replace("a" => "b", "c" => "d")
       ENV.to_h { |k, v| [k.to_sym, v.to_sym] }.should == { :a => :b, :c => :d }
@@ -26,17 +38,17 @@ describe "ENV.to_h" do
     it "raises ArgumentError if block returns longer or shorter array" do
       -> do
         ENV.to_h { |k, v| [k, v.upcase, 1] }
-      end.should raise_error(ArgumentError, /element has wrong array length/)
+      end.should.raise(ArgumentError, /element has wrong array length/)
 
       -> do
         ENV.to_h { |k, v| [k] }
-      end.should raise_error(ArgumentError, /element has wrong array length/)
+      end.should.raise(ArgumentError, /element has wrong array length/)
     end
 
     it "raises TypeError if block returns something other than Array" do
       -> do
         ENV.to_h { |k, v| "not-array" }
-      end.should raise_error(TypeError, /wrong element type String/)
+      end.should.raise(TypeError, /wrong element type String/)
     end
 
     it "coerces returned pair to Array with #to_ary" do
@@ -52,7 +64,7 @@ describe "ENV.to_h" do
 
       -> do
         ENV.to_h { |k| x }
-      end.should raise_error(TypeError, /wrong element type MockObject/)
+      end.should.raise(TypeError, /wrong element type MockObject/)
     end
   end
 end

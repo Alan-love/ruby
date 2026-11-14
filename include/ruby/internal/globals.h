@@ -68,6 +68,7 @@ RUBY_EXTERN VALUE rb_cBasicObject;            /**< `BasicObject` class. */
 RUBY_EXTERN VALUE rb_cObject;                 /**< `Object` class. */
 RUBY_EXTERN VALUE rb_cArray;                  /**< `Array` class. */
 RUBY_EXTERN VALUE rb_cBinding;                /**< `Binding` class. */
+RUBY_EXTERN VALUE rb_cBox;                    /**< `Ruby::Box` class. */
 RUBY_EXTERN VALUE rb_cClass;                  /**< `Class` class. */
 RUBY_EXTERN VALUE rb_cDir;                    /**< `Dir` class. */
 RUBY_EXTERN VALUE rb_cEncoding;               /**< `Encoding` class. */
@@ -91,10 +92,11 @@ RUBY_EXTERN VALUE rb_cRandom;                 /**< `Random` class. */
 RUBY_EXTERN VALUE rb_cRange;                  /**< `Range` class. */
 RUBY_EXTERN VALUE rb_cRational;               /**< `Rational` class. */
 RUBY_EXTERN VALUE rb_cRegexp;                 /**< `Regexp` class. */
+RUBY_EXTERN VALUE rb_cSet;                    /**< `Set` class. */
 RUBY_EXTERN VALUE rb_cStat;                   /**< `File::Stat` class. */
 RUBY_EXTERN VALUE rb_cString;                 /**< `String` class. */
 RUBY_EXTERN VALUE rb_cStruct;                 /**< `Struct` class. */
-RUBY_EXTERN VALUE rb_cSymbol;                 /**< `Sumbol` class. */
+RUBY_EXTERN VALUE rb_cSymbol;                 /**< `Symbol` class. */
 RUBY_EXTERN VALUE rb_cThread;                 /**< `Thread` class. */
 RUBY_EXTERN VALUE rb_cTime;                   /**< `Time` class. */
 RUBY_EXTERN VALUE rb_cTrueClass;              /**< `TrueClass` class. */

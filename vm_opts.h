@@ -19,7 +19,7 @@
 #define OPT_PEEPHOLE_OPTIMIZATION       1
 #define OPT_SPECIALISED_INSTRUCTION     1
 #define OPT_INLINE_CONST_CACHE          1
-#define OPT_FROZEN_STRING_LITERAL       0
+#define OPT_FROZEN_STRING_LITERAL       -1
 #define OPT_DEBUG_FROZEN_STRING_LITERAL 0
 
 /* Build Options.
@@ -44,8 +44,6 @@
 /* VM running option */
 #define OPT_CHECKED_RUN              1
 #define OPT_INLINE_METHOD_CACHE      1
-#define OPT_GLOBAL_METHOD_CACHE      1
-#define OPT_BLOCKINLINING            0
 
 #ifndef OPT_IC_FOR_IVAR
 #define OPT_IC_FOR_IVAR 1
@@ -54,16 +52,10 @@
 /* architecture independent, affects generated code */
 #define OPT_OPERANDS_UNIFICATION     1
 #define OPT_INSTRUCTIONS_UNIFICATION 0
-#define OPT_UNIFY_ALL_COMBINATION    0
-#define OPT_STACK_CACHING            0
 
 /* misc */
 #ifndef OPT_SUPPORT_JOKE
 #define OPT_SUPPORT_JOKE             0
-#endif
-
-#ifndef OPT_SUPPORT_CALL_C_FUNCTION
-#define OPT_SUPPORT_CALL_C_FUNCTION  0
 #endif
 
 #ifndef VM_COLLECT_USAGE_DETAILS

@@ -80,7 +80,8 @@ VALUE rb_class_new_instance(int argc, const VALUE *argv, VALUE klass);
  * @param[in]  kw_splat         Handling of keyword parameters:
  *   - RB_NO_KEYWORDS           `argv`'s last is not a keyword argument.
  *   - RB_PASS_KEYWORDS         `argv`'s last is a keyword argument.
- *   - RB_PASS_CALLED_KEYWORDS  it depends if there is a passed block.
+ *   - RB_PASS_CALLED_KEYWORDS  Pass keyword arguments if the current method
+ *                              was called with keyword arguments.
  * @exception  rb_eTypeError    `klass`'s allocator is undefined.
  * @exception  rb_eException    Any exceptions can happen inside.
  * @return     An allocated new instance of `klass`.
@@ -92,8 +93,8 @@ VALUE rb_class_new_instance_kw(int argc, const VALUE *argv, VALUE klass, int kw_
  *
  * @param[in]  lhs          Comparison left hand side.
  * @param[in]  rhs          Comparison right hand side.
- * @retval     RUBY_Qtrue   They are equal.
- * @retval     RUBY_Qfalse  Otherwise.
+ * @retval     non-zero     They are equal.
+ * @retval     0            Otherwise.
  * @note       This  function  actually  calls `lhs.eql?(rhs)`  so  you  cannot
  *             implement your class' `#eql?` method using it.
  */
@@ -151,13 +152,12 @@ VALUE rb_obj_is_kind_of(VALUE obj, VALUE klass);
  * @return     An allocated, not yet initialised instance of `klass`.
  * @note       It calls  the allocator defined by  rb_define_alloc_func().  You
  *             cannot  use   this  function   to  define  an   allocator.   Use
- *             rb_newobj_of(), #TypedData_Make_Struct or others, instead.
+ *             TypedData_Make_Struct or others, instead.
  * @note       Usually  prefer  rb_class_new_instance() to  rb_obj_alloc()  and
  *             rb_obj_call_init().
  * @see        rb_class_new_instance()
  * @see        rb_obj_call_init()
  * @see        rb_define_alloc_func()
- * @see        rb_newobj_of()
  * @see        #TypedData_Make_Struct
  */
 VALUE rb_obj_alloc(VALUE klass);
@@ -202,77 +202,8 @@ VALUE rb_obj_dup(VALUE obj);
  */
 VALUE rb_obj_init_copy(VALUE src, VALUE dst);
 
-RBIMPL_ATTR_DEPRECATED_EXT(("taintedness turned out to be a wrong idea."))
 /**
- * @deprecated  This function  once was a thing  in the old days,  but makes no
- *              sense   any   longer   today.   Exists   here   for   backwards
- *              compatibility only.  You can safely forget about it.
- *
- * @param[in]   obj  Object in question.
- * @return      Verbatim `obj`.
- */
-VALUE rb_obj_taint(VALUE obj);
-
-RBIMPL_ATTR_PURE()
-RBIMPL_ATTR_DEPRECATED_EXT(("taintedness turned out to be a wrong idea."))
-/**
- * @deprecated  This function  once was a thing  in the old days,  but makes no
- *              sense   any   longer   today.   Exists   here   for   backwards
- *              compatibility only.  You can safely forget about it.
- *
- * @param[in]   obj  Object in question.
- * @return      Always returns ::RUBY_Qfalse.
- */
-VALUE rb_obj_tainted(VALUE obj);
-
-RBIMPL_ATTR_DEPRECATED_EXT(("taintedness turned out to be a wrong idea."))
-/**
- * @deprecated  This function  once was a thing  in the old days,  but makes no
- *              sense   any   longer   today.   Exists   here   for   backwards
- *              compatibility only.  You can safely forget about it.
- *
- * @param[in]   obj  Object in question.
- * @return      Verbatim `obj`.
- */
-VALUE rb_obj_untaint(VALUE obj);
-
-RBIMPL_ATTR_DEPRECATED_EXT(("trustedness turned out to be a wrong idea."))
-/**
- * @deprecated  This function  once was a thing  in the old days,  but makes no
- *              sense   any   longer   today.   Exists   here   for   backwards
- *              compatibility only.  You can safely forget about it.
- *
- * @param[in]   obj  Object in question.
- * @return      Verbatim `obj`.
- */
-VALUE rb_obj_untrust(VALUE obj);
-
-RBIMPL_ATTR_PURE()
-RBIMPL_ATTR_DEPRECATED_EXT(("trustedness turned out to be a wrong idea."))
-/**
- * @deprecated  This function  once was a thing  in the old days,  but makes no
- *              sense   any   longer   today.   Exists   here   for   backwards
- *              compatibility only.  You can safely forget about it.
- *
- * @param[in]   obj  Object in question.
- * @return      Always returns ::RUBY_Qfalse.
- */
-VALUE rb_obj_untrusted(VALUE obj);
-
-RBIMPL_ATTR_DEPRECATED_EXT(("trustedness turned out to be a wrong idea."))
-/**
- * @deprecated  This function  once was a thing  in the old days,  but makes no
- *              sense   any   longer   today.   Exists   here   for   backwards
- *              compatibility only.  You can safely forget about it.
- *
- * @param[in]   obj  Object in question.
- * @return      Verbatim `obj`.
- */
-VALUE rb_obj_trust(VALUE obj);
-
-/**
- * Just  calls  rb_obj_freeze_inline() inside.   Does  this  make any  sens  to
- * extension libraries?
+ * Same as RB_OBJ_FREEZE(), but returns the given object.
  *
  * @param[out]  obj  Object to freeze.
  * @return      Verbatim `obj`.
@@ -281,8 +212,7 @@ VALUE rb_obj_freeze(VALUE obj);
 
 RBIMPL_ATTR_PURE()
 /**
- * Just calls  RB_OBJ_FROZEN() inside.   Does this make  any sens  to extension
- * libraries?
+ * Same as RB_OBJ_FROZEN(), but returns #Qtrue/#Qfalse instead of #bool.
  *
  * @param[in]  obj          Object in question.
  * @retval     RUBY_Qtrue   Yes it is.
@@ -349,7 +279,7 @@ RBIMPL_ATTR_PURE()
  */
 VALUE rb_class_real(VALUE klass);
 
-RBIMPL_ATTR_PURE()
+RBIMPL_ATTR_NOALIAS()
 /**
  * Determines if the given two modules are relatives.
  *
@@ -362,7 +292,7 @@ RBIMPL_ATTR_PURE()
  */
 VALUE rb_class_inherited_p(VALUE scion, VALUE ascendant);
 
-RBIMPL_ATTR_PURE()
+RBIMPL_ATTR_NOALIAS()
 /**
  * Queries the parent of the given class.
  *

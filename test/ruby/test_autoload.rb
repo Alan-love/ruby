@@ -65,6 +65,24 @@ p Foo::Bar
     }
   end
 
+  def test_autoload_p_with_static_extensions
+    require 'rbconfig'
+    omit unless RbConfig::CONFIG['EXTSTATIC'] == 'static'
+    begin
+      require 'fcntl.so'
+    rescue LoadError
+      omit('fcntl not included in the build')
+    end
+
+    assert_separately(['--disable-all'], <<~RUBY)
+      autoload :Fcntl, 'fcntl.so'
+
+      assert_equal('fcntl.so', autoload?(:Fcntl))
+      assert(Object.const_defined?(:Fcntl))
+      assert_equal('constant', defined?(Fcntl), '[Bug #19115]')
+    RUBY
+  end
+
   def test_autoload_with_unqualified_file_name # [ruby-core:69206]
     Object.send(:remove_const, :A) if Object.const_defined?(:A)
 
@@ -150,6 +168,7 @@ p Foo::Bar
   end
 
   def test_nameerror_when_autoload_did_not_define_the_constant
+    verbose_bak, $VERBOSE = $VERBOSE, nil
     Tempfile.create(['autoload', '.rb']) {|file|
       file.puts ''
       file.close
@@ -162,6 +181,8 @@ p Foo::Bar
         remove_autoload_constant
       end
     }
+  ensure
+    $VERBOSE = verbose_bak
   end
 
   def test_override_autoload
@@ -203,10 +224,21 @@ p Foo::Bar
     Kernel.module_eval do
       alias old_require require
     end
+    if defined?(Ruby::Box)
+      Ruby::Box.module_eval do
+        alias old_require require
+      end
+    end
     called_with = []
     Kernel.send :define_method, :require do |path|
       called_with << path
       old_require path
+    end
+    if defined?(Ruby::Box)
+      Ruby::Box.send :define_method, :require do |path|
+        called_with << path
+        old_require path
+      end
     end
     yield called_with
   ensure
@@ -214,6 +246,13 @@ p Foo::Bar
       undef require
       alias require old_require
       undef old_require
+    end
+    if defined?(Ruby::Box)
+      Ruby::Box.module_eval do
+        undef require
+        alias require old_require
+        undef old_require
+      end
     end
   end
 
@@ -228,7 +267,8 @@ p Foo::Bar
         ensure
           remove_autoload_constant
         end
-        assert_equal [file.path], called_with
+        # .dup to prevent breaking called_with by autoloading pp, etc
+        assert_equal [file.path], called_with.dup
       }
     end
   end
@@ -246,13 +286,18 @@ p Foo::Bar
           ensure
             remove_autoload_constant
           end
-          assert_equal [a.path, b.path], called_with
+          # .dup to prevent breaking called_with by autoloading pp, etc
+          assert_equal [a.path, b.path], called_with.dup
         end
       end
     end
   end
 
   def test_bug_13526
+    # Skip this on macOS 10.13 because of the following error:
+    # http://rubyci.s3.amazonaws.com/osx1013/ruby-master/log/20231011T014505Z.fail.html.gz
+    require "rbconfig"
+
     script = File.join(__dir__, 'bug-13526.rb')
     assert_ruby_status([script], '', '[ruby-core:81016] [Bug #13526]')
   end
@@ -381,7 +426,7 @@ p Foo::Bar
         end
       }
     end
-  end if Process.respond_to?(:fork)
+  end if Process.respond_to?(:fork) && ENV["RUBYCI_OPENBSD"] != "1"
 
   def test_autoload_same_file
     Dir.mktmpdir('autoload') do |tmpdir|
@@ -443,6 +488,23 @@ p Foo::Bar
     end
   end
 
+  def test_source_location_after_require
+    bug = "Bug18624"
+    Dir.mktmpdir('autoload') do |tmpdir|
+      path = "#{tmpdir}/test-#{bug}.rb"
+      File.write(path, "C::#{bug} = __FILE__\n")
+      assert_separately(%W[-I #{tmpdir}], "#{<<-"begin;"}\n#{<<-"end;"}")
+      begin;
+        class C; end
+        C.autoload(:Bug18624, #{path.dump})
+        require #{path.dump}
+        assert_equal [#{path.dump}, 1], C.const_source_location(#{bug.dump})
+        assert_equal #{path.dump}, C.const_get(#{bug.dump})
+        assert_equal [#{path.dump}, 1], C.const_source_location(#{bug.dump})
+      end;
+    end
+  end
+
   def test_no_memory_leak
     assert_no_memory_leak([], '', "#{<<~"begin;"}\n#{<<~'end;'}", 'many autoloads', timeout: 60)
     begin;
@@ -462,6 +524,7 @@ p Foo::Bar
       File.write(autoload_path, '')
 
       assert_separately(%W[-I #{tmpdir}], <<-RUBY)
+        $VERBOSE = nil
         path = #{File.realpath(autoload_path).inspect}
         autoload :X, path
         assert_equal(path, Object.autoload?(:X))
@@ -490,5 +553,169 @@ p Foo::Bar
     $".replace($" - @autoload_paths)
     ::Object.class_eval {remove_const(:AutoloadTest)} if defined? Object::AutoloadTest
     TestAutoload.class_eval {remove_const(:AutoloadTest)} if defined? TestAutoload::AutoloadTest
+  end
+
+  def test_autoload_module_gc
+    Dir.mktmpdir('autoload') do |tmpdir|
+      autoload_path = File.join(tmpdir, "autoload_module_gc.rb")
+      File.write(autoload_path, "X = 1; Y = 2;")
+
+      x = Module.new
+      x.autoload :X, "./feature.rb"
+
+      1000.times do
+        y = Module.new
+        y.autoload :Y, "./feature.rb"
+      end
+
+      x = y = nil
+
+      # Ensure the internal data structures are cleaned up correctly / don't crash:
+      GC.start
+    end
+  end
+
+  def test_autoload_parallel_race
+    Dir.mktmpdir('autoload') do |tmpdir|
+      autoload_path = File.join(tmpdir, "autoload_parallel_race.rb")
+      File.write(autoload_path, 'module Foo; end; module Bar; end')
+
+      assert_ruby_status([], <<-RUBY, timeout: 100)
+        autoload_path = #{File.realpath(autoload_path).inspect}
+
+        # This should work with no errors or failures.
+        1000.times do
+          autoload :Foo, autoload_path
+          autoload :Bar, autoload_path
+
+          t1 = Thread.new {Foo}
+          t2 = Thread.new {Bar}
+
+          t1.join
+          GC.start # force GC.
+          t2.join
+
+          Object.send(:remove_const, :Foo)
+          Object.send(:remove_const, :Bar)
+
+          $LOADED_FEATURES.delete(autoload_path)
+        end
+      RUBY
+    end
+  end
+
+  def test_autoload_parent_namespace
+    Dir.mktmpdir('autoload') do |tmpdir|
+      autoload_path = File.join(tmpdir, "some_const.rb")
+      File.write(autoload_path, 'class SomeConst; end')
+
+      assert_separately(%W[-I #{tmpdir}], <<-RUBY)
+        module SomeNamespace
+          autoload :SomeConst, #{File.realpath(autoload_path).inspect}
+          assert_warning(%r{/some_const\.rb to define SomeNamespace::SomeConst but it didn't}) do
+            assert_not_nil SomeConst
+          end
+        end
+      RUBY
+    end
+  end
+
+  def test_autoload_relative_toplevel
+    Dir.mktmpdir('autoload_relative') do |tmpdir|
+      main_file = File.join(tmpdir, 'main.rb')
+      module_file = File.join(tmpdir, 'test_module.rb')
+
+      File.write(module_file, <<-RUBY)
+        module AutoloadRelativeTest
+          VERSION = '1.0'
+        end
+      RUBY
+
+      File.write(main_file, <<-RUBY)
+        autoload_relative :AutoloadRelativeTest, 'test_module.rb'
+        puts AutoloadRelativeTest::VERSION
+      RUBY
+
+      assert_in_out_err([main_file], '', ['1.0'], [])
+    end
+  end
+
+  def test_autoload_relative_module_level
+    Dir.mktmpdir('autoload_relative') do |tmpdir|
+      main_file = File.join(tmpdir, 'main_mod.rb')
+      module_file = File.join(tmpdir, 'nested_module.rb')
+
+      File.write(module_file, <<-RUBY)
+        module Container
+          module NestedModule
+            MSG = 'loaded'
+          end
+        end
+      RUBY
+
+      File.write(main_file, <<-RUBY)
+        module Container
+          autoload_relative :NestedModule, 'nested_module.rb'
+        end
+        puts Container::NestedModule::MSG
+      RUBY
+
+      assert_in_out_err([main_file], '', ['loaded'], [])
+    end
+  end
+
+  def test_autoload_relative_query
+    Dir.mktmpdir('autoload_relative') do |tmpdir|
+      main_file = File.join(tmpdir, 'query_test.rb')
+      module_file = File.join(tmpdir, 'query_module.rb')
+
+      File.write(module_file, 'module QueryModule; end')
+
+      File.write(main_file, <<-RUBY)
+        autoload_relative :QueryModule, 'query_module.rb'
+        path = autoload?(:QueryModule)
+        # Use realpath for comparison to handle symlinks (e.g., /var -> /private/var on macOS)
+        real_tmpdir = File.realpath('#{tmpdir}')
+        puts path.start_with?(real_tmpdir) && path.end_with?('query_module.rb')
+      RUBY
+
+      assert_in_out_err([main_file], '', ['true'], [])
+    end
+  end
+
+  def test_autoload_relative_nested_directory
+    Dir.mktmpdir('autoload_relative') do |tmpdir|
+      nested_dir = File.join(tmpdir, 'nested')
+      Dir.mkdir(nested_dir)
+
+      main_file = File.join(tmpdir, 'nested_test.rb')
+      module_file = File.join(nested_dir, 'deep_module.rb')
+
+      File.write(module_file, 'module DeepModule; VALUE = 42; end')
+
+      File.write(main_file, <<-RUBY)
+        autoload_relative :DeepModule, 'nested/deep_module.rb'
+        puts DeepModule::VALUE
+      RUBY
+
+      assert_in_out_err([main_file], '', ['42'], [])
+    end
+  end
+
+  def test_autoload_relative_no_basepath
+    # Test that autoload_relative raises an error when called from eval without file context
+    assert_raise(LoadError) do
+      eval('autoload_relative :TestConst, "test.rb"')
+    end
+  end
+
+  private
+
+  def assert_separately(*args, **kwargs)
+    super(*args, timeout: 60, **kwargs)
+  end
+
+  def assert_ruby_status(*args, **kwargs)
+    super(*args, timeout: 60, **kwargs)
   end
 end

@@ -32,8 +32,21 @@ describe "IO.open" do
         super()
         ScratchPad.record :called
       end
-      io.closed?.should be_false
+      io.closed?.should == false
     end
+    ScratchPad.recorded.should == :called
+  end
+
+  it "propagate an exception in the block after calling #close" do
+    -> do
+      IO.open(@fd, "w") do |io|
+        IOSpecs.io_mock(io, :close) do
+          super()
+          ScratchPad.record :called
+        end
+        raise Exception
+      end
+    end.should.raise(Exception)
     ScratchPad.recorded.should == :called
   end
 
@@ -46,7 +59,7 @@ describe "IO.open" do
           raise Exception
         end
       end
-    end.should raise_error(Exception)
+    end.should.raise(Exception)
     ScratchPad.recorded.should == :called
   end
 
@@ -59,7 +72,7 @@ describe "IO.open" do
           raise StandardError
         end
       end
-    end.should raise_error(StandardError)
+    end.should.raise(StandardError)
     ScratchPad.recorded.should == :called
   end
 

@@ -1,3 +1,3 @@
 module DidYouMean
-  VERSION = "1.6.0-alpha"
+  VERSION = "2.0.0".freeze
 end

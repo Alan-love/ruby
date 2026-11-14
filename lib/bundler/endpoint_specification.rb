@@ -3,27 +3,49 @@
 module Bundler
   # used for Creating Specifications from the Gemcutter Endpoint
   class EndpointSpecification < Gem::Specification
-    include MatchPlatform
+    include MatchRemoteMetadata
 
-    attr_reader :name, :version, :platform, :required_rubygems_version, :required_ruby_version, :checksum
-    attr_accessor :source, :remote, :dependencies
+    attr_reader :name, :version, :platform, :checksum, :created_at, :content_address
+    attr_writer :dependencies
+    attr_accessor :remote, :locked_platform
 
-    def initialize(name, version, platform, dependencies, metadata = nil)
+    def initialize(name, version, suffix, spec_fetcher, dependencies, metadata = nil)
       super()
       @name         = name
       @version      = Gem::Version.create version
-      @platform     = platform
-      @dependencies = dependencies.map {|dep, reqs| build_dependency(dep, reqs) }
+      @spec_fetcher = spec_fetcher
+      @dependencies = nil
+      @unbuilt_dependencies = dependencies
+      @content_address = nil
+      @required_platform = nil
 
       @loaded_from          = nil
       @remote_specification = nil
+      @locked_platform = nil
 
       parse_metadata(metadata)
+
+      if Gem::ContentAddress.content_addressed_row?(suffix, @required_platform, @required_ruby_version)
+        @content_address = suffix
+        @platform = @required_platform
+        @required_rubygems_version ||= Gem::Requirement.default
+      else
+        @platform = Gem::Platform.new(suffix)
+      end
+    end
+
+    def insecurely_materialized?
+      @locked_platform.to_s != @platform.to_s
     end
 
     def fetch_platform
       @platform
     end
+
+    def dependencies
+      @dependencies ||= @unbuilt_dependencies.map! {|dep, reqs| build_dependency(dep, reqs) }
+    end
+    alias_method :runtime_dependencies, :dependencies
 
     # needed for standalone, load required_paths from local gemspec
     # after the gem is installed
@@ -32,6 +54,19 @@ module Bundler
         @remote_specification.require_paths
       elsif _local_specification
         _local_specification.require_paths
+      else
+        super
+      end
+    end
+
+    # `require_paths` is overridden above, but `full_require_paths` (and so
+    # `load_paths`) is computed from `raw_require_paths`, which would otherwise
+    # report the default `lib` for every gem
+    def raw_require_paths
+      if @remote_specification
+        @remote_specification.raw_require_paths
+      elsif _local_specification
+        _local_specification.raw_require_paths
       else
         super
       end
@@ -91,9 +126,20 @@ module Bundler
       end
     end
 
+    # needed for `bundle fund`
+    def metadata
+      if @remote_specification
+        @remote_specification.metadata
+      elsif _local_specification
+        _local_specification.metadata
+      else
+        super
+      end
+    end
+
     def _local_specification
       return unless @loaded_from && File.exist?(local_specification_path)
-      eval(File.read(local_specification_path)).tap do |spec|
+      eval(File.read(local_specification_path), nil, local_specification_path).tap do |spec|
         spec.loaded_from = @loaded_from
       end
     end
@@ -103,31 +149,91 @@ module Bundler
       @remote_specification = spec
     end
 
+    def inspect
+      "#<#{self.class} @name=\"#{name}\" (#{full_name.delete_prefix("#{name}-")})>"
+    end
+
     private
 
+    def _remote_specification
+      suffix = @content_address || @platform
+      @_remote_specification ||= @spec_fetcher.fetch_spec([@name, @version, suffix])
+    end
+
     def local_specification_path
-      "#{base_dir}/specifications/#{full_name}.gemspec"
+      File.join(Gem::SpecificationRecord.specification_dir_for(self, base_dir),
+                "#{full_name}.gemspec")
     end
 
     def parse_metadata(data)
-      return unless data
+      @created_at = nil
+
+      unless data
+        @required_ruby_version = nil
+        @required_rubygems_version = nil
+        return
+      end
+
       data.each do |k, v|
         next unless v
         case k.to_s
         when "checksum"
-          @checksum = v.last
+          # Some registries send empty checksum values, treat them as if the
+          # checksum was not included at all
+          checksum = v.last
+          next unless checksum
+
+          begin
+            @checksum = Checksum.from_api(checksum, @spec_fetcher.uri)
+          rescue ArgumentError => e
+            raise ArgumentError, "Invalid checksum for #{full_name}: #{e.message}"
+          end
         when "rubygems"
           @required_rubygems_version = Gem::Requirement.new(v)
         when "ruby"
           @required_ruby_version = Gem::Requirement.new(v)
+        when "created_at"
+          @created_at = parse_created_at(v.is_a?(Array) ? v.last : v)&.freeze
+        when "platform"
+          @required_platform = required_platform_from(Array(v).last)
         end
       end
     rescue StandardError => e
       raise GemspecError, "There was an error parsing the metadata for the gem #{name} (#{version}): #{e.class}\n#{e}\nThe metadata was #{data.inspect}"
     end
 
+    # Matches an ISO 8601 time zone designator at the end of a timestamp.
+    TIME_ZONE_SUFFIX = /(?:Z|z|[+-]\d{2}(?::?\d{2})?)\z/
+    private_constant :TIME_ZONE_SUFFIX
+
+    # See Gem::Cooldown::FOUR_DIGIT_YEAR.
+    FOUR_DIGIT_YEAR = /\A\d{4}-/
+    private_constant :FOUR_DIGIT_YEAR
+
+    # A timestamp without a time zone offset is read as UTC, because reading
+    # it as local time would shift the cooldown window by the environment's
+    # offset. Unparsable values and years outside four digits become nil so
+    # the cooldown fails open.
+    def parse_created_at(value)
+      return unless value.is_a?(String) && value.match?(FOUR_DIGIT_YEAR)
+
+      require "time"
+      begin
+        Time.iso8601(value.match?(TIME_ZONE_SUFFIX) ? value : "#{value}Z")
+      rescue ArgumentError
+        nil
+      end
+    end
+
     def build_dependency(name, requirements)
-      Gem::Dependency.new(name, requirements)
+      Dependency.new(name, requirements)
+    end
+
+    def required_platform_from(value)
+      value = value.to_s
+      return if value.empty?
+
+      Gem::Platform.new(value)
     end
   end
 end

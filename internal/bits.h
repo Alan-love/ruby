@@ -28,16 +28,15 @@
 #include "ruby/internal/config.h"
 #include <limits.h>             /* for CHAR_BITS */
 #include <stdint.h>             /* for uintptr_t */
-#include "internal/compilers.h" /* for MSC_VERSION_SINCE */
+#include "internal/compilers.h" /* for __has_builtin */
 
-#if MSC_VERSION_SINCE(1310)
+#ifdef _MSC_VER
 # include <stdlib.h>            /* for _byteswap_uint64 */
 #endif
 
-#if defined(HAVE_X86INTRIN_H) && ! defined(MJIT_HEADER)
-# /* Rule out MJIT_HEADER, which does not interface well with <immintrin.h> */
+#if defined(HAVE_X86INTRIN_H)
 # include <x86intrin.h>         /* for _lzcnt_u64 */
-#elif MSC_VERSION_SINCE(1310)
+#elif defined(_MSC_VER)
 # include <intrin.h>            /* for the following intrinsics */
 #endif
 
@@ -51,16 +50,13 @@
 # pragma intrinsic(__lzcnt64)
 #endif
 
-#if MSC_VERSION_SINCE(1310)
+#if defined(_MSC_VER)
 # pragma intrinsic(_rotl)
 # pragma intrinsic(_rotr)
 # ifdef _WIN64
 #  pragma intrinsic(_rotl64)
 #  pragma intrinsic(_rotr64)
 # endif
-#endif
-
-#if MSC_VERSION_SINCE(1400)
 # pragma intrinsic(_BitScanForward)
 # pragma intrinsic(_BitScanReverse)
 # ifdef _WIN64
@@ -91,6 +87,7 @@
 
 #define UNSIGNED_INTEGER_MAX(T) ((T)~(T)0)
 
+#ifndef MUL_OVERFLOW_SIGNED_INTEGER_P
 #if __has_builtin(__builtin_mul_overflow_p)
 # define MUL_OVERFLOW_P(a, b) \
     __builtin_mul_overflow_p((a), (b), (__typeof__(a * b))0)
@@ -106,6 +103,8 @@
       ((b) > 0 ? (max) / (a) < (b) : (min) / (a) > (b)) : \
       ((b) > 0 ? (min) / (a) < (b) : (max) / (a) > (b)))
 
+#define MUL_OVERFLOW_UNSIGNED_INTEGER_P(a, b, max) ((a) > 0 && ((b) > (max) / (a)))
+
 #if __has_builtin(__builtin_mul_overflow_p)
 /* __builtin_mul_overflow_p can take bitfield */
 /* and GCC permits bitfields for integers other than int */
@@ -119,14 +118,133 @@
     MUL_OVERFLOW_SIGNED_INTEGER_P(a, b, FIXNUM_MIN, FIXNUM_MAX)
 #endif
 
-#ifdef MUL_OVERFLOW_P
+#if defined(MUL_OVERFLOW_P) && defined(USE___BUILTIN_MUL_OVERFLOW_LONG_LONG)
 # define MUL_OVERFLOW_LONG_LONG_P(a, b) MUL_OVERFLOW_P(a, b)
+#else
+# define MUL_OVERFLOW_LONG_LONG_P(a, b) MUL_OVERFLOW_SIGNED_INTEGER_P(a, b, LLONG_MIN, LLONG_MAX)
+#endif
+
+#ifdef MUL_OVERFLOW_P
 # define MUL_OVERFLOW_LONG_P(a, b)      MUL_OVERFLOW_P(a, b)
 # define MUL_OVERFLOW_INT_P(a, b)       MUL_OVERFLOW_P(a, b)
 #else
-# define MUL_OVERFLOW_LONG_LONG_P(a, b) MUL_OVERFLOW_SIGNED_INTEGER_P(a, b, LLONG_MIN, LLONG_MAX)
 # define MUL_OVERFLOW_LONG_P(a, b)      MUL_OVERFLOW_SIGNED_INTEGER_P(a, b, LONG_MIN, LONG_MAX)
 # define MUL_OVERFLOW_INT_P(a, b)       MUL_OVERFLOW_SIGNED_INTEGER_P(a, b, INT_MIN, INT_MAX)
+#endif
+
+#if SIZEOF_RB_LEN_T > SIZEOF_LONG
+# define MUL_OVERFLOW_LEN_P(a, b)       MUL_OVERFLOW_LONG_LONG_P(a, b)
+#elif SIZEOF_RB_LEN_T > SIZEOF_INT
+# define MUL_OVERFLOW_LEN_P(a, b)       MUL_OVERFLOW_LONG_P(a, b)
+#else
+# define MUL_OVERFLOW_LEN_P(a, b)       MUL_OVERFLOW_INT_P(a, b)
+#endif
+
+#define MUL_OVERFLOW_SIZE_P(a, b)      MUL_OVERFLOW_UNSIGNED_INTEGER_P(a, b, SIZE_MAX)
+#endif
+
+#ifndef ADD_OVERFLOW_SIGNED_INTEGER_P
+#if __has_builtin(__builtin_add_overflow_p)
+# define ADD_OVERFLOW_P(a, b) \
+    __builtin_add_overflow_p((a), (b), (__typeof__(a * b))0)
+#elif __has_builtin(__builtin_add_overflow)
+# define ADD_OVERFLOW_P(a, b) \
+    __extension__ ({ __typeof__(a) c; __builtin_add_overflow((a), (b), &c); })
+#endif
+
+#define ADD_OVERFLOW_SIGNED_INTEGER_P(a, b, min, max) ( \
+    (a) > 0 ? (b) > (max) - (a) : (b) < (min) - (a))
+
+#define ADD_OVERFLOW_UNSIGNED_INTEGER_P(a, b, max) ((b) > (max) - (a))
+
+#if __has_builtin(__builtin_add_overflow_p)
+/* __builtin_add_overflow_p can take bitfield */
+/* and GCC permits bitfields for integers other than int */
+# define ADD_OVERFLOW_FIXNUM_P(a, b) \
+    __extension__ ({ \
+        struct { long fixnum : sizeof(long) * CHAR_BIT - 1; } c = { 0 }; \
+        __builtin_add_overflow_p((a), (b), c.fixnum); \
+    })
+#else
+# define ADD_OVERFLOW_FIXNUM_P(a, b) \
+    ADD_OVERFLOW_SIGNED_INTEGER_P(a, b, FIXNUM_MIN, FIXNUM_MAX)
+#endif
+
+#if defined(ADD_OVERFLOW_P) && defined(USE___BUILTIN_ADD_OVERFLOW_LONG_LONG)
+# define ADD_OVERFLOW_LONG_LONG_P(a, b) ADD_OVERFLOW_P(a, b)
+#else
+# define ADD_OVERFLOW_LONG_LONG_P(a, b) ADD_OVERFLOW_SIGNED_INTEGER_P(a, b, LLONG_MIN, LLONG_MAX)
+#endif
+
+#ifdef ADD_OVERFLOW_P
+# define ADD_OVERFLOW_LONG_P(a, b)      ADD_OVERFLOW_P(a, b)
+# define ADD_OVERFLOW_INT_P(a, b)       ADD_OVERFLOW_P(a, b)
+#else
+# define ADD_OVERFLOW_LONG_P(a, b)      ADD_OVERFLOW_SIGNED_INTEGER_P(a, b, LONG_MIN, LONG_MAX)
+# define ADD_OVERFLOW_INT_P(a, b)       ADD_OVERFLOW_SIGNED_INTEGER_P(a, b, INT_MIN, INT_MAX)
+#endif
+
+#if SIZEOF_RB_LEN_T > SIZEOF_LONG
+# define ADD_OVERFLOW_LEN_P(a, b)       ADD_OVERFLOW_LONG_LONG_P(a, b)
+#elif SIZEOF_RB_LEN_T > SIZEOF_INT
+# define ADD_OVERFLOW_LEN_P(a, b)       ADD_OVERFLOW_LONG_P(a, b)
+#else
+# define ADD_OVERFLOW_LEN_P(a, b)       ADD_OVERFLOW_INT_P(a, b)
+#endif
+
+#define ADD_OVERFLOW_SIZE_P(a, b)       ADD_OVERFLOW_UNSIGNED_INTEGER_P(a, b, SIZE_MAX)
+#endif
+
+#ifndef SUB_OVERFLOW_SIGNED_INTEGER_P
+#if __has_builtin(__builtin_sub_overflow_p)
+# define SUB_OVERFLOW_P(a, b) \
+    __builtin_sub_overflow_p((a), (b), (__typeof__(a * b))0)
+#elif __has_builtin(__builtin_sub_overflow)
+# define SUB_OVERFLOW_P(a, b) \
+    __extension__ ({ __typeof__(a) c; __builtin_sub_overflow((a), (b), &c); })
+#endif
+
+#define SUB_OVERFLOW_SIGNED_INTEGER_P(a, b, min, max) ( \
+        (b) > 0 ? (a) < (min) + (b) : (a) > (max) + (b))
+
+#define SUB_OVERFLOW_UNSIGNED_INTEGER_P(a, b) ((a) < (b))
+
+#if __has_builtin(__builtin_sub_overflow_p)
+/* __builtin_sub_overflow_p can take bitfield */
+/* and GCC permits bitfields for integers other than int */
+# define SUB_OVERFLOW_FIXNUM_P(a, b) \
+    __extension__ ({ \
+        struct { long fixnum : sizeof(long) * CHAR_BIT - 1; } c = { 0 }; \
+        __builtin_sub_overflow_p((a), (b), c.fixnum); \
+    })
+#else
+# define SUB_OVERFLOW_FIXNUM_P(a, b) \
+    SUB_OVERFLOW_SIGNED_INTEGER_P(a, b, FIXNUM_MIN, FIXNUM_MAX)
+#endif
+
+#if defined(SUB_OVERFLOW_P) && defined(USE___BUILTIN_SUB_OVERFLOW_LONG_LONG)
+# define SUB_OVERFLOW_LONG_LONG_P(a, b) SUB_OVERFLOW_P(a, b)
+#else
+# define SUB_OVERFLOW_LONG_LONG_P(a, b) SUB_OVERFLOW_SIGNED_INTEGER_P(a, b, LLONG_MIN, LLONG_MAX)
+#endif
+
+#ifdef SUB_OVERFLOW_P
+# define SUB_OVERFLOW_LONG_P(a, b)      SUB_OVERFLOW_P(a, b)
+# define SUB_OVERFLOW_INT_P(a, b)       SUB_OVERFLOW_P(a, b)
+#else
+# define SUB_OVERFLOW_LONG_P(a, b)      SUB_OVERFLOW_SIGNED_INTEGER_P(a, b, LONG_MIN, LONG_MAX)
+# define SUB_OVERFLOW_INT_P(a, b)       SUB_OVERFLOW_SIGNED_INTEGER_P(a, b, INT_MIN, INT_MAX)
+#endif
+
+#if SIZEOF_RB_LEN_T > SIZEOF_LONG
+# define SUB_OVERFLOW_LEN_P(a, b)       SUB_OVERFLOW_LONG_LONG_P(a, b)
+#elif SIZEOF_RB_LEN_T > SIZEOF_INT
+# define SUB_OVERFLOW_LEN_P(a, b)       SUB_OVERFLOW_LONG_P(a, b)
+#else
+# define SUB_OVERFLOW_LEN_P(a, b)       SUB_OVERFLOW_INT_P(a, b)
+#endif
+
+#define SUB_OVERFLOW_SIZE_P(a, b)       SUB_OVERFLOW_UNSIGNED_INTEGER_P(a, b)
 #endif
 
 #ifdef HAVE_UINT128_T
@@ -181,7 +299,7 @@ ruby_swap16(uint16_t x)
 #if __has_builtin(__builtin_bswap16)
     return __builtin_bswap16(x);
 
-#elif MSC_VERSION_SINCE(1310)
+#elif defined(_MSC_VER)
     return _byteswap_ushort(x);
 
 #else
@@ -196,7 +314,7 @@ ruby_swap32(uint32_t x)
 #if __has_builtin(__builtin_bswap32)
     return __builtin_bswap32(x);
 
-#elif MSC_VERSION_SINCE(1310)
+#elif defined(_MSC_VER)
     return _byteswap_ulong(x);
 
 #else
@@ -213,7 +331,7 @@ ruby_swap64(uint64_t x)
 #if __has_builtin(__builtin_bswap64)
     return __builtin_bswap64(x);
 
-#elif MSC_VERSION_SINCE(1310)
+#elif defined(_MSC_VER)
     return _byteswap_uint64(x);
 
 #else
@@ -235,10 +353,10 @@ nlz_int32(uint32_t x)
      * safety. */
     return (unsigned int)__lzcnt(x);
 
-#elif defined(__x86_64__) && defined(__LZCNT__) && ! defined(MJIT_HEADER)
+#elif defined(__x86_64__) && defined(__LZCNT__)
     return (unsigned int)_lzcnt_u32(x);
 
-#elif MSC_VERSION_SINCE(1400) /* &&! defined(__AVX2__) */
+#elif defined(_MSC_VER) /* &&! defined(__AVX2__) */
     unsigned long r;
     return _BitScanReverse(&r, x) ? (31 - (int)r) : 32;
 
@@ -264,10 +382,10 @@ nlz_int64(uint64_t x)
 #if defined(_MSC_VER) && defined(__AVX2__)
     return (unsigned int)__lzcnt64(x);
 
-#elif defined(__x86_64__) && defined(__LZCNT__) && ! defined(MJIT_HEADER)
+#elif defined(__x86_64__) && defined(__LZCNT__)
     return (unsigned int)_lzcnt_u64(x);
 
-#elif defined(_WIN64) && MSC_VERSION_SINCE(1400) /* &&! defined(__AVX2__) */
+#elif defined(_WIN64) && defined(_MSC_VER) /* &&! defined(__AVX2__) */
     unsigned long r;
     return _BitScanReverse64(&r, x) ? (63u - (unsigned int)r) : 64;
 
@@ -395,9 +513,9 @@ rb_popcount32(uint32_t x)
 #else
     x = (x & 0x55555555) + (x >> 1 & 0x55555555);
     x = (x & 0x33333333) + (x >> 2 & 0x33333333);
-    x = (x & 0x0f0f0f0f) + (x >> 4 & 0x0f0f0f0f);
-    x = (x & 0x001f001f) + (x >> 8 & 0x001f001f);
-    x = (x & 0x0000003f) + (x >>16 & 0x0000003f);
+    x = (x & 0x07070707) + (x >> 4 & 0x07070707);
+    x = (x & 0x000f000f) + (x >> 8 & 0x000f000f);
+    x = (x & 0x0000001f) + (x >>16 & 0x0000001f);
     return (unsigned int)x;
 
 #endif
@@ -425,9 +543,9 @@ rb_popcount64(uint64_t x)
     x = (x & 0x5555555555555555) + (x >> 1 & 0x5555555555555555);
     x = (x & 0x3333333333333333) + (x >> 2 & 0x3333333333333333);
     x = (x & 0x0707070707070707) + (x >> 4 & 0x0707070707070707);
-    x = (x & 0x001f001f001f001f) + (x >> 8 & 0x001f001f001f001f);
-    x = (x & 0x0000003f0000003f) + (x >>16 & 0x0000003f0000003f);
-    x = (x & 0x000000000000007f) + (x >>32 & 0x000000000000007f);
+    x = (x & 0x000f000f000f000f) + (x >> 8 & 0x000f000f000f000f);
+    x = (x & 0x0000001f0000001f) + (x >>16 & 0x0000001f0000001f);
+    x = (x & 0x000000000000003f) + (x >>32 & 0x000000000000003f);
     return (unsigned int)x;
 
 #endif
@@ -450,10 +568,10 @@ rb_popcount_intptr(uintptr_t x)
 static inline int
 ntz_int32(uint32_t x)
 {
-#if defined(__x86_64__) && defined(__BMI__) && ! defined(MJIT_HEADER)
+#if defined(__x86_64__) && defined(__BMI__)
     return (unsigned)_tzcnt_u32(x);
 
-#elif MSC_VERSION_SINCE(1400)
+#elif defined(_MSC_VER)
     /* :FIXME: Is there any way to issue TZCNT instead of BSF, apart from using
      *         assembly?  Because issuing LZCNT seems possible (see nlz.h). */
     unsigned long r;
@@ -472,10 +590,10 @@ ntz_int32(uint32_t x)
 static inline int
 ntz_int64(uint64_t x)
 {
-#if defined(__x86_64__) && defined(__BMI__) && ! defined(MJIT_HEADER)
+#if defined(__x86_64__) && defined(__BMI__)
     return (unsigned)_tzcnt_u64(x);
 
-#elif defined(_WIN64) && MSC_VERSION_SINCE(1400)
+#elif defined(_WIN64) && defined(_MSC_VER)
     unsigned long r;
     return _BitScanForward64(&r, x) ? (int)r : 64;
 
@@ -523,10 +641,10 @@ RUBY_BIT_ROTL(VALUE v, int n)
 #elif __has_builtin(__builtin_rotateleft64) && (SIZEOF_VALUE * CHAR_BIT == 64)
     return __builtin_rotateleft64(v, n);
 
-#elif MSC_VERSION_SINCE(1310) && (SIZEOF_VALUE * CHAR_BIT == 32)
+#elif defined(_MSC_VER) && (SIZEOF_VALUE * CHAR_BIT == 32)
     return _rotl(v, n);
 
-#elif MSC_VERSION_SINCE(1310) && (SIZEOF_VALUE * CHAR_BIT == 64)
+#elif defined(_MSC_VER) && (SIZEOF_VALUE * CHAR_BIT == 64)
     return _rotl64(v, n);
 
 #elif defined(_lrotl) && (SIZEOF_VALUE == SIZEOF_LONG)
@@ -547,10 +665,10 @@ RUBY_BIT_ROTR(VALUE v, int n)
 #elif __has_builtin(__builtin_rotateright64) && (SIZEOF_VALUE * CHAR_BIT == 64)
     return __builtin_rotateright64(v, n);
 
-#elif MSC_VERSION_SINCE(1310) && (SIZEOF_VALUE * CHAR_BIT == 32)
+#elif defined(_MSC_VER) && (SIZEOF_VALUE * CHAR_BIT == 32)
     return _rotr(v, n);
 
-#elif MSC_VERSION_SINCE(1310) && (SIZEOF_VALUE * CHAR_BIT == 64)
+#elif defined(_MSC_VER) && (SIZEOF_VALUE * CHAR_BIT == 64)
     return _rotr64(v, n);
 
 #elif defined(_lrotr) && (SIZEOF_VALUE == SIZEOF_LONG)

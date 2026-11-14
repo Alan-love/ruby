@@ -2,7 +2,6 @@
 
 require 'test/unit'
 require 'open3'
-require_relative 'lib/jit_support'
 
 class TestOpen3 < Test::Unit::TestCase
   RUBY = EnvUtil.rubybin
@@ -92,7 +91,7 @@ class TestOpen3 < Test::Unit::TestCase
   end
 
   def test_numeric_file_descriptor3
-    skip "passing FDs bigger than 2 is not supported on Windows" if /mswin|mingw/ =~ RUBY_PLATFORM
+    omit "passing FDs bigger than 2 is not supported on Windows" if /mswin|mingw/ =~ RbConfig::CONFIG['host_os']
     with_pipe {|r, w|
       Open3.popen3(RUBY, '-e', 'IO.open(3).puts "foo"', 3 => w) {|i,o,e,t|
         assert_equal("foo\n", r.gets, "[GH-808] [ruby-core:67347] [Bug #10699]")
@@ -127,7 +126,7 @@ class TestOpen3 < Test::Unit::TestCase
           i.close
           STDERR.reopen(old)
           assert_equal("zo", o.read)
-          assert_equal("ze", JITSupport.remove_mjit_logs(r.read))
+          assert_equal("ze", r.read)
         }
       }
     }
@@ -158,6 +157,67 @@ class TestOpen3 < Test::Unit::TestCase
     i.close
     o.close
     t.join
+  end
+
+  def test_popen_spawn_failure_closes_pipes
+    [:popen3, :popen2, :popen2e].each do |method|
+      assert_no_fd_leak(method) do
+        assert_raise(Errno::ENOENT) do
+          Open3.public_send(method, "/open3-command-does-not-exist")
+        end
+      end
+    end
+  end
+
+  def test_popen_spawn_throw_closes_pipes
+    tag = Object.new
+    assert_no_fd_leak(:popen3) do
+      stub_open3_spawn(->(*) {throw tag}) do
+        assert_throw(tag) do
+          Open3.popen3("unused")
+        end
+      end
+    end
+  end
+
+  def test_pipeline_spawn_failure_closes_pipes
+    first = [RUBY, '-e', '']
+    missing = ["/open3-command-does-not-exist"]
+
+    [:pipeline_rw, :pipeline_r, :pipeline_w,
+     :pipeline_start, :pipeline].each do |method|
+      threads = Thread.list
+      assert_no_fd_leak(method) do
+        assert_raise(Errno::ENOENT) do
+          Open3.public_send(method, first, missing)
+        end
+      end
+      (Thread.list - threads).each do |thread|
+        thread.join if Process::Waiter === thread
+      end
+    end
+  end
+
+  def test_pipeline_spawn_throw_closes_pipes
+    tag = Object.new
+    spawn = Open3.method(:spawn)
+    calls = 0
+    threads = Thread.list
+
+    assert_no_fd_leak(:pipeline_rw) do
+      stub_open3_spawn(->(*args) {
+        calls += 1
+        throw tag if calls == 2
+        spawn.call(*args)
+      }) do
+        assert_throw(tag) do
+          Open3.pipeline_rw([RUBY, '-e', ''], ["unused"])
+        end
+      end
+    end
+    (Thread.list - threads).each do |thread|
+      thread.join if Process::Waiter === thread
+    end
   end
 
   def test_capture3
@@ -332,5 +392,34 @@ class TestOpen3 < Test::Unit::TestCase
     out, status = Open3.capture2(*command, :chdir => '.', 2 => IO::NULL)
     assert_equal("test_integer_and_symbol_key\n", out)
     assert_predicate(status, :success?)
+  end
+
+  private
+
+  def stub_open3_spawn(spawn)
+    Open3.define_singleton_method(:spawn, spawn)
+    yield
+  ensure
+    Open3.singleton_class.send(:remove_method, :spawn)
+  end
+
+  def assert_no_fd_leak(method)
+    fd_dir = ["/proc/self/fd", "/dev/fd"].find {|dir| File.directory?(dir) }
+    omit "cannot inspect open file descriptors" unless fd_dir
+
+    gc_was_disabled = GC.disable
+    before = open_fds(fd_dir)
+    yield
+    assert_equal(before, open_fds(fd_dir),
+                 "#{method} leaked file descriptors")
+  ensure
+    GC.enable unless gc_was_disabled
+  end
+
+  def open_fds(fd_dir)
+    Dir.open(fd_dir) do |dir|
+      fds = dir.children(&:to_i).sort
+      fds -= [dir.fileno] if dir.respond_to? :fileno
+    end
   end
 end

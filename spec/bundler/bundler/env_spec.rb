@@ -4,7 +4,7 @@ require "bundler/settings"
 require "openssl"
 
 RSpec.describe Bundler::Env do
-  let(:git_proxy_stub) { Bundler::Source::Git::GitProxy.new(nil, nil, nil) }
+  let(:git_proxy_stub) { Bundler::Source::Git::GitProxy.new(nil, nil) }
 
   describe "#report" do
     it "prints the environment" do
@@ -34,8 +34,6 @@ RSpec.describe Bundler::Env do
       end
 
       it "prints user home" do
-        skip "needs to use a valid HOME" if Gem.win_platform? && RUBY_VERSION < "2.6.0"
-
         with_clear_paths("HOME", "/a/b/c") do
           out = described_class.report
           expect(out).to include("User Home   /a/b/c")
@@ -43,8 +41,6 @@ RSpec.describe Bundler::Env do
       end
 
       it "prints user path" do
-        skip "needs to use a valid HOME" if Gem.win_platform? && RUBY_VERSION < "2.6.0"
-
         with_clear_paths("HOME", "/a/b/c") do
           allow(File).to receive(:exist?)
           allow(File).to receive(:exist?).with("/a/b/c/.gem").and_return(true)
@@ -74,16 +70,16 @@ RSpec.describe Bundler::Env do
 
     context "when there is a Gemfile and a lockfile and print_gemfile is true" do
       before do
-        gemfile "source \"#{file_uri_for(gem_repo1)}\"; gem 'rack', '1.0.0'"
+        gemfile "source 'https://gem.repo1'; gem 'myrack', '1.0.0'"
 
         lockfile <<-L
           GEM
-            remote: #{file_uri_for(gem_repo1)}/
+            remote: https://gem.repo1/
             specs:
-              rack (1.0.0)
+              myrack (1.0.0)
 
           DEPENDENCIES
-            rack
+            myrack
 
           BUNDLED WITH
              1.10.0
@@ -92,21 +88,21 @@ RSpec.describe Bundler::Env do
         allow(Bundler::SharedHelpers).to receive(:find_gemfile).and_return(bundled_app_gemfile)
       end
 
-      let(:output) { described_class.report(:print_gemfile => true) }
+      let(:output) { described_class.report(print_gemfile: true) }
 
       it "prints the Gemfile" do
         expect(output).to include("Gemfile")
-        expect(output).to include("'rack', '1.0.0'")
+        expect(output).to include("'myrack', '1.0.0'")
       end
 
       it "prints the lockfile" do
         expect(output).to include("Gemfile.lock")
-        expect(output).to include("rack (1.0.0)")
+        expect(output).to include("myrack (1.0.0)")
       end
     end
 
     context "when there no Gemfile and print_gemfile is true" do
-      let(:output) { described_class.report(:print_gemfile => true) }
+      let(:output) { described_class.report(print_gemfile: true) }
 
       it "prints the environment" do
         expect(output).to start_with("## Environment")
@@ -118,9 +114,10 @@ RSpec.describe Bundler::Env do
         bundle "config set https://localgemserver.test/ user:pass"
       end
 
-      let(:output) { described_class.report(:print_gemfile => true) }
+      let(:output) { described_class.report(print_gemfile: true) }
 
       it "prints the config with redacted values" do
+        skip "temp dir is on a different drive than the source tree" if tmp_and_source_on_different_drives?
         expect(output).to include("https://localgemserver.test")
         expect(output).to include("user:[REDACTED]")
         expect(output).to_not include("user:pass")
@@ -132,9 +129,10 @@ RSpec.describe Bundler::Env do
         bundle "config set https://localgemserver.test/ api_token:x-oauth-basic"
       end
 
-      let(:output) { described_class.report(:print_gemfile => true) }
+      let(:output) { described_class.report(print_gemfile: true) }
 
       it "prints the config with redacted values" do
+        skip "temp dir is on a different drive than the source tree" if tmp_and_source_on_different_drives?
         expect(output).to include("https://localgemserver.test")
         expect(output).to include("[REDACTED]:x-oauth-basic")
         expect(output).to_not include("api_token:x-oauth-basic")
@@ -143,7 +141,7 @@ RSpec.describe Bundler::Env do
 
     context "when Gemfile contains a gemspec and print_gemspecs is true" do
       let(:gemspec) do
-        strip_whitespace(<<-GEMSPEC)
+        <<~GEMSPEC
           Gem::Specification.new do |gem|
             gem.name = "foo"
             gem.author = "Fumofu"
@@ -152,9 +150,9 @@ RSpec.describe Bundler::Env do
       end
 
       before do
-        gemfile("source \"#{file_uri_for(gem_repo1)}\"; gemspec")
+        gemfile("source 'https://gem.repo1'; gemspec")
 
-        File.open(bundled_app.join("foo.gemspec"), "wb") do |f|
+        File.open(bundled_app("foo.gemspec"), "wb") do |f|
           f.write(gemspec)
         end
 
@@ -162,7 +160,7 @@ RSpec.describe Bundler::Env do
       end
 
       it "prints the gemspec" do
-        output = described_class.report(:print_gemspecs => true)
+        output = described_class.report(print_gemspecs: true)
 
         expect(output).to include("foo.gemspec")
         expect(output).to include(gemspec)
@@ -171,18 +169,18 @@ RSpec.describe Bundler::Env do
 
     context "when eval_gemfile is used" do
       it "prints all gemfiles" do
-        create_file bundled_app("other/Gemfile-other"), "gem 'rack'"
-        create_file bundled_app("other/Gemfile"), "eval_gemfile 'Gemfile-other'"
-        create_file bundled_app("Gemfile-alt"), <<-G
-          source "#{file_uri_for(gem_repo1)}"
+        gemfile bundled_app("other/Gemfile-other"), "gem 'myrack'"
+        gemfile bundled_app("other/Gemfile"), "eval_gemfile 'Gemfile-other'"
+        gemfile bundled_app("Gemfile-alt"), <<-G
+          source "https://gem.repo1"
           eval_gemfile "other/Gemfile"
         G
         gemfile "eval_gemfile #{bundled_app("Gemfile-alt").to_s.dump}"
         allow(Bundler::SharedHelpers).to receive(:find_gemfile).and_return(bundled_app_gemfile)
         allow(Bundler::SharedHelpers).to receive(:pwd).and_return(bundled_app)
 
-        output = described_class.report(:print_gemspecs => true)
-        expect(output).to include(strip_whitespace(<<-ENV))
+        output = described_class.report(print_gemspecs: true)
+        expect(output).to include(<<~ENV)
           ## Gemfile
 
           ### Gemfile
@@ -194,7 +192,7 @@ RSpec.describe Bundler::Env do
           ### Gemfile-alt
 
           ```ruby
-          source "#{file_uri_for(gem_repo1)}"
+          source "https://gem.repo1"
           eval_gemfile "other/Gemfile"
           ```
 
@@ -207,7 +205,7 @@ RSpec.describe Bundler::Env do
           ### other/Gemfile-other
 
           ```ruby
-          gem 'rack'
+          gem 'myrack'
           ```
 
           ### Gemfile.lock
@@ -221,20 +219,21 @@ RSpec.describe Bundler::Env do
 
     context "when the git version is OS specific" do
       it "includes OS specific information with the version number" do
-        expect(git_proxy_stub).to receive(:git).with("--version").
-          and_return("git version 1.2.3 (Apple Git-BS)")
+        status = double("success?" => true)
+        expect(Open3).to receive(:capture3).with("git", "--version").
+          and_return(["git version 1.2.3 (Apple Git-BS)", "", status])
         expect(Bundler::Source::Git::GitProxy).to receive(:new).and_return(git_proxy_stub)
 
-        expect(described_class.report).to include("Git         1.2.3 (Apple Git-BS)")
+        expect(described_class.report).to include("Git           1.2.3 (Apple Git-BS)")
       end
     end
-  end
 
-  describe ".version_of" do
-    let(:parsed_version) { described_class.send(:version_of, "ruby") }
-
-    it "strips version of new line characters" do
-      expect(parsed_version).to_not end_with("\n")
+    it "no longer reports the Tools section or external tool versions" do
+      report = described_class.report
+      expect(report).not_to include("Tools")
+      ["rbenv", "RVM", "chruby"].each do |tool|
+        expect(report).not_to include(tool)
+      end
     end
   end
 end

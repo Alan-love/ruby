@@ -36,12 +36,12 @@ describe "Enumerable#to_h" do
 
   it "raises TypeError if an element is not an array" do
     enum = EnumerableSpecs::EachDefiner.new(:x)
-    -> { enum.to_h }.should raise_error(TypeError)
+    -> { enum.to_h }.should.raise(TypeError)
   end
 
   it "raises ArgumentError if an element is not a [key, value] pair" do
     enum = EnumerableSpecs::EachDefiner.new([:x])
-    -> { enum.to_h }.should raise_error(ArgumentError)
+    -> { enum.to_h }.should.raise(ArgumentError)
   end
 
   context "with block" do
@@ -53,20 +53,28 @@ describe "Enumerable#to_h" do
       @enum.to_h { |k| [k, k.to_s] }.should == { a: 'a', b: 'b' }
     end
 
+    it "passes to a block each element as a single argument" do
+      enum_of_arrays = EnumerableSpecs::EachDefiner.new([:a, 1], [:b, 2])
+
+      ScratchPad.record []
+      enum_of_arrays.to_h { |*args| ScratchPad << args; [args[0], args[1]] }
+      ScratchPad.recorded.sort.should == [[[:a, 1]], [[:b, 2]]]
+    end
+
     it "raises ArgumentError if block returns longer or shorter array" do
       -> do
         @enum.to_h { |k| [k, k.to_s, 1] }
-      end.should raise_error(ArgumentError, /element has wrong array length/)
+      end.should.raise(ArgumentError, /element has wrong array length/)
 
       -> do
         @enum.to_h { |k| [k] }
-      end.should raise_error(ArgumentError, /element has wrong array length/)
+      end.should.raise(ArgumentError, /element has wrong array length/)
     end
 
     it "raises TypeError if block returns something other than Array" do
       -> do
         @enum.to_h { |k| "not-array" }
-      end.should raise_error(TypeError, /wrong element type String/)
+      end.should.raise(TypeError, /wrong element type String/)
     end
 
     it "coerces returned pair to Array with #to_ary" do
@@ -82,7 +90,7 @@ describe "Enumerable#to_h" do
 
       -> do
         @enum.to_h { |k| x }
-      end.should raise_error(TypeError, /wrong element type MockObject/)
+      end.should.raise(TypeError, /wrong element type MockObject/)
     end
   end
 end

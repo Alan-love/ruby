@@ -1,18 +1,19 @@
 # frozen_string_literal: true
-require_relative '../command'
-require_relative '../version_option'
+
+require_relative "../command"
+require_relative "../version_option"
 
 class Gem::Commands::OpenCommand < Gem::Command
   include Gem::VersionOption
 
   def initialize
-    super 'open', 'Open gem sources in editor'
+    super "open", "Open gem sources in editor"
 
-    add_option('-e', '--editor COMMAND', String,
+    add_option("-e", "--editor COMMAND", String,
                "Prepends COMMAND to gem path. Could be used to specify editor.") do |command, options|
       options[:editor] = command || get_env_editor
     end
-    add_option('-v', '--version VERSION', String,
+    add_option("-v", "--version VERSION", String,
                "Opens specific gem version") do |version|
       options[:version] = version
     end
@@ -40,10 +41,10 @@ class Gem::Commands::OpenCommand < Gem::Command
   end
 
   def get_env_editor
-    ENV['GEM_EDITOR'] ||
-      ENV['VISUAL'] ||
-      ENV['EDITOR'] ||
-      'vi'
+    ENV["GEM_EDITOR"] ||
+      ENV["VISUAL"] ||
+      ENV["EDITOR"] ||
+      "vi"
   end
 
   def execute
@@ -69,9 +70,18 @@ class Gem::Commands::OpenCommand < Gem::Command
   end
 
   def open_editor(path)
-    Dir.chdir(path) do
-      system(*@editor.split(/\s+/) + [path])
-    end
+    system(*editor_command(@editor), path, { chdir: path })
+  end
+
+  def editor_command(editor) # :nodoc:
+    # On Windows an editor is often configured with a full path such as
+    # C:\Program Files\Microsoft VS Code\Code.exe, which shell splitting
+    # would corrupt. Take a value that names an existing file as a
+    # single word.
+    return [editor] if Gem.win_platform? && File.file?(editor)
+
+    require "shellwords"
+    Shellwords.split(editor)
   end
 
   def spec_for(name)

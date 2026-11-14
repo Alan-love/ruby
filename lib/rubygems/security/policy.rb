@@ -1,5 +1,6 @@
 # frozen_string_literal: true
-require_relative '../user_interaction'
+
+require_relative "../user_interaction"
 
 ##
 # A Gem::Security::Policy object encapsulates the settings for verifying
@@ -53,8 +54,8 @@ class Gem::Security::Policy
   # and is valid for the given +time+.
 
   def check_chain(chain, time)
-    raise Gem::Security::Exception, 'missing signing chain' unless chain
-    raise Gem::Security::Exception, 'empty signing chain' if chain.empty?
+    raise Gem::Security::Exception, "missing signing chain" unless chain
+    raise Gem::Security::Exception, "empty signing chain" if chain.empty?
 
     begin
       chain.each_cons 2 do |issuer, cert|
@@ -72,8 +73,10 @@ class Gem::Security::Policy
   # the +digest+ algorithm.
 
   def check_data(public_key, digest, signature, data)
+    filtered_digest = digest if Gem::Security.digest_required?(public_key)
+
     raise Gem::Security::Exception, "invalid signature" unless
-      public_key.verify digest, signature, data.digest
+      public_key.verify filtered_digest, signature, data.digest
 
     true
   end
@@ -83,21 +86,21 @@ class Gem::Security::Policy
   # If the +issuer+ is +nil+ no verification is performed.
 
   def check_cert(signer, issuer, time)
-    raise Gem::Security::Exception, 'missing signing certificate' unless
+    raise Gem::Security::Exception, "missing signing certificate" unless
       signer
 
     message = "certificate #{signer.subject}"
 
-    if not_before = signer.not_before and not_before > time
+    if (not_before = signer.not_before) && not_before > time
       raise Gem::Security::Exception,
             "#{message} not valid before #{not_before}"
     end
 
-    if not_after = signer.not_after and not_after < time
+    if (not_after = signer.not_after) && not_after < time
       raise Gem::Security::Exception, "#{message} not valid after #{not_after}"
     end
 
-    if issuer and not signer.verify issuer.public_key
+    if issuer && !signer.verify(issuer.public_key)
       raise Gem::Security::Exception,
             "#{message} was not issued by #{issuer.subject}"
     end
@@ -109,17 +112,15 @@ class Gem::Security::Policy
   # Ensures the public key of +key+ matches the public key in +signer+
 
   def check_key(signer, key)
-    unless signer and key
+    unless signer && key
       return true unless @only_signed
 
-      raise Gem::Security::Exception, 'missing key or signature'
+      raise Gem::Security::Exception, "missing key or signature"
     end
-
-    public_key = Gem::Security.get_public_key(key)
 
     raise Gem::Security::Exception,
       "certificate #{signer.subject} does not match the signing key" unless
-        signer.public_key.to_pem == public_key.to_pem
+        signer.check_private_key(key)
 
     true
   end
@@ -129,14 +130,14 @@ class Gem::Security::Policy
   # +time+.
 
   def check_root(chain, time)
-    raise Gem::Security::Exception, 'missing signing chain' unless chain
+    raise Gem::Security::Exception, "missing signing chain" unless chain
 
     root = chain.first
 
-    raise Gem::Security::Exception, 'missing root certificate' unless root
+    raise Gem::Security::Exception, "missing root certificate" unless root
 
     raise Gem::Security::Exception,
-          "root certificate #{root.subject} is not self-signed " +
+          "root certificate #{root.subject} is not self-signed " \
           "(issuer #{root.issuer})" if
       root.issuer != root.subject
 
@@ -144,15 +145,15 @@ class Gem::Security::Policy
   end
 
   ##
-  # Ensures the root of +chain+ has a trusted certificate in +trust_dir+ and
+  # Ensures the root of +chain+ has a trusted certificate in Gem::Security.trust_dir and
   # the digests of the two certificates match according to +digester+
 
   def check_trust(chain, digester, trust_dir)
-    raise Gem::Security::Exception, 'missing signing chain' unless chain
+    raise Gem::Security::Exception, "missing signing chain" unless chain
 
     root = chain.first
 
-    raise Gem::Security::Exception, 'missing root certificate' unless root
+    raise Gem::Security::Exception, "missing root certificate" unless root
 
     path = Gem::Security.trust_dir.cert_path root
 
@@ -166,13 +167,13 @@ class Gem::Security::Policy
     end
 
     save_cert = OpenSSL::X509::Certificate.new File.read path
-    save_dgst = digester.digest save_cert.public_key.to_pem
+    save_dgst = digester.digest save_cert.public_key.public_to_pem
 
-    pkey_str = root.public_key.to_pem
+    pkey_str = root.public_key.public_to_pem
     cert_dgst = digester.digest pkey_str
 
     raise Gem::Security::Exception,
-          "trusted root certificate #{root.subject} checksum " +
+          "trusted root certificate #{root.subject} checksum " \
           "does not match signing root certificate checksum" unless
       save_dgst == cert_dgst
 
@@ -184,7 +185,7 @@ class Gem::Security::Policy
 
   def subject(certificate) # :nodoc:
     certificate.extensions.each do |extension|
-      next unless extension.oid == 'subjectAltName'
+      next unless extension.oid == "subjectAltName"
 
       return extension.value
     end
@@ -193,11 +194,8 @@ class Gem::Security::Policy
   end
 
   def inspect # :nodoc:
-    ("[Policy: %s - data: %p signer: %p chain: %p root: %p " +
-     "signed-only: %p trusted-only: %p]") % [
-       @name, @verify_chain, @verify_data, @verify_root, @verify_signer,
-       @only_signed, @only_trusted
-     ]
+    format("[Policy: %s - data: %p signer: %p chain: %p root: %p " \
+     "signed-only: %p trusted-only: %p]", @name, @verify_chain, @verify_data, @verify_root, @verify_signer, @only_signed, @only_trusted)
   end
 
   ##
@@ -207,8 +205,7 @@ class Gem::Security::Policy
   #
   # If +key+ is given it is used to validate the signing certificate.
 
-  def verify(chain, key = nil, digests = {}, signatures = {},
-             full_name = '(unknown)')
+  def verify(chain, key = nil, digests = {}, signatures = {}, full_name = "(unknown)")
     if signatures.empty?
       if @only_signed
         raise Gem::Security::Exception,
@@ -227,13 +224,13 @@ class Gem::Security::Policy
     trust_dir = opt[:trust_dir]
     time      = Time.now
 
-    _, signer_digests = digests.find do |algorithm, file_digests|
+    _, signer_digests = digests.find do |_algorithm, file_digests|
       file_digests.values.first.name == Gem::Security::DIGEST_NAME
     end
 
     if @verify_data
-      raise Gem::Security::Exception, 'no digests provided (probable bug)' if
-        signer_digests.nil? or signer_digests.empty?
+      raise Gem::Security::Exception, "no digests provided (probable bug)" if
+        signer_digests.nil? || signer_digests.empty?
     else
       signer_digests = {}
     end
@@ -250,7 +247,7 @@ class Gem::Security::Policy
 
     if @only_trusted
       check_trust chain, digester, trust_dir
-    elsif signatures.empty? and digests.empty?
+    elsif signatures.empty? && digests.empty?
       # trust is irrelevant if there's no signatures to verify
     else
       alert_warning "#{subject signer} is not trusted for #{full_name}"
@@ -273,6 +270,12 @@ class Gem::Security::Policy
     end
 
     true
+  # NotImplementedError: JRuby's Ruby OpenSSL raises it for ML-DSA.
+  rescue OpenSSL::X509::CertificateError, NotImplementedError
+    raise Gem::Security::Exception,
+      "certificate verification failed: The certificate may use an algorithm "\
+      "such as ML-DSA that the installed OpenSSL does not support. ML-DSA "\
+      "requires OpenSSL >= 3.5 or an SSL library supporting ML-DSA."
   end
 
   ##
@@ -289,5 +292,5 @@ class Gem::Security::Policy
     true
   end
 
-  alias to_s name # :nodoc:
+  alias_method :to_s, :name # :nodoc:
 end

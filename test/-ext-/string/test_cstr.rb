@@ -43,7 +43,11 @@ class Test_StringCStr < Test::Unit::TestCase
   end
 
   def test_rb_str_new_frozen_embed
-    str = Bug::String.cstr_noembed("rbconfig.rb")
+    # "rbconfi" is the smallest "maximum embeddable string".  VWA adds
+    # a capacity field, which removes one pointer capacity for embedded objects,
+    # so if VWA is enabled, but there is only one size pool, then the
+    # maximum embeddable capacity on 32 bit machines is 8 bytes.
+    str = Bug::String.cstr_noembed("rbconfi")
     str = Bug::String.rb_str_new_frozen(str)
     assert_equal true, Bug::String.cstr_embedded?(str)
   end
@@ -75,6 +79,50 @@ class Test_StringCStr < Test::Unit::TestCase
       s.cstr_unterm('x')
       assert_equal(0, s.cstr_term, enc.name)
     end
+  end
+
+  # [Bug #22517]
+  def test_wchar_casemap
+    [:upcase, :downcase, :swapcase, :capitalize].each do |m|
+      [[], [:ascii]].each do |opts|
+        assert_wchars_long_term {|s| s.__send__(m, *opts)}
+      end
+    end
+  end
+
+  # [Bug #22517]
+  def test_wchar_interpolation
+    assert_wchars_long_term {|s| "#{s}#{s}"}
+    assert_wchars_long_term do |s|
+      a = s.b.force_encoding("US-ASCII")
+      b = s[0, 0]
+      eval(%{# coding: us-ascii\n"\#{a}\#{b}"})
+    end
+  end
+
+  # [Bug #22517]
+  def test_wchar_reverse
+    assert_wchars_long_term {|s| s.reverse}
+  end
+
+  # [Bug #22517]
+  def test_wchar_succ
+    assert_wchars_long_term {|s| s.succ}
+  end
+
+  # [Bug #22517]
+  def test_wchar_scrub
+    assert_wchars_long_term {|s| s.b.tr("\0", "\xDC".b).force_encoding(s.encoding).scrub}
+  end
+
+  # [Bug #22517]
+  def test_wchar_fstring
+    assert_wchars_long_term {|s| -Ractor.make_shareable(Bug::String.new(s))}
+  end
+
+  # [Bug #22517]
+  def test_wchar_slice!
+    assert_wchars_long_term {|s| s.slice!(0, 900)}
   end
 
   def test_wchar_lstrip!
@@ -149,6 +197,16 @@ class Test_StringCStr < Test::Unit::TestCase
       result[enc] = c if c
     end
     assert_empty(result, gh821)
+  end
+
+  def assert_wchars_long_term
+    result = {}
+    WCHARS.each do |enc|
+      s = yield(("a" * 1000).encode(enc))
+      c = Bug::String.cstr_term(s)
+      result[enc] = c unless c == 0
+    end
+    assert_empty(result)
   end
 
   def assert_wchars_term_char(str)

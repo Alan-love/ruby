@@ -13,12 +13,12 @@ module TestDigestRactor
   Data1 = "abc"
   Data2 = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
 
-  def setup
-    pend unless defined?(Ractor)
-  end
-
   def test_s_hexdigest
     assert_in_out_err([], <<-"end;", ["true", "true"], [])
+      class Ractor
+        alias value take
+      end unless Ractor.method_defined? :value # compat with Ruby 3.4 and olders
+
       $VERBOSE = nil
       require "digest"
       require "#{self.class::LIB}"
@@ -30,7 +30,7 @@ module TestDigestRactor
         [r, hexdigest]
       end
       rs.each do |r, hexdigest|
-        puts r.take == hexdigest
+        puts r.value == hexdigest
       end
     end;
   end
@@ -98,4 +98,4 @@ module TestDigestRactor
       Data2 => "12a053384a9c0c88e405a06c27dcf49ada62eb2b",
     }
   end if defined?(Digest::RMD160)
-end
+end if defined?(Ractor)

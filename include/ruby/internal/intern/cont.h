@@ -39,6 +39,28 @@ RBIMPL_SYMBOL_EXPORT_BEGIN()
 VALUE rb_fiber_new(rb_block_call_func_t func, VALUE callback_obj);
 
 /**
+ * Creates a Fiber instance from a C-backended block with the specified
+ * storage.
+ *
+ * If the given storage is Qundef or Qtrue, this function is equivalent to
+ * rb_fiber_new() which inherits storage from the current fiber.
+ *
+ * Specifying Qtrue is experimental and may be changed in the future.
+ *
+ * If the given storage is Qnil, this function will lazy initialize the
+ * internal storage which starts of empty (without any inheritance).
+ *
+ * Otherwise, the given storage is used as the internal storage.
+ *
+ * @param[in]  func          A function, to become the fiber's body.
+ * @param[in]  callback_obj  Passed as-is to `func`.
+ * @param[in]  storage       The way to set up the storage for the fiber.
+ * @return     An allocated  new instance  of rb_cFiber, which  is ready  to be
+ *             "resume"d.
+ */
+VALUE rb_fiber_new_storage(rb_block_call_func_t func, VALUE callback_obj, VALUE storage);
+
+/**
  * Queries  the fiber  which  is  calling this  function.   Any ruby  execution
  * context has its fiber, either explicitly or implicitly.
  *
@@ -126,7 +148,8 @@ VALUE rb_fiber_resume(VALUE fiber, int argc, const VALUE *argv);
  * @param[in]   kw_splat        Handling of keyword parameters:
  *   - RB_NO_KEYWORDS           `argv`'s last is not a keyword argument.
  *   - RB_PASS_KEYWORDS         `argv`'s last is a keyword argument.
- *   - RB_PASS_CALLED_KEYWORDS  it depends if there is a passed block.
+ *   - RB_PASS_CALLED_KEYWORDS  Pass keyword arguments if the current method
+ *                              was called with keyword arguments.
  * @exception   rb_eFiberError  `fiber` is terminated etc.
  * @exception   rb_eException   Any exceptions happen in `fiber`.
  * @return      Either what was yielded or the last value of the fiber body.
@@ -170,7 +193,8 @@ VALUE rb_fiber_yield(int argc, const VALUE *argv);
  * @param[in]  kw_splat        Handling of keyword parameters:
  *   - RB_NO_KEYWORDS           `argv`'s last is not a keyword argument.
  *   - RB_PASS_KEYWORDS         `argv`'s last is a keyword argument.
- *   - RB_PASS_CALLED_KEYWORDS  it depends if there is a passed block.
+ *   - RB_PASS_CALLED_KEYWORDS  Pass keyword arguments if the current method
+ *                              was called with keyword arguments.
  * @exception  rb_eException   What was raised using `Fiber#raise`.
  * @return     (See rb_fiber_resume() for details)
  */
@@ -225,7 +249,8 @@ VALUE rb_fiber_transfer(VALUE fiber, int argc, const VALUE *argv);
  * @param[in]   kw_splat        Handling of keyword parameters:
  *   - RB_NO_KEYWORDS           `argv`'s last is not a keyword argument.
  *   - RB_PASS_KEYWORDS         `argv`'s last is a keyword argument.
- *   - RB_PASS_CALLED_KEYWORDS  it depends if there is a passed block.
+ *   - RB_PASS_CALLED_KEYWORDS  Pass keyword arguments if the current method
+ *                              was called with keyword arguments.
  * @exception   rb_eFiberError  (See above)
  * @exception   rb_eException   What was raised using `Fiber#raise`.
  * @return      (See rb_fiber_resume() for details)
@@ -253,7 +278,7 @@ VALUE rb_fiber_transfer_kw(VALUE fiber, int argc, const VALUE *argv, int kw_spla
  * @exception   rb_eFiberError  `fiber` is terminated etc.
  * @return      (See rb_fiber_resume() for details)
  */
-VALUE rb_fiber_raise(VALUE fiber, int argc, const VALUE *argv);
+VALUE rb_fiber_raise(VALUE fiber, int argc, VALUE *argv);
 
 RBIMPL_SYMBOL_EXPORT_END()
 

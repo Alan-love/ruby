@@ -12,7 +12,7 @@ describe "passed { |a, b = 1|  } creates a method that" do
   end
 
   it "raises an ArgumentError when passed zero arguments" do
-    -> { @klass.new.m }.should raise_error(ArgumentError)
+    -> { @klass.new.m }.should.raise(ArgumentError)
   end
 
   it "has a default value for b when passed one argument" do
@@ -24,7 +24,7 @@ describe "passed { |a, b = 1|  } creates a method that" do
   end
 
   it "raises an ArgumentError when passed three arguments" do
-    -> { @klass.new.m(1, 2, 3) }.should raise_error(ArgumentError)
+    -> { @klass.new.m(1, 2, 3) }.should.raise(ArgumentError)
   end
 end
 
@@ -47,7 +47,7 @@ describe "Module#define_method when given an UnboundMethod" do
       end
       define_method(:another_test_method, instance_method(:test_method))
     end
-    klass.new.should have_method(:another_test_method)
+    klass.new.should.respond_to?(:another_test_method)
   end
 
   describe "defining a method on a singleton class" do
@@ -83,7 +83,7 @@ describe "Module#define_method when given an UnboundMethod" do
       define_method :piggy, instance_method(:ziggy)
     end
 
-    -> { foo.new.ziggy }.should raise_error(NoMethodError)
+    -> { foo.new.ziggy }.should.raise(NoMethodError)
     foo.new.piggy.should == 'piggy'
   end
 end
@@ -115,8 +115,8 @@ describe "Module#define_method when name is not a special private name" do
           define_method(:baz, ModuleSpecs::EmptyFooMethod)
         end
 
-        klass.should have_public_instance_method(:bar)
-        klass.should have_private_instance_method(:baz)
+        klass.public_instance_methods(false).should.include?(:bar)
+        klass.private_instance_methods(false).should.include?(:baz)
       end
     end
 
@@ -129,9 +129,20 @@ describe "Module#define_method when name is not a special private name" do
           klass.send(:define_method, :baz, ModuleSpecs::EmptyFooMethod)
         end
 
-        klass.should have_public_instance_method(:bar)
-        klass.should have_public_instance_method(:baz)
+        klass.public_instance_methods(false).should.include?(:bar)
+        klass.public_instance_methods(false).should.include?(:baz)
       end
+    end
+
+    it "sets the method owner for a dynamically added method with a different original owner" do
+      mixin_module = Module.new do
+        def bar; end
+      end
+
+      foo = Object.new
+      foo.singleton_class.define_method(:bar, mixin_module.instance_method(:bar))
+
+      foo.method(:bar).owner.should == foo.singleton_class
     end
   end
 
@@ -144,8 +155,8 @@ describe "Module#define_method when name is not a special private name" do
           define_method(:baz) {}
         end
 
-        klass.should have_public_instance_method(:bar)
-        klass.should have_private_instance_method(:baz)
+        klass.public_instance_methods(false).should.include?(:bar)
+        klass.private_instance_methods(false).should.include?(:baz)
       end
     end
 
@@ -158,8 +169,8 @@ describe "Module#define_method when name is not a special private name" do
           klass.send(:define_method, :baz) {}
         end
 
-        klass.should have_public_instance_method(:bar)
-        klass.should have_public_instance_method(:baz)
+        klass.public_instance_methods(false).should.include?(:bar)
+        klass.public_instance_methods(false).should.include?(:baz)
       end
     end
   end
@@ -171,7 +182,7 @@ describe "Module#define_method when name is :initialize" do
       klass = Class.new do
         define_method(:initialize) { }
       end
-      klass.should have_private_instance_method(:initialize)
+      klass.private_instance_methods(false).should.include?(:initialize)
     end
   end
 
@@ -182,7 +193,7 @@ describe "Module#define_method when name is :initialize" do
         end
         define_method(:initialize, instance_method(:test_method))
       end
-      klass.should have_private_instance_method(:initialize)
+      klass.private_instance_methods(false).should.include?(:initialize)
     end
   end
 end
@@ -219,24 +230,61 @@ describe "Module#define_method" do
     o.block_test2.should == o
   end
 
+  it "raises TypeError if name cannot converted to String" do
+    -> {
+      Class.new { define_method(1001, -> {}) }
+    }.should.raise(TypeError, /is not a symbol nor a string/)
+
+    -> {
+      Class.new { define_method([], -> {}) }
+    }.should.raise(TypeError, /is not a symbol nor a string/)
+  end
+
+  it "converts non-String name to String with #to_str" do
+    obj = Object.new
+    def obj.to_str() "foo" end
+
+    new_class = Class.new { define_method(obj, -> { :called }) }
+    new_class.new.foo.should == :called
+  end
+
+  it "raises TypeError when #to_str called on non-String name returns non-String value" do
+    obj = Object.new
+    def obj.to_str() [] end
+
+    -> {
+      Class.new { define_method(obj, -> {}) }
+    }.should raise_consistent_error(TypeError, /can't convert Object into String/)
+  end
+
   it "raises a TypeError when the given method is no Method/Proc" do
     -> {
       Class.new { define_method(:test, "self") }
-    }.should raise_error(TypeError)
+    }.should.raise(TypeError, "wrong argument type String (expected Proc/Method/UnboundMethod)")
 
     -> {
       Class.new { define_method(:test, 1234) }
-    }.should raise_error(TypeError)
+    }.should.raise(TypeError, "wrong argument type Integer (expected Proc/Method/UnboundMethod)")
 
     -> {
       Class.new { define_method(:test, nil) }
-    }.should raise_error(TypeError)
+    }.should.raise(TypeError, "wrong argument type NilClass (expected Proc/Method/UnboundMethod)")
+  end
+
+  it "uses provided Method/Proc even if block is specified" do
+    new_class = Class.new do
+      define_method(:test, -> { :method_is_called }) do
+        :block_is_called
+      end
+    end
+
+    new_class.new.test.should == :method_is_called
   end
 
   it "raises an ArgumentError when no block is given" do
     -> {
       Class.new { define_method(:test) }
-    }.should raise_error(ArgumentError)
+    }.should.raise(ArgumentError)
   end
 
   it "does not use the caller block when no block is given" do
@@ -249,7 +297,7 @@ describe "Module#define_method" do
 
     -> {
       o.define(:foo) { raise "not used" }
-    }.should raise_error(ArgumentError)
+    }.should.raise(ArgumentError)
   end
 
   it "does not change the arity check style of the original proc" do
@@ -259,13 +307,13 @@ describe "Module#define_method" do
     end
 
     obj = DefineMethodSpecClass.new
-    -> { obj.proc_style_test :arg }.should raise_error(ArgumentError)
+    -> { obj.proc_style_test :arg }.should.raise(ArgumentError)
   end
 
   it "raises a FrozenError if frozen" do
     -> {
       Class.new { freeze; define_method(:foo) {} }
-    }.should raise_error(FrozenError)
+    }.should.raise(FrozenError)
   end
 
   it "accepts a Method (still bound)" do
@@ -278,13 +326,13 @@ describe "Module#define_method" do
     o = DefineMethodSpecClass.new
     o.data = :foo
     m = o.method(:inspect_data)
-    m.should be_an_instance_of(Method)
+    m.should.instance_of?(Method)
     klass = Class.new(DefineMethodSpecClass)
     klass.send(:define_method,:other_inspect, m)
     c = klass.new
     c.data = :bar
     c.other_inspect.should == "data is bar"
-    ->{o.other_inspect}.should raise_error(NoMethodError)
+    ->{o.other_inspect}.should.raise(NoMethodError)
   end
 
   it "raises a TypeError when a Method from a singleton class is defined on another class" do
@@ -298,7 +346,7 @@ describe "Module#define_method" do
 
     -> {
       Class.new { define_method :bar, m }
-    }.should raise_error(TypeError, /can't bind singleton method to a different class/)
+    }.should.raise(TypeError, /can't bind singleton method to a different class/)
   end
 
   it "raises a TypeError when a Method from one class is defined on an unrelated class" do
@@ -310,7 +358,7 @@ describe "Module#define_method" do
 
     -> {
       Class.new { define_method :bar, m }
-    }.should raise_error(TypeError)
+    }.should.raise(TypeError)
   end
 
   it "accepts an UnboundMethod from an attr_accessor method" do
@@ -322,7 +370,7 @@ describe "Module#define_method" do
     o = DefineMethodSpecClass.new
 
     DefineMethodSpecClass.send(:undef_method, :accessor_method)
-    -> { o.accessor_method }.should raise_error(NoMethodError)
+    -> { o.accessor_method }.should.raise(NoMethodError)
 
     DefineMethodSpecClass.send(:define_method, :accessor_method, m)
 
@@ -367,7 +415,7 @@ describe "Module#define_method" do
     end
 
     o = DefineMethodByProcClass.new
-    o.proc_test.should be_true
+    o.proc_test.should == true
   end
 
   it "accepts a String method name" do
@@ -381,7 +429,7 @@ describe "Module#define_method" do
   end
 
   it "is a public method" do
-    Module.should have_public_instance_method(:define_method)
+    Module.public_instance_methods(false).should.include?(:define_method)
   end
 
   it "returns its symbol" do
@@ -395,7 +443,7 @@ describe "Module#define_method" do
     klass = Class.new {
       define_method :bar, ModuleSpecs::UnboundMethodTest.instance_method(:foo)
     }
-    klass.new.should respond_to(:bar)
+    klass.new.should.respond_to?(:bar)
   end
 
   it "allows an UnboundMethod from a parent class to be defined on a child class" do
@@ -403,7 +451,7 @@ describe "Module#define_method" do
     child = Class.new(parent) {
       define_method :baz, parent.instance_method(:foo)
     }
-    child.new.should respond_to(:baz)
+    child.new.should.respond_to?(:baz)
   end
 
   it "allows an UnboundMethod from a module to be defined on another unrelated module" do
@@ -411,7 +459,7 @@ describe "Module#define_method" do
       define_method :bar, ModuleSpecs::UnboundMethodTest.instance_method(:foo)
     }
     klass = Class.new { include mod }
-    klass.new.should respond_to(:bar)
+    klass.new.should.respond_to?(:bar)
   end
 
 
@@ -427,7 +475,10 @@ describe "Module#define_method" do
       ParentClass = Class.new { define_method(:foo) { :bar } }
       ChildClass = Class.new(ParentClass) { define_method(:foo) { :baz } }
       ParentClass.send :define_method, :foo, ChildClass.instance_method(:foo)
-    }.should raise_error(TypeError, /bind argument must be a subclass of ChildClass/)
+    }.should.raise(TypeError, /bind argument must be a subclass of ChildClass/)
+  ensure
+    Object.send(:remove_const, :ParentClass)
+    Object.send(:remove_const, :ChildClass)
   end
 
   it "raises a TypeError when an UnboundMethod from one class is defined on an unrelated class" do
@@ -435,7 +486,7 @@ describe "Module#define_method" do
       DestinationClass = Class.new {
         define_method :bar, ModuleSpecs::InstanceMeth.instance_method(:foo)
       }
-    }.should raise_error(TypeError, /bind argument must be a subclass of ModuleSpecs::InstanceMeth/)
+    }.should.raise(TypeError, /bind argument must be a subclass of ModuleSpecs::InstanceMeth/)
   end
 
   it "raises a TypeError when an UnboundMethod from a singleton class is defined on another class" do
@@ -449,7 +500,34 @@ describe "Module#define_method" do
 
     -> {
       Class.new { define_method :bar, m }
-    }.should raise_error(TypeError, /can't bind singleton method to a different class/)
+    }.should.raise(TypeError, /can't bind singleton method to a different class/)
+  end
+
+  it "defines a new method with public visibility when a Method passed and the class/module of the context isn't equal to the receiver of #define_method" do
+    c = Class.new do
+      private def foo
+        "public"
+      end
+    end
+
+    object = c.new
+    object.singleton_class.define_method(:bar, object.method(:foo))
+
+    object.bar.should == "public"
+  end
+
+  it "defines the new method according to the scope visibility when a Method passed and the class/module of the context is equal to the receiver of #define_method" do
+    c = Class.new do
+      def foo; end
+    end
+
+    object = c.new
+    object.singleton_class.class_eval do
+      private
+      define_method(:bar, c.new.method(:foo))
+    end
+
+    -> { object.bar }.should.raise(NoMethodError)
   end
 end
 
@@ -466,11 +544,11 @@ describe "Module#define_method" do
     end
 
     it "raises an ArgumentError when passed one argument" do
-      -> { @klass.new.m 1 }.should raise_error(ArgumentError)
+      -> { @klass.new.m 1 }.should.raise(ArgumentError)
     end
 
     it "raises an ArgumentError when passed two arguments" do
-      -> { @klass.new.m 1, 2 }.should raise_error(ArgumentError)
+      -> { @klass.new.m 1, 2 }.should.raise(ArgumentError)
     end
   end
 
@@ -486,11 +564,11 @@ describe "Module#define_method" do
     end
 
     it "raises an ArgumentError when passed one argument" do
-      -> { @klass.new.m 1 }.should raise_error(ArgumentError)
+      -> { @klass.new.m 1 }.should.raise(ArgumentError)
     end
 
     it "raises an ArgumentError when passed two arguments" do
-      -> { @klass.new.m 1, 2 }.should raise_error(ArgumentError)
+      -> { @klass.new.m 1, 2 }.should.raise(ArgumentError)
     end
   end
 
@@ -502,15 +580,15 @@ describe "Module#define_method" do
     end
 
     it "raises an ArgumentError when passed zero arguments" do
-      -> { @klass.new.m }.should raise_error(ArgumentError)
+      -> { @klass.new.m }.should.raise(ArgumentError)
     end
 
     it "raises an ArgumentError when passed zero arguments and a block" do
-      -> { @klass.new.m { :computed } }.should raise_error(ArgumentError)
+      -> { @klass.new.m { :computed } }.should.raise(ArgumentError)
     end
 
     it "raises an ArgumentError when passed two arguments" do
-      -> { @klass.new.m 1, 2 }.should raise_error(ArgumentError)
+      -> { @klass.new.m 1, 2 }.should.raise(ArgumentError)
     end
 
     it "receives the value passed as the argument when passed one argument" do
@@ -526,15 +604,15 @@ describe "Module#define_method" do
     end
 
     it "raises an ArgumentError when passed zero arguments" do
-      -> { @klass.new.m }.should raise_error(ArgumentError)
+      -> { @klass.new.m }.should.raise(ArgumentError)
     end
 
     it "raises an ArgumentError when passed zero arguments and a block" do
-      -> { @klass.new.m { :computed } }.should raise_error(ArgumentError)
+      -> { @klass.new.m { :computed } }.should.raise(ArgumentError)
     end
 
     it "raises an ArgumentError when passed two arguments" do
-      -> { @klass.new.m 1, 2 }.should raise_error(ArgumentError)
+      -> { @klass.new.m 1, 2 }.should.raise(ArgumentError)
     end
 
     it "receives the value passed as the argument when passed one argument" do
@@ -576,7 +654,7 @@ describe "Module#define_method" do
     end
 
     it "raises an ArgumentError when passed zero arguments" do
-      -> { @klass.new.m }.should raise_error(ArgumentError)
+      -> { @klass.new.m }.should.raise(ArgumentError)
     end
 
     it "returns the value computed by the block when passed one argument" do
@@ -604,19 +682,19 @@ describe "Module#define_method" do
     end
 
     it "raises an ArgumentError when passed zero arguments" do
-      -> { @klass.new.m }.should raise_error(ArgumentError)
+      -> { @klass.new.m }.should.raise(ArgumentError)
     end
 
     it "raises an ArgumentError when passed one argument" do
-      -> { @klass.new.m 1 }.should raise_error(ArgumentError)
+      -> { @klass.new.m 1 }.should.raise(ArgumentError)
     end
 
     it "raises an ArgumentError when passed one argument and a block" do
-      -> { @klass.new.m(1) { } }.should raise_error(ArgumentError)
+      -> { @klass.new.m(1) { } }.should.raise(ArgumentError)
     end
 
     it "raises an ArgumentError when passed three arguments" do
-      -> { @klass.new.m 1, 2, 3 }.should raise_error(ArgumentError)
+      -> { @klass.new.m 1, 2, 3 }.should.raise(ArgumentError)
     end
   end
 
@@ -628,15 +706,15 @@ describe "Module#define_method" do
     end
 
     it "raises an ArgumentError when passed zero arguments" do
-      -> { @klass.new.m }.should raise_error(ArgumentError)
+      -> { @klass.new.m }.should.raise(ArgumentError)
     end
 
     it "raises an ArgumentError when passed one argument" do
-      -> { @klass.new.m 1 }.should raise_error(ArgumentError)
+      -> { @klass.new.m 1 }.should.raise(ArgumentError)
     end
 
     it "raises an ArgumentError when passed one argument and a block" do
-      -> { @klass.new.m(1) { } }.should raise_error(ArgumentError)
+      -> { @klass.new.m(1) { } }.should.raise(ArgumentError)
     end
 
     it "receives an empty array as the third argument when passed two arguments" do
@@ -649,7 +727,7 @@ describe "Module#define_method" do
   end
 end
 
-describe "Method#define_method when passed a Method object" do
+describe "Module#define_method when passed a Method object" do
   before :each do
     @klass = Class.new do
       def m(a, b, *c)
@@ -674,7 +752,7 @@ describe "Method#define_method when passed a Method object" do
   end
 end
 
-describe "Method#define_method when passed an UnboundMethod object" do
+describe "Module#define_method when passed an UnboundMethod object" do
   before :each do
     @klass = Class.new do
       def m(a, b, *c)
@@ -699,7 +777,7 @@ describe "Method#define_method when passed an UnboundMethod object" do
   end
 end
 
-describe "Method#define_method when passed a Proc object" do
+describe "Module#define_method when passed a Proc object" do
   describe "and a method is defined inside" do
     it "defines the nested method in the default definee where the Proc was created" do
       prc = nil
@@ -717,14 +795,14 @@ describe "Method#define_method when passed a Proc object" do
 
       o = c.new
       o.test
-      o.should_not have_method :nested_method_in_proc_for_define_method
+      o.should_not.respond_to? :nested_method_in_proc_for_define_method
 
       t.new.nested_method_in_proc_for_define_method.should == 42
     end
   end
 end
 
-describe "Method#define_method when passed a block" do
+describe "Module#define_method when passed a block" do
   describe "behaves exactly like a lambda" do
     it "for return" do
       Class.new do

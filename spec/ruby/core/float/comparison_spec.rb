@@ -7,16 +7,32 @@ describe "Float#<=>" do
     ((bignum_value*1.1) <=> bignum_value).should == 1
   end
 
-  it "returns nil when either argument is NaN" do
-    (nan_value <=> 71.2).should be_nil
-    (1771.176 <=> nan_value).should be_nil
+  it "returns nil if one side is NaN" do
+    [1.0, 42, bignum_value].each { |n|
+      (nan_value <=> n).should == nil
+      (n <=> nan_value).should == nil
+    }
+  end
+
+  it "handles positive infinity" do
+    [1.0, 42, bignum_value].each { |n|
+      (infinity_value <=> n).should == 1
+      (n <=> infinity_value).should == -1
+    }
+  end
+
+  it "handles negative infinity" do
+    [1.0, 42, bignum_value].each { |n|
+      (-infinity_value <=> n).should == -1
+      (n <=> -infinity_value).should == 1
+    }
   end
 
   it "returns nil when the given argument is not a Float" do
-    (1.0 <=> "1").should be_nil
-    (1.0 <=> "1".freeze).should be_nil
-    (1.0 <=> :one).should be_nil
-    (1.0 <=> true).should be_nil
+    (1.0 <=> "1").should == nil
+    (1.0 <=> "1".freeze).should == nil
+    (1.0 <=> :one).should == nil
+    (1.0 <=> true).should == nil
   end
 
   it "compares using #coerce when argument is not a Float" do
@@ -46,28 +62,17 @@ describe "Float#<=>" do
     bad_coercible = klass.new
     -> {
       4.2 <=> bad_coercible
-    }.should raise_error(TypeError, "coerce must return [x, y]")
+    }.should.raise(TypeError, "coerce must return [x, y]")
   end
 
-  # The 4 tests below are taken from matz's revision 23730 for Ruby trunk
-  #
-  it "returns 1 when self is Infinity and other is an Integer" do
+  it "returns the correct result when one side is infinite" do
     (infinity_value <=> Float::MAX.to_i*2).should == 1
-  end
-
-  it "returns -1 when self is negative and other is Infinity" do
     (-Float::MAX.to_i*2 <=> infinity_value).should == -1
-  end
-
-  it "returns -1 when self is -Infinity and other is negative" do
     (-infinity_value <=> -Float::MAX.to_i*2).should == -1
-  end
-
-  it "returns 1 when self is negative and other is -Infinity" do
     (-Float::MAX.to_i*2 <=> -infinity_value).should == 1
   end
 
-  it "returns 0 when self is Infinity and other other is infinite?=1" do
+  it "returns 0 when self is Infinity and other is infinite?=1" do
     obj = Object.new
     def obj.infinite?
       1
@@ -86,7 +91,7 @@ describe "Float#<=>" do
   it "returns 1 when self is Infinity and other is infinite?=nil (which means finite)" do
     obj = Object.new
     def obj.infinite?
-        nil
+      nil
     end
     (infinity_value <=> obj).should == 1
   end

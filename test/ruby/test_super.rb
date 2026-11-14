@@ -8,6 +8,7 @@ class TestSuper < Test::Unit::TestCase
     def array(*a) a end
     def optional(a = 0) a end
     def keyword(**a) a end
+    def forward(*a) a end
   end
   class Single1 < Base
     def single(*) super end
@@ -61,6 +62,16 @@ class TestSuper < Test::Unit::TestCase
       foo = "changed2"
       y = super
       [x, y]
+    end
+  end
+  class Forward < Base
+    def forward(...)
+      w = super()
+      x = super
+      y = super(...)
+      a = 1
+      z = super(a, ...)
+      [w, x, y, z]
     end
   end
 
@@ -132,6 +143,11 @@ class TestSuper < Test::Unit::TestCase
   end
   def test_keyword2
     assert_equal([{foo: "changed1"}, {foo: "changed2"}], Keyword2.new.keyword)
+  end
+  def test_forwardable(...)
+    assert_equal([[],[],[],[1]], Forward.new.forward())
+    assert_equal([[],[1,2],[1,2],[1,1,2]], Forward.new.forward(1,2))
+    assert_equal([[],[:test],[:test],[1,:test]], Forward.new.forward(:test, ...))
   end
 
   class A
@@ -558,6 +574,18 @@ class TestSuper < Test::Unit::TestCase
     end
   end
 
+  def test_zsuper_kw_splat_not_mutable
+    extend(Module.new{def a(**k) k[:a] = 1 end})
+    extend(Module.new do
+      def a(**k)
+        before = k.dup
+        super
+        [before, k]
+      end
+    end)
+    assert_equal(*a)
+  end
+
   def test_from_eval
     bug10263 = '[ruby-core:65122] [Bug #10263a]'
     a = Class.new do
@@ -603,6 +631,72 @@ class TestSuper < Test::Unit::TestCase
     assert_raise_with_message(RuntimeError, "exception in M") {
       c.new
     }
+  end
+
+  def test_super_with_included_prepended_module_method_caching_bug_20716
+    a = Module.new do
+      def test(*args)
+        super
+      end
+    end
+
+    b = Module.new do
+      def test(a)
+        a
+      end
+    end
+
+    c = Class.new
+
+    b.prepend(a)
+    c.include(b)
+
+    assert_equal(1, c.new.test(1))
+
+    b.class_eval do
+      begin
+        verbose_bak, $VERBOSE = $VERBOSE, nil
+        def test
+          :test
+        end
+      ensure
+        $VERBOSE = verbose_bak
+      end
+    end
+
+    assert_equal(:test, c.new.test)
+  end
+
+  def test_super_with_prepended_module_after_include_method_caching
+    m = Module.new do
+      def test
+        :m
+      end
+    end
+
+    c = Class.new { include m }
+
+    m.prepend(Module.new do
+      def test
+        super
+      end
+    end)
+
+    # prime the super call-site cache through the prepended module
+    assert_equal(:m, c.new.test)
+
+    m.class_eval do
+      begin
+        verbose_bak, $VERBOSE = $VERBOSE, nil
+        def test
+          :redefined
+        end
+      ensure
+        $VERBOSE = verbose_bak
+      end
+    end
+
+    assert_equal(:redefined, c.new.test)
   end
 
   class TestFor_super_with_modified_rest_parameter_base
@@ -696,5 +790,34 @@ class TestSuper < Test::Unit::TestCase
 
     inherited = inherited_class.new
     assert_equal 2, inherited.test # it may read index=1 while it should be index=2
+  end
+
+  def test_define_initialize_in_basic_object
+    assert_separately([], "#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      class ::BasicObject
+        alias_method :initialize, :initialize
+        def initialize
+          @bug = "[Bug #21992]"
+        end
+      end
+
+      assert_not_nil Object.new
+    end;
+  end
+
+  def test_super_in_basic_object
+    assert_separately([], "#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      class ::BasicObject
+        def no_super
+          super()
+        rescue ::NameError
+          :ok
+        end
+      end
+
+      assert_equal :ok, "[Bug #21694]".no_super
+    end;
   end
 end

@@ -1,0 +1,1701 @@
+/* indent-tabs-mode: nil */
+
+#include "eval_intern.h"
+#include "internal.h"
+#include "internal/box.h"
+#include "internal/class.h"
+#include "internal/eval.h"
+#include "internal/error.h"
+#include "internal/file.h"
+#include "internal/gc.h"
+#include "internal/hash.h"
+#include "internal/io.h"
+#include "internal/load.h"
+#include "internal/random.h"
+#include "internal/st.h"
+#include "internal/variable.h"
+#include "iseq.h"
+#include "ruby/internal/globals.h"
+#include "ruby/util.h"
+#include "vm_core.h"
+#include "darray.h"
+#include "zjit.h"
+
+#include "builtin.h"
+
+#include <stdio.h>
+
+#ifdef HAVE_FCNTL_H
+#include <fcntl.h>
+#endif
+#ifdef HAVE_SYS_SENDFILE_H
+# include <sys/sendfile.h>
+#endif
+#ifdef HAVE_COPYFILE_H
+#include <copyfile.h>
+#endif
+
+VALUE rb_cBox = 0;
+VALUE rb_cBoxEntry = 0;
+VALUE rb_mBoxLoader = 0;
+
+static rb_box_t master_box[1]; /* Initialize in initialize_master_box() */
+static rb_box_t *root_box;
+static rb_box_t *main_box;
+
+static rb_box_gem_flags_t box_gem_flags[1];
+
+static char *tmp_dir;
+static bool tmp_dir_has_dirsep;
+
+#ifndef MAXPATHLEN
+# define MAXPATHLEN 1024
+#endif
+
+/* process-private 0700 directory for box-local copies of extensions */
+static char box_ext_tmp_dir[MAXPATHLEN];
+static rb_pid_t box_ext_tmp_dir_owner;
+static unsigned long box_ext_seq;
+
+#define BOX_TMP_PREFIX "_ruby_box_"
+
+#if defined(_WIN32)
+# define DIRSEP "\\"
+#else
+# define DIRSEP "/"
+#endif
+
+bool ruby_box_enabled = false; // extern
+bool ruby_box_init_done = false; // extern
+bool ruby_box_crashed = false; // extern, changed only in vm.c
+
+VALUE rb_resolve_feature_path(VALUE klass, VALUE fname);
+static VALUE rb_box_inspect(VALUE obj);
+
+void
+rb_box_set_gem_flags(rb_box_gem_flags_t *flags)
+{
+
+    box_gem_flags->gem = flags->gem;
+    box_gem_flags->error_highlight = flags->error_highlight;
+    box_gem_flags->did_you_mean    = flags->did_you_mean;
+    box_gem_flags->syntax_suggest  = flags->syntax_suggest;
+}
+
+void
+rb_box_init_done(void)
+{
+    ruby_box_init_done = true;
+}
+
+const rb_box_t *
+rb_master_box(void)
+{
+    return master_box;
+}
+
+const rb_box_t *
+rb_root_box(void)
+{
+    if (!root_box) // The root box isn't initialized yet - The Ruby runtime is in setup.
+        return master_box;
+    return root_box;
+}
+
+const rb_box_t *
+rb_main_box(void)
+{
+    return main_box;
+}
+
+// NOTE: must be called by Ruby thread
+const rb_box_t *
+rb_current_box(void)
+{
+    /*
+     * If RUBY_BOX is not set, the master box is the only available one.
+     *
+     * While the root/main boxes are not initialized, the master box is
+     * the only valid box.
+     * This early return is to avoid accessing EC before its setup.
+     */
+    if (!root_box)
+        return master_box;
+    if (!main_box)
+        return root_box;
+
+    return rb_vm_current_box(GET_EC());
+}
+
+// NOTE: must be called by Ruby thread
+const rb_box_t *
+rb_loading_box(void)
+{
+    if (!root_box)
+        return master_box;
+    if (!main_box)
+        return root_box;
+
+    return rb_vm_loading_box(GET_EC());
+}
+
+// NOTE: must be called by Ruby thread
+const rb_box_t *
+rb_current_box_in_crash_report(void)
+{
+    if (ruby_box_crashed)
+        return NULL;
+    return rb_current_box();
+}
+
+static long box_id_counter = 0;
+
+static long
+box_generate_id(void)
+{
+    long id;
+    RB_VM_LOCKING() {
+        id = ++box_id_counter;
+    }
+    return id;
+}
+
+static VALUE
+box_main_to_s(VALUE obj)
+{
+    return rb_str_new2("main");
+}
+
+static void
+box_entry_initialize(rb_box_t *box)
+{
+    const rb_box_t *master = rb_master_box();
+
+    // These will be updated immediately
+    box->box_object = 0;
+    box->box_id = 0;
+
+    box->top_self = rb_obj_alloc(rb_cObject);
+    rb_define_singleton_method(box->top_self, "to_s", box_main_to_s, 0);
+    rb_define_alias(rb_singleton_class(box->top_self), "inspect", "to_s");
+    box->load_path = rb_ary_dup(master->load_path);
+    box->expanded_load_path = rb_ary_dup(master->expanded_load_path);
+    box->load_path_snapshot = rb_ary_new();
+    box->load_path_check_cache = 0;
+    box->loaded_features = rb_ary_dup(master->loaded_features);
+    box->loaded_features_snapshot = rb_ary_new();
+    box->loaded_features_index = st_init_numtable();
+    box->loaded_features_realpaths = rb_hash_dup(master->loaded_features_realpaths);
+    box->loaded_features_realpath_map = rb_hash_dup(master->loaded_features_realpath_map);
+    box->loading_table = st_init_strtable();
+    box->ruby_dln_libmap = rb_hash_new();
+    box->gvar_tbl = rb_hash_new();
+    box->classext_cow_classes = st_init_numtable();
+
+    box->is_user = true;
+    box->is_optional = true;
+}
+
+void
+rb_box_gc_update_references(void *ptr)
+{
+    rb_box_t *box = (rb_box_t *)ptr;
+    if (!box) return;
+
+    if (box->box_object)
+        rb_gc_update_moved(&box->box_object);
+    if (box->top_self)
+        rb_gc_update_moved(&box->top_self);
+    rb_gc_update_moved(&box->load_path);
+    rb_gc_update_moved(&box->expanded_load_path);
+    rb_gc_update_moved(&box->load_path_snapshot);
+    if (box->load_path_check_cache) {
+        rb_gc_update_moved(&box->load_path_check_cache);
+    }
+    rb_gc_update_moved(&box->loaded_features);
+    rb_gc_update_moved(&box->loaded_features_snapshot);
+    rb_gc_update_moved(&box->loaded_features_realpaths);
+    rb_gc_update_moved(&box->loaded_features_realpath_map);
+    rb_gc_update_moved(&box->ruby_dln_libmap);
+    rb_gc_update_moved(&box->gvar_tbl);
+}
+
+void
+rb_box_entry_mark(void *ptr)
+{
+    const rb_box_t *box = (rb_box_t *)ptr;
+    if (!box) return;
+
+    rb_gc_mark(box->box_object);
+    rb_gc_mark(box->top_self);
+    rb_gc_mark(box->load_path);
+    rb_gc_mark(box->expanded_load_path);
+    rb_gc_mark(box->load_path_snapshot);
+    rb_gc_mark(box->load_path_check_cache);
+    rb_gc_mark(box->loaded_features);
+    rb_gc_mark(box->loaded_features_snapshot);
+    rb_gc_mark(box->loaded_features_realpaths);
+    rb_gc_mark(box->loaded_features_realpath_map);
+    if (box->loading_table) {
+        rb_mark_tbl(box->loading_table);
+    }
+    rb_gc_mark(box->ruby_dln_libmap);
+    rb_gc_mark(box->gvar_tbl);
+    if (box->classext_cow_classes) {
+        rb_mark_set(box->classext_cow_classes);
+    }
+}
+
+static int
+free_loading_table_entry(st_data_t key, st_data_t value, st_data_t arg)
+{
+    xfree((char *)key);
+    return ST_DELETE;
+}
+
+static int
+free_loaded_feature_index_i(st_data_t key, st_data_t value, st_data_t arg)
+{
+    if (!FIXNUM_P(value)) {
+        rb_darray_free_sized((void *)value, long);
+    }
+    return ST_CONTINUE;
+}
+
+static void
+free_box_st_tables(void *ptr)
+{
+    rb_box_t *box = (rb_box_t *)ptr;
+    if (box->loading_table) {
+        st_foreach(box->loading_table, free_loading_table_entry, 0);
+        st_free_table(box->loading_table);
+        box->loading_table = 0;
+    }
+
+    if (box->loaded_features_index) {
+        st_foreach(box->loaded_features_index, free_loaded_feature_index_i, 0);
+        st_free_table(box->loaded_features_index);
+    }
+}
+
+static int
+free_classext_for_box(st_data_t key, st_data_t _value, st_data_t box_arg)
+{
+    rb_classext_t *ext;
+    VALUE obj = (VALUE)key;
+    const rb_box_t *box = (const rb_box_t *)box_arg;
+
+    if (RB_TYPE_P(obj, T_NONE)) {
+        /* RUBY_FREE_AT_EXIT can free a class before the box that refers to
+         * it, and freeing a class already freed its classext for this box. */
+        return ST_CONTINUE;
+    }
+
+    if (RB_TYPE_P(obj, T_CLASS) || RB_TYPE_P(obj, T_MODULE)) {
+        ext = rb_class_unlink_classext(obj, box);
+        rb_class_classext_free(obj, ext, false);
+    }
+    else if (RB_TYPE_P(obj, T_ICLASS)) {
+        ext = rb_class_unlink_classext(obj, box);
+        rb_iclass_classext_free(obj, ext, false);
+    }
+    else {
+        rb_bug("Invalid type of object in classext_cow_classes: %s", rb_type_str(BUILTIN_TYPE(obj)));
+    }
+    return ST_CONTINUE;
+}
+
+static void
+box_entry_free(void *ptr)
+{
+    const rb_box_t *box = (const rb_box_t *)ptr;
+
+    if (box->classext_cow_classes) {
+        st_foreach(box->classext_cow_classes, free_classext_for_box, (st_data_t)box);
+    }
+
+    free_box_st_tables(ptr);
+    SIZED_FREE(box);
+}
+
+static size_t
+box_entry_memsize(const void *ptr)
+{
+    size_t size = sizeof(rb_box_t);
+    const rb_box_t *box = (const rb_box_t *)ptr;
+    if (box->loaded_features_index) {
+        size += rb_st_memsize(box->loaded_features_index);
+    }
+    if (box->loading_table) {
+        size += rb_st_memsize(box->loading_table);
+    }
+    return size;
+}
+
+static const rb_data_type_t rb_box_data_type = {
+    "Ruby::Box::Entry",
+    {
+        rb_box_entry_mark,
+        box_entry_free,
+        box_entry_memsize,
+        rb_box_gc_update_references,
+    },
+    0, 0, RUBY_TYPED_FREE_IMMEDIATELY // TODO: enable RUBY_TYPED_WB_PROTECTED when inserting write barriers
+};
+
+static const rb_data_type_t rb_master_box_data_type = {
+    "Ruby::Box::Master",
+    {
+        rb_box_entry_mark,
+        free_box_st_tables,
+        box_entry_memsize,
+        rb_box_gc_update_references,
+    },
+    &rb_box_data_type, 0, RUBY_TYPED_THREAD_SAFE_FREE // TODO: enable RUBY_TYPED_WB_PROTECTED when inserting write barriers
+};
+
+VALUE
+rb_box_entry_alloc(VALUE klass)
+{
+    rb_box_t *entry;
+    VALUE obj = TypedData_Make_Struct(klass, rb_box_t, &rb_box_data_type, entry);
+    box_entry_initialize(entry);
+    return obj;
+}
+
+static rb_box_t *
+get_box_struct_internal(VALUE entry)
+{
+    rb_box_t *sval;
+    TypedData_Get_Struct(entry, rb_box_t, &rb_box_data_type, sval);
+    return sval;
+}
+
+rb_box_t *
+rb_get_box_t(VALUE box)
+{
+    VALUE entry;
+    ID id_box_entry;
+
+    VM_ASSERT(box);
+
+    if (NIL_P(box))
+        return (rb_box_t *)rb_root_box();
+
+    VM_ASSERT(BOX_OBJ_P(box));
+
+    CONST_ID(id_box_entry, "__box_entry__");
+    entry = rb_attr_get(box, id_box_entry);
+    return get_box_struct_internal(entry);
+}
+
+VALUE
+rb_get_box_object(rb_box_t *box)
+{
+    VM_ASSERT(box && box->box_object);
+    return box->box_object;
+}
+
+/*
+ *  call-seq:
+ *    Ruby::Box.new -> new_box
+ *
+ *  Returns a new Ruby::Box object.
+ */
+static VALUE
+box_initialize(VALUE box_value)
+{
+    rb_box_t *box;
+    rb_classext_t *object_classext;
+    VALUE entry;
+    ID id_box_entry;
+    CONST_ID(id_box_entry, "__box_entry__");
+
+    if (!rb_box_available()) {
+        rb_raise(rb_eRuntimeError, "Ruby Box is disabled. Set RUBY_BOX=1 environment variable to use Ruby::Box.");
+    }
+
+    entry = rb_class_new_instance_pass_kw(0, NULL, rb_cBoxEntry);
+    box = get_box_struct_internal(entry);
+
+    box->box_object = box_value;
+    box->box_id = box_generate_id();
+    rb_define_singleton_method(box->load_path, "resolve_feature_path", rb_resolve_feature_path, 1);
+
+    // Set the Ruby::Box object unique/consistent from any boxes to have just single
+    // constant table from any view of every (including main) box.
+    // If a code in the box adds a constant, the constant will be visible even from root/main.
+    RCLASS_SET_PRIME_CLASSEXT_WRITABLE(box_value, true);
+
+    // Get a clean constant table of Object even by writable one
+    // because ns was just created, so it has not touched any constants yet.
+    object_classext = RCLASS_EXT_WRITABLE_IN_BOX(rb_cObject, box);
+    RCLASS_SET_CONST_TBL(box_value, RCLASSEXT_CONST_TBL(object_classext), true);
+
+    rb_ivar_set(box_value, id_box_entry, entry);
+
+    if (ruby_box_init_done) {
+        if (box_gem_flags->gem) {
+            rb_vm_call_cfunc_in_box(Qnil, rb_define_gem_modules, (VALUE)box_gem_flags, Qnil,
+                                    rb_str_new_cstr("before_prelude.user.dummy"), (const rb_box_t *)box);
+            rb_load_gem_prelude((VALUE)box);
+        }
+    }
+
+    // Invalidate ZJIT code that assumes only the root box is active
+    rb_zjit_invalidate_root_box();
+
+    return box_value;
+}
+
+/*
+ *  call-seq:
+ *    Ruby::Box.enabled? -> true or false
+ *
+ *  Returns +true+ if Ruby::Box is enabled.
+ */
+static VALUE
+rb_box_s_getenabled(VALUE recv)
+{
+    return RBOOL(rb_box_available());
+}
+
+/*
+ *  call-seq:
+ *    Ruby::Box.current -> box, nil or false
+ *
+ *  Returns the current box.
+ *  Returns +nil+ if Ruby Box is not enabled.
+ */
+static VALUE
+rb_box_s_current(VALUE recv)
+{
+    const rb_box_t *box;
+
+    if (!rb_box_available())
+        return Qnil;
+
+    box = rb_vm_current_box(GET_EC());
+    VM_ASSERT(box && box->box_object);
+    return box->box_object;
+}
+
+/*
+ *  call-seq:
+ *    load_path -> array
+ *
+ *  Returns box local load path.
+ */
+static VALUE
+rb_box_load_path(VALUE box)
+{
+    VM_ASSERT(BOX_OBJ_P(box));
+    return rb_get_box_t(box)->load_path;
+}
+
+#ifdef _WIN32
+UINT rb_w32_system_tmpdir(WCHAR *path, UINT len);
+#endif
+
+/* Copied from mjit.c Ruby 3.0.3 */
+static char *
+system_default_tmpdir(void)
+{
+    // c.f. ext/etc/etc.c:etc_systmpdir()
+#ifdef _WIN32
+    WCHAR tmppath[_MAX_PATH];
+    UINT len = rb_w32_system_tmpdir(tmppath, numberof(tmppath));
+    if (len) {
+        int blen = WideCharToMultiByte(CP_UTF8, 0, tmppath, len, NULL, 0, NULL, NULL);
+        char *tmpdir = xmalloc(blen + 1);
+        WideCharToMultiByte(CP_UTF8, 0, tmppath, len, tmpdir, blen, NULL, NULL);
+        tmpdir[blen] = '\0';
+        return tmpdir;
+    }
+#elif defined _CS_DARWIN_USER_TEMP_DIR
+    char path[MAXPATHLEN];
+    size_t len = confstr(_CS_DARWIN_USER_TEMP_DIR, path, sizeof(path));
+    if (len > 0) {
+        char *tmpdir = xmalloc(len);
+        if (len > sizeof(path)) {
+            confstr(_CS_DARWIN_USER_TEMP_DIR, tmpdir, len);
+        }
+        else {
+            memcpy(tmpdir, path, len);
+        }
+        return tmpdir;
+    }
+#endif
+    return 0;
+}
+
+static int
+check_tmpdir(const char *dir)
+{
+    struct stat st;
+
+    if (!dir) return FALSE;
+    if (stat(dir, &st)) return FALSE;
+#ifndef S_ISDIR
+#   define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#endif
+    if (!S_ISDIR(st.st_mode)) return FALSE;
+#ifndef _WIN32
+# ifndef S_IWOTH
+#   define S_IWOTH 002
+# endif
+    if (st.st_mode & S_IWOTH) {
+# ifdef S_ISVTX
+        if (!(st.st_mode & S_ISVTX)) return FALSE;
+# else
+        return FALSE;
+# endif
+    }
+    if (access(dir, W_OK)) return FALSE;
+#endif
+    return TRUE;
+}
+
+static char *
+system_tmpdir(void)
+{
+    char *tmpdir;
+# define RETURN_ENV(name) \
+    if (check_tmpdir(tmpdir = getenv(name))) return ruby_strdup(tmpdir)
+    RETURN_ENV("TMPDIR");
+    RETURN_ENV("TMP");
+    tmpdir = system_default_tmpdir();
+    if (check_tmpdir(tmpdir)) return tmpdir;
+    return ruby_strdup("/tmp");
+# undef RETURN_ENV
+}
+
+/* end of copy */
+
+/* Box-local copies of extensions are placed in a process-private 0700
+ * directory with an unpredictable name, so that other local users cannot
+ * occupy the copy destination in a shared TMPDIR [Bug #22110], and so
+ * that the file name of each copy stays short regardless of the depth of
+ * the original path (a full path flattened into a single file name can
+ * exceed NAME_MAX). */
+static void
+ensure_box_ext_tmp_dir(void)
+{
+    /* A forked child inherits the parent's directory path; discard it so
+     * that each process creates its own directory and removes only that
+     * one at teardown. */
+    if (box_ext_tmp_dir[0] && box_ext_tmp_dir_owner != getpid()) {
+        box_ext_tmp_dir[0] = '\0';
+        box_ext_seq = 0;
+    }
+    if (box_ext_tmp_dir[0]) return;
+
+    int last_errno = 0;
+    for (int retry = 0; retry < 10; retry++) {
+        char path[MAXPATHLEN];
+        uint64_t suffix;
+        if (ruby_fill_random_bytes(&suffix, sizeof(suffix), FALSE) != 0) {
+            /* no random source; mkdir(0700) below still refuses hijacked names */
+            suffix = (uint64_t)(uintptr_t)&suffix ^ (uint64_t)retry;
+        }
+        int wrote = snprintf(path, sizeof(path), "%s%s%sp%"PRI_PIDT_PREFIX"u_%.16"PRIx64,
+                             tmp_dir, tmp_dir_has_dirsep ? "" : DIRSEP,
+                             BOX_TMP_PREFIX, getpid(), suffix);
+        if (wrote >= (int)sizeof(path)) {
+            rb_raise(rb_eLoadError, "TMPDIR for Ruby Box extensions is too long: %s", tmp_dir);
+        }
+        if (mkdir(path, 0700) == 0) {
+            strlcpy(box_ext_tmp_dir, path, sizeof(box_ext_tmp_dir));
+            box_ext_tmp_dir_owner = getpid();
+            return;
+        }
+        last_errno = errno;
+        if (last_errno != EEXIST) break;
+    }
+    rb_raise(rb_eLoadError, "can't create the temporary directory for Ruby Box extensions under %s: %s",
+             tmp_dir, strerror(last_errno));
+}
+
+enum copy_error_type {
+    COPY_ERROR_NONE,
+    COPY_ERROR_SRC_OPEN,
+    COPY_ERROR_DST_OPEN,
+    COPY_ERROR_SRC_READ,
+    COPY_ERROR_DST_WRITE,
+    COPY_ERROR_SRC_STAT,
+    COPY_ERROR_DST_CHMOD,
+    COPY_ERROR_SYSERR
+};
+
+static const char *
+copy_ext_file_error(char *message, size_t size, int copy_retvalue)
+{
+#ifdef _WIN32
+    int error = GetLastError();
+    char *p = message;
+    size_t len = snprintf(message, size, "%d: ", error);
+
+#define format_message(sublang) FormatMessage(\
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,	\
+        NULL, error, MAKELANGID(LANG_NEUTRAL, (sublang)),		\
+        message + len, size - len, NULL)
+    if (format_message(SUBLANG_ENGLISH_US) == 0)
+        format_message(SUBLANG_DEFAULT);
+    for (p = message + len; *p; p++) {
+        if (*p == '\n' || *p == '\r')
+            *p = ' ';
+    }
+#else
+    switch (copy_retvalue) {
+      case COPY_ERROR_SRC_OPEN:
+        strlcpy(message, "can't open the extension path", size);
+        break;
+      case COPY_ERROR_DST_OPEN:
+        strlcpy(message, "can't open the file to write", size);
+        break;
+      case COPY_ERROR_SRC_READ:
+        strlcpy(message, "failed to read the extension path", size);
+        break;
+      case COPY_ERROR_DST_WRITE:
+        strlcpy(message, "failed to write the extension path", size);
+        break;
+      case COPY_ERROR_SRC_STAT:
+        strlcpy(message, "failed to stat the extension path to copy permissions", size);
+        break;
+      case COPY_ERROR_DST_CHMOD:
+        strlcpy(message, "failed to set permissions to the copied extension path", size);
+        break;
+      case COPY_ERROR_SYSERR:
+        strlcpy(message, strerror(errno), size);
+        break;
+      case COPY_ERROR_NONE: /* shouldn't be called */
+      default:
+        rb_bug("unknown return value of copy_ext_file: %d", copy_retvalue);
+    }
+#endif
+    return message;
+}
+
+#ifndef _WIN32
+static enum copy_error_type
+copy_stream(int src_fd, int dst_fd)
+{
+    char buffer[1024];
+    ssize_t rsize;
+
+    while ((rsize = read(src_fd, buffer, sizeof(buffer))) != 0) {
+        if (rsize < 0) return COPY_ERROR_SRC_READ;
+        for (size_t written = 0; written < (size_t)rsize;) {
+            ssize_t wsize = write(dst_fd, buffer+written, rsize-written);
+            if (wsize < 0) return COPY_ERROR_DST_WRITE;
+            written += (size_t)wsize;
+        }
+    }
+    return COPY_ERROR_NONE;
+}
+#endif
+
+static enum copy_error_type
+copy_ext_file(const char *src_path, const char *dst_path)
+{
+#if defined(_WIN32)
+    WCHAR *w_src = rb_w32_mbstr_to_wstr(CP_UTF8, src_path, -1, NULL);
+    WCHAR *w_dst = rb_w32_mbstr_to_wstr(CP_UTF8, dst_path, -1, NULL);
+    if (!w_src || !w_dst) {
+        free(w_src);
+        free(w_dst);
+        rb_memerror();
+    }
+
+    enum copy_error_type rvalue = CopyFileW(w_src, w_dst, TRUE) ?
+        COPY_ERROR_NONE : COPY_ERROR_SYSERR;
+    free(w_src);
+    free(w_dst);
+    return rvalue;
+#else
+# ifdef O_BINARY
+    const int bin = O_BINARY;
+# else
+    const int bin = 0;
+# endif
+# ifdef O_CLOEXEC
+    const int cloexec = O_CLOEXEC;
+# else
+    const int cloexec = 0;
+# endif
+    const int src_fd = open(src_path, O_RDONLY|cloexec|bin);
+    if (src_fd < 0) return COPY_ERROR_SRC_OPEN;
+    if (!cloexec) rb_maygvl_fd_fix_cloexec(src_fd);
+
+    struct stat src_st;
+    if (fstat(src_fd, &src_st)) {
+        close(src_fd);
+        return COPY_ERROR_SRC_STAT;
+    }
+
+    const int dst_fd = open(dst_path, O_WRONLY|O_CREAT|O_EXCL|cloexec|bin, S_IRWXU);
+    if (dst_fd < 0) {
+        close(src_fd);
+        return COPY_ERROR_DST_OPEN;
+    }
+    if (!cloexec) rb_maygvl_fd_fix_cloexec(dst_fd);
+
+    enum copy_error_type ret = COPY_ERROR_NONE;
+
+    if (fchmod(dst_fd, src_st.st_mode & 0777)) {
+        ret = COPY_ERROR_DST_CHMOD;
+        goto done;
+    }
+
+    const size_t count_max = (SIZE_MAX >> 1) + 1;
+    (void)count_max;
+
+# ifdef HAVE_COPY_FILE_RANGE
+    for (;;) {
+        ssize_t written = copy_file_range(src_fd, NULL, dst_fd, NULL, count_max, 0);
+        if (written == 0) goto done;
+        if (written < 0) break;
+    }
+# endif
+# ifdef HAVE_FCOPYFILE
+    if (fcopyfile(src_fd, dst_fd, NULL, COPYFILE_DATA) == 0) {
+        goto done;
+    }
+# endif
+# ifdef USE_SENDFILE
+    for (;;) {
+        ssize_t written = sendfile(src_fd, dst_fd, NULL count_max);
+        if (written == 0) goto done;
+        if (written < 0) break;
+    }
+# endif
+    ret = copy_stream(src_fd, dst_fd);
+
+  done:
+    close(src_fd);
+    if (dst_fd >= 0) close(dst_fd);
+    if (ret != COPY_ERROR_NONE) unlink(dst_path);
+    return ret;
+#endif
+}
+
+#if defined __CYGWIN__ || defined DOSISH
+#define isdirsep(x) ((x) == '/' || (x) == '\\')
+#else
+#define isdirsep(x) ((x) == '/')
+#endif
+
+static const char *
+ext_basename(const char *path)
+{
+    const char *base = path;
+    for (const char *pos = path; *pos; pos++) {
+        if (isdirsep(*pos)) base = pos + 1;
+    }
+    return base;
+}
+
+static void
+box_ext_cleanup_mark(void *p)
+{
+    rb_gc_mark((VALUE)p);
+}
+
+static void
+box_ext_cleanup_free(void *p)
+{
+    VALUE path = (VALUE)p;
+    unlink(RSTRING_PTR(path));
+}
+
+static const rb_data_type_t box_ext_cleanup_type = {
+    "box_ext_cleanup",
+    {box_ext_cleanup_mark, box_ext_cleanup_free},
+    .flags = RUBY_TYPED_FREE_IMMEDIATELY,
+};
+
+void
+rb_box_cleanup_local_extension(VALUE cleanup)
+{
+    void *p = DATA_PTR(cleanup);
+    DATA_PTR(cleanup) = NULL;
+#ifndef _WIN32
+    if (p) box_ext_cleanup_free(p);
+#endif
+    (void)p;
+}
+
+#if defined(_WIN32)
+struct box_local_ext_list {
+    struct box_local_ext_list *next;
+    HMODULE handle;
+};
+static struct box_local_ext_list *box_local_exts;
+#endif
+
+void
+rb_box_defer_unload_local_extension(void *handle)
+{
+#if defined(_WIN32)
+    /* A box-local copy of an extension DLL must stay loaded as long as
+     * objects created by it can be finalized; unloading is deferred to
+     * rb_box_unload_local_extensions after the objspace is destructed.
+     * The loaded copy cannot be deleted on Windows, so the file is also
+     * removed there instead of in box_ext_cleanup_free. */
+    struct box_local_ext_list *ext = malloc(sizeof(struct box_local_ext_list));
+    if (!ext) return;
+    ext->handle = (HMODULE)handle;
+    ext->next = box_local_exts;
+    box_local_exts = ext;
+#endif
+}
+
+void
+rb_box_unload_local_extensions(void)
+{
+#if defined(_WIN32)
+    struct box_local_ext_list *ext = box_local_exts;
+    box_local_exts = NULL;
+    while (ext) {
+        struct box_local_ext_list *next = ext->next;
+        WCHAR module_path[MAXPATHLEN];
+        DWORD len = GetModuleFileNameW(ext->handle, module_path, numberof(module_path));
+
+        FreeLibrary(ext->handle);
+        if (len > 0 && len < numberof(module_path)) DeleteFileW(module_path);
+        free(ext);
+        ext = next;
+    }
+#endif
+    if (box_ext_tmp_dir[0] && box_ext_tmp_dir_owner == getpid()) {
+        rmdir(box_ext_tmp_dir);
+        box_ext_tmp_dir[0] = '\0';
+    }
+}
+
+VALUE
+rb_box_local_extension(VALUE box_value, VALUE path, VALUE *cleanup)
+{
+    char ext_path[MAXPATHLEN];
+    int wrote;
+    const char *src_path = RSTRING_PTR(path);
+    rb_box_t *box = rb_get_box_t(box_value);
+
+    ensure_box_ext_tmp_dir();
+    wrote = snprintf(ext_path, sizeof(ext_path), "%s%s%ld_%lu_%s",
+                     box_ext_tmp_dir, DIRSEP, box->box_id, box_ext_seq++, ext_basename(src_path));
+    if (wrote >= (int)sizeof(ext_path)) {
+        rb_raise(rb_eLoadError, "extension file path in the box is too long: %"PRIsVALUE, path);
+    }
+    VALUE new_path = rb_str_new_cstr(ext_path);
+    *cleanup = TypedData_Wrap_Struct(0, &box_ext_cleanup_type, NULL);
+    enum copy_error_type copy_error = copy_ext_file(src_path, ext_path);
+    if (copy_error) {
+        char message[1024];
+        copy_ext_file_error(message, sizeof(message), copy_error);
+        rb_raise(rb_eLoadError, "can't prepare the extension file for Ruby Box (%s from %"PRIsVALUE"): %s", ext_path, path, message);
+    }
+    DATA_PTR(*cleanup) = (void *)new_path;
+    return new_path;
+}
+
+static VALUE
+rb_box_load(int argc, VALUE *argv, VALUE box)
+{
+    VALUE fname, wrap;
+    rb_scan_args(argc, argv, "11", &fname, &wrap);
+
+    rb_vm_frame_flag_set_box_require(GET_EC());
+
+    return rb_load_entrypoint(fname, wrap);
+}
+
+static VALUE
+rb_box_require(VALUE box, VALUE fname)
+{
+    rb_vm_frame_flag_set_box_require(GET_EC());
+
+    return rb_require_string(fname);
+}
+
+static VALUE
+rb_box_require_relative(VALUE box, VALUE fname)
+{
+    rb_vm_frame_flag_set_box_require(GET_EC());
+
+    return rb_require_relative_entrypoint(fname);
+}
+
+static void
+initialize_master_box(void)
+{
+    rb_vm_t *vm = GET_VM();
+    rb_box_t *master = (rb_box_t *)rb_master_box();
+
+    master->load_path = rb_ary_new();
+    master->expanded_load_path = rb_ary_hidden_new(0);
+    master->load_path_snapshot = rb_ary_hidden_new(0);
+    master->load_path_check_cache = 0;
+    rb_define_singleton_method(master->load_path, "resolve_feature_path", rb_resolve_feature_path, 1);
+
+    master->loaded_features = rb_ary_new();
+    master->loaded_features_snapshot = rb_ary_hidden_new(0);
+    master->loaded_features_index = st_init_numtable();
+    master->loaded_features_realpaths = rb_hash_new();
+    rb_obj_hide(master->loaded_features_realpaths);
+    master->loaded_features_realpath_map = rb_hash_new();
+    rb_obj_hide(master->loaded_features_realpath_map);
+
+    master->ruby_dln_libmap = rb_hash_new();
+    master->gvar_tbl = rb_hash_new();
+    master->classext_cow_classes = NULL; // classext CoW never happen on the master box
+
+    vm->master_box = master;
+
+    if (rb_box_available()) {
+        VALUE master_box, entry;
+        ID id_box_entry;
+        CONST_ID(id_box_entry, "__box_entry__");
+
+        master_box = rb_obj_alloc(rb_cBox);
+        RCLASS_SET_PRIME_CLASSEXT_WRITABLE(master_box, true);
+        RCLASS_SET_CONST_TBL(master_box, RCLASSEXT_CONST_TBL(RCLASS_EXT_PRIME(rb_cObject)), true);
+
+        master->box_id = box_generate_id();
+        master->box_object = master_box;
+
+        entry = TypedData_Wrap_Struct(rb_cBoxEntry, &rb_master_box_data_type, master);
+        rb_ivar_set(master_box, id_box_entry, entry);
+
+        rb_gc_register_mark_object(master_box);
+        rb_gc_register_mark_object(entry);
+    }
+    else {
+        master->box_id = 1;
+        master->box_object = Qnil;
+    }
+}
+
+static VALUE
+rb_box_eval(VALUE box_value, VALUE str)
+{
+    const rb_iseq_t *iseq;
+    const rb_box_t *box;
+
+    StringValue(str);
+
+    iseq = rb_iseq_compile_iseq(str, rb_str_new_cstr("eval"));
+    VM_ASSERT(iseq);
+
+    box = (const rb_box_t *)rb_get_box_t(box_value);
+
+    return rb_iseq_eval(iseq, box);
+}
+
+static int box_experimental_warned = 0;
+
+RUBY_EXTERN const char ruby_api_version_name[];
+
+static VALUE
+box_value_initialize(bool root, bool user, bool optional)
+{
+    rb_box_t *box;
+    VALUE box_value = rb_class_new_instance(0, NULL, rb_cBox);
+
+    VM_ASSERT(BOX_OBJ_P(box_value));
+
+    box = rb_get_box_t(box_value);
+    box->box_object = box_value;
+    box->is_root = root;
+    box->is_user = user;
+    box->is_optional = optional;
+    return box_value;
+}
+
+void
+rb_initialize_mandatory_boxes(void)
+{
+    VALUE root_box_value, main_box_value;
+    rb_vm_t *vm = GET_VM();
+
+    VM_ASSERT(rb_box_available());
+
+    if (!box_experimental_warned) {
+        rb_category_warn(RB_WARN_CATEGORY_EXPERIMENTAL,
+                         "Ruby::Box is experimental, and the behavior may change in the future!\n"
+                         "See https://docs.ruby-lang.org/en/%s/Ruby/Box.html for known issues, etc.",
+                         ruby_api_version_name);
+        box_experimental_warned = 1;
+    }
+
+    root_box_value = box_value_initialize(true, false, false);
+    main_box_value = box_value_initialize(false, true, false);
+
+    rb_const_set(rb_cBox, rb_intern("ROOT"), root_box_value);
+    rb_const_set(rb_cBox, rb_intern("MAIN"), main_box_value);
+
+    vm->root_box = root_box = rb_get_box_t(root_box_value);
+    vm->main_box = main_box = rb_get_box_t(main_box_value);
+
+    // create the writable classext of ::Object explicitly to finalize the set of visible top-level constants
+    RCLASS_EXT_WRITABLE_IN_BOX(rb_cObject, root_box);
+    RCLASS_EXT_WRITABLE_IN_BOX(rb_cObject, main_box);
+}
+
+static VALUE
+rb_box_inspect(VALUE obj)
+{
+    rb_box_t *box;
+    VALUE r;
+    if (obj == Qfalse) {
+        r = rb_str_new_cstr("#<Ruby::Box:master>");
+        return r;
+    }
+    box = rb_get_box_t(obj);
+    r = rb_sprintf("#<Ruby::Box:%ld", box->box_id);
+    if (BOX_MASTER_P(box)) {
+        rb_str_cat_cstr(r, ",master");
+    }
+    if (BOX_ROOT_P(box)) {
+        rb_str_cat_cstr(r, ",root");
+    }
+    if (BOX_USER_P(box)) {
+        rb_str_cat_cstr(r, ",user");
+    }
+    if (BOX_MAIN_P(box)) {
+        rb_str_cat_cstr(r, ",main");
+    }
+    else if (BOX_OPTIONAL_P(box)) {
+        rb_str_cat_cstr(r, ",optional");
+    }
+    rb_str_cat_cstr(r, ">");
+    return r;
+}
+
+static VALUE
+rb_box_loading_func(int argc, VALUE *argv, VALUE _self)
+{
+    rb_vm_frame_flag_set_box_require(GET_EC());
+    return rb_call_super(argc, argv);
+}
+
+static void
+box_define_loader_method(const char *name)
+{
+    rb_define_private_method(rb_mBoxLoader, name, rb_box_loading_func, -1);
+    rb_define_singleton_method(rb_mBoxLoader, name, rb_box_loading_func, -1);
+}
+
+void
+Init_master_box(void)
+{
+    master_box->loading_table = st_init_strtable();
+}
+
+void
+Init_enable_box(void)
+{
+    const char *env = getenv("RUBY_BOX");
+    if (env && strlen(env) == 1 && env[0] == '1') {
+        ruby_box_enabled = true;
+    }
+    else {
+        ruby_box_init_done = true;
+    }
+}
+
+/* :nodoc: */
+static VALUE
+rb_box_s_master(VALUE recv)
+{
+    return master_box->box_object;
+}
+
+/* :nodoc: */
+static VALUE
+rb_box_s_root(VALUE recv)
+{
+    return root_box->box_object;
+}
+
+/* :nodoc: */
+static VALUE
+rb_box_s_main(VALUE recv)
+{
+    return main_box->box_object;
+}
+
+/* :nodoc: */
+static VALUE
+rb_box_master_p(VALUE box_value)
+{
+    const rb_box_t *box = (const rb_box_t *)rb_get_box_t(box_value);
+    return RBOOL(BOX_MASTER_P(box));
+}
+
+/* :nodoc: */
+static VALUE
+rb_box_root_p(VALUE box_value)
+{
+    const rb_box_t *box = (const rb_box_t *)rb_get_box_t(box_value);
+    return RBOOL(BOX_ROOT_P(box));
+}
+
+/* :nodoc: */
+static VALUE
+rb_box_main_p(VALUE box_value)
+{
+    const rb_box_t *box = (const rb_box_t *)rb_get_box_t(box_value);
+    return RBOOL(BOX_MAIN_P(box));
+}
+
+#if RUBY_DEBUG
+
+static const char *
+classname(VALUE klass)
+{
+    VALUE p;
+    if (!klass) {
+        return "Qfalse";
+    }
+    p = RCLASSEXT_CLASSPATH(RCLASS_EXT_PRIME(klass));
+    if (RTEST(p))
+        return RSTRING_PTR(p);
+    if (RB_TYPE_P(klass, T_CLASS) || RB_TYPE_P(klass, T_MODULE) || RB_TYPE_P(klass, T_ICLASS))
+        return "AnyClassValue";
+    return "NonClassValue";
+}
+
+static enum rb_id_table_iterator_result
+dump_classext_methods_i(ID mid, VALUE _val, void *data)
+{
+    VALUE ary = (VALUE)data;
+    rb_ary_push(ary, rb_id2str(mid));
+    return ID_TABLE_CONTINUE;
+}
+
+static enum rb_id_table_iterator_result
+dump_classext_constants_i(ID mid, VALUE _val, void *data)
+{
+    VALUE ary = (VALUE)data;
+    rb_ary_push(ary, rb_id2str(mid));
+    return ID_TABLE_CONTINUE;
+}
+
+static void
+dump_classext_i(rb_classext_t *ext, bool is_prime, VALUE _recv, void *data)
+{
+    char buf[4096];
+    struct rb_id_table *tbl;
+    VALUE ary, res = (VALUE)data;
+
+    snprintf(buf, 4096, "Ruby::Box %ld:%s classext %p\n",
+             RCLASSEXT_BOX(ext)->box_id, is_prime ? " prime" : "", (void *)ext);
+    rb_str_cat_cstr(res, buf);
+
+    snprintf(buf, 2048, "  Super: %s\n", classname(RCLASSEXT_SUPER(ext)));
+    rb_str_cat_cstr(res, buf);
+
+    tbl = RCLASSEXT_M_TBL(ext);
+    if (tbl) {
+        ary = rb_ary_new_capa((rb_len_t)rb_id_table_size(tbl));
+        rb_id_table_foreach(RCLASSEXT_M_TBL(ext), dump_classext_methods_i, (void *)ary);
+        rb_ary_sort_bang(ary);
+        snprintf(buf, 4096, "  Methods(%"PRIdLEN"): ", RARRAY_LEN(ary));
+        rb_str_cat_cstr(res, buf);
+        rb_str_concat(res, rb_ary_join(ary, rb_str_new_cstr(",")));
+        rb_str_cat_cstr(res, "\n");
+    }
+    else {
+        rb_str_cat_cstr(res, "  Methods(0): .\n");
+    }
+
+    tbl = RCLASSEXT_CONST_TBL(ext);
+    if (tbl) {
+        ary = rb_ary_new_capa((rb_len_t)rb_id_table_size(tbl));
+        rb_id_table_foreach(tbl, dump_classext_constants_i, (void *)ary);
+        rb_ary_sort_bang(ary);
+        snprintf(buf, 4096, "  Constants(%"PRIdLEN"): ", RARRAY_LEN(ary));
+        rb_str_cat_cstr(res, buf);
+        rb_str_concat(res, rb_ary_join(ary, rb_str_new_cstr(",")));
+        rb_str_cat_cstr(res, "\n");
+    }
+    else {
+        rb_str_cat_cstr(res, "  Constants(0): .\n");
+    }
+}
+
+/* :nodoc: */
+static VALUE
+rb_f_dump_classext(VALUE recv, VALUE klass)
+{
+    /*
+     * The desired output String value is:
+     * Class: 0x88800932 (String) [singleton]
+     * Prime classext box(2,main), readable(t), writable(f)
+     * Non-prime classexts: 3
+     * Box 2: prime classext 0x88800933
+     *   Super: Object
+     *   Methods(43): aaaaa, bbbb, cccc, dddd, eeeee, ffff, gggg, hhhhh, ...
+     *   Constants(12): FOO, Bar, ...
+     * Box 5: classext 0x88800934
+     *   Super: Object
+     *   Methods(43): aaaaa, bbbb, cccc, dddd, eeeee, ffff, gggg, hhhhh, ...
+     *   Constants(12): FOO, Bar, ...
+     */
+    char buf[2048];
+    VALUE res;
+    const rb_classext_t *ext;
+    const rb_box_t *box;
+    st_table *classext_tbl;
+
+    if (!(RB_TYPE_P(klass, T_CLASS) || RB_TYPE_P(klass, T_MODULE))) {
+        snprintf(buf, 2048, "Non-class/module value: %p (%s)\n", (void *)klass, rb_type_str(BUILTIN_TYPE(klass)));
+        return rb_str_new_cstr(buf);
+    }
+
+    if (RB_TYPE_P(klass, T_CLASS)) {
+        snprintf(buf, 2048, "Class: %p (%s)%s\n",
+                 (void *)klass, classname(klass), RCLASS_SINGLETON_P(klass) ? " [singleton]" : "");
+    }
+    else {
+        snprintf(buf, 2048, "Module: %p (%s)\n", (void *)klass, classname(klass));
+    }
+    res = rb_str_new_cstr(buf);
+
+    ext = RCLASS_EXT_PRIME(klass);
+    box = RCLASSEXT_BOX(ext);
+    snprintf(buf, 2048, "Prime classext box(%ld,%s), readable(%s), writable(%s)\n",
+             box->box_id,
+             BOX_MASTER_P(box) ? "master" : (BOX_ROOT_P(box) ? "root" : (BOX_MAIN_P(box) ? "main" : "optional")),
+             RCLASS_PRIME_CLASSEXT_READABLE_P(klass) ? "t" : "f",
+             RCLASS_PRIME_CLASSEXT_WRITABLE_P(klass) ? "t" : "f");
+    rb_str_cat_cstr(res, buf);
+
+    classext_tbl = RCLASS_CLASSEXT_TBL(klass);
+    if (!classext_tbl) {
+        rb_str_cat_cstr(res, "Non-prime classexts: 0\n");
+    }
+    else {
+        snprintf(buf, 2048, "Non-prime classexts: %zu\n", st_table_size(classext_tbl));
+        rb_str_cat_cstr(res, buf);
+    }
+
+    rb_class_classext_foreach(klass, dump_classext_i, (void *)res);
+
+    return res;
+}
+
+#endif /* RUBY_DEBUG */
+
+/*
+ *  Document-class: Ruby::Box
+ *
+ *  :markup: markdown
+ *  # Ruby Box - Ruby's in-process separation of Classes and Modules
+ *
+ *  Ruby Box is designed to provide separated spaces in a Ruby process, to isolate application code, libraries and monkey patches.
+ *
+ *  ## Known issues
+ *
+ *  * Experimental warning is shown when ruby starts with `RUBY_BOX=1` (specify `-W:no-experimental` option to hide it)
+ *  * Installing native extensions may fail under `RUBY_BOX=1` because of stack level too deep in extconf.rb
+ *  * `require 'active_support/core_ext'` may fail under `RUBY_BOX=1`
+ *  * Defined methods in a box may not be referred by built-in methods written in Ruby
+ *
+ *  ## TODOs
+ *
+ *  * Add the loaded box on iseq to check if another box tries running the iseq (add a field only when VM_CHECK_MODE?)
+ *  * Assign its own TOPLEVEL_BINDING in boxes
+ *  * Fix calling `warn` in boxes to refer `$VERBOSE` and `Warning.warn` in the box
+ *  * Make an internal data container class `Ruby::Box::Entry` invisible
+ *  * More test cases about `$LOAD_PATH` and `$LOADED_FEATURES`
+ *
+ *  ## How to use
+ *
+ *  ### Enabling Ruby Box
+ *
+ *  First, an environment variable should be set at the ruby process bootup: `RUBY_BOX=1`.
+ *  The only valid value is `1` to enable Ruby Box. Other values (or unset `RUBY_BOX`) means disabling Ruby Box. And setting the value after Ruby program starts doesn't work.
+ *
+ *  ### Using Ruby Box
+ *
+ *  `Ruby::Box` class is the entrypoint of Ruby Box.
+ *
+ *  ```ruby
+ *  box = Ruby::Box.new
+ *  box.require('something') # or require_relative, load
+ *  ```
+ *
+ *  The required file (either .rb or .so/.dll/.bundle) is loaded in the box (`box` here). The required/loaded files from `something` will be loaded in the box recursively.
+ *
+ *  ```ruby
+ *  # something.rb
+ *
+ *  X = 1
+ *
+ *  class Something
+ *    def self.x = X
+ *    def x = ::X
+ *  end
+ *  ```
+ *
+ *  Classes/modules, those methods and constants defined in the box can be accessed via `box` object.
+ *
+ *  ```ruby
+ *  X = 2
+ *  p X                 # 2
+ *  p ::X               # 2
+ *  p box::Something.x  # 1
+ *  p box::X            # 1
+ *  ```
+ *
+ *  Instance methods defined in the box also run with definitions in the box.
+ *
+ *  ```ruby
+ *  s = box::Something.new
+ *
+ *  p s.x  # 1
+ *  ```
+ *
+ *  ## Specifications
+ *
+ *  ### Ruby Box types
+ *
+ *  There are three box types:
+ *
+ *  * Master box
+ *  * Root box
+ *  * User boxes
+ *
+ *  Ruby bootstrap runs in the root box, and a
+ *
+ *  There is the root box, just a single box in a Ruby process. All builtin classes/modules are defined and run in the root box. (See "Builtin classes and modules".)
+ *
+ *  User boxes are to run user-written programs and libraries loaded from user programs. The user's main program (specified by the `ruby` command line argument) is executed in the "main" box, which is a user box automatically created at the end of Ruby's bootstrap. The files specified with `-r` command line option will be required in the main box.
+ *
+ *  Calling `Ruby::Box.new` creates an "optional" box (a user, non-main box), technically equal to the main box.
+ *
+ *  Ruby also has the master box. The master box is the "master copy" of all boxes. Boxes will be created as a copy of the master box. The master box is only for the source of box copies, and no code runs in the master box.
+ *
+ *
+ *  ```
+ *  [master]
+ *   |
+ *   |----[root]
+ *   |
+ *   |----[main]
+ *   |
+ *   |----[user box 1]
+ *   |
+ *   |----[user box 2]
+ *   ...
+ *  ```
+ *
+ *  ### Ruby Box class and instances
+ *
+ *  `Ruby::Box` is a class, as a subclass of `Module`. `Ruby::Box` instances are a kind of `Module`.
+ *
+ *  ### Classes and modules defined in boxes
+ *
+ *  The classes and modules, newly defined in a box `box`, are accessible via `box`. For example, if a class `A` is defined in `box`, it is accessible as `box::A` from outside of the box.
+ *
+ *  In the box `box`, `A` can be referred to as `A` (and `::A`).
+ *
+ *  ### Built-in classes and modules reopened in boxes
+ *
+ *  In boxes, builtin classes/modules are visible and can be reopened. Those classes/modules can be reopened using `class` or `module` clauses, and class/module definitions can be changed.
+ *
+ *  The changed definitions are visible only in the box. In other boxes, builtin classes/modules and those instances work without changed definitions.
+ *
+ *  ```ruby
+ *  # in foo.rb
+ *  class String
+ *    BLANK_PATTERN = /\A\s*\z/
+ *    def blank?
+ *      self.match?(BLANK_PATTERN)
+ *    end
+ *  end
+ *
+ *  module Foo
+ *    def self.foo = "foo"
+ *
+ *    def self.foo_is_blank?
+ *      foo.blank?
+ *    end
+ *  end
+ *
+ *  Foo.foo.blank? #=> false
+ *  "foo".blank?   #=> false
+ *
+ *  # in main.rb
+ *  box = Ruby::Box.new
+ *  box.require_relative('foo')
+ *
+ *  box::Foo.foo_is_blank? #=> false   (#blank? called in box)
+ *
+ *  "foo".blank?          # NoMethodError
+ *  String::BLANK_PATTERN # NameError
+ *  ```
+ *
+ *  The main box and `box` above are different boxes, so monkey patches in main are also invisible in `box`.
+ *
+ *  ### Builtin classes and modules
+ *
+ *  In the box context, "builtin" classes and modules are classes and modules:
+ *
+ *  * Accessible without any `require` calls in user scripts
+ *  * Defined before any user program start running
+ *
+ *  Hereafter, "builtin classes and modules" will be referred to as just "builtin classes".
+ *
+ *  Builtin classes and modules are loaded in all boxes, and run in the root box.
+ *
+ *  ### Exceptional non-built-in classes/modules
+ *
+ *  There are some exceptional classes/modules that are enabled in default, but aren't built-in classes. Those classes/modules are:
+ *
+ *  * `RubyGems`
+ *  * `ErrorHighlight`
+ *  * `DidYouMean`
+ *  * `SyntaxSuggest`
+ *
+ *  Those classes/modules (part of default gems) are loaded in each boxes independently. If a user box's code calls RubyGems, it calls the RubyGems inside the box itself, instead of the root box's one.
+ *
+ *  ### Builtin classes referred via box objects
+ *
+ *  Builtin classes in a box `box` can be referred from other boxes. For example, `box::String` is a valid reference, and `String` and `box::String` are identical (`String == box::String`, `String.object_id == box::String.object_id`).
+ *
+ *  `box::String`-like reference returns just a `String` in the current box, so its definition is `String` in the box, not in `box`.
+ *
+ *  ```ruby
+ *  # foo.rb
+ *  class String
+ *    def self.foo = "foo"
+ *  end
+ *
+ *  # main.rb
+ *  box = Ruby::Box.new
+ *  box.require_relative('foo')
+ *
+ *  box::String.foo  # NoMethodError
+ *  ```
+ *
+ *  ### Class instance variables, class variables, constants
+ *
+ *  Builtin classes can have different sets of class instance variables, class variables and constants between boxes.
+ *
+ *  ```ruby
+ *  # foo.rb
+ *  class Array
+ *    @v = "foo"
+ *    @@v = "_foo_"
+ *    V = "FOO"
+ *  end
+ *
+ *  Array.instance_variable_get(:@v) #=> "foo"
+ *  Array.class_variable_get(:@@v)   #=> "_foo_"
+ *  Array.const_get(:V)              #=> "FOO"
+ *
+ *  # main.rb
+ *  box = Ruby::Box.new
+ *  box.require_relative('foo')
+ *
+ *  Array.instance_variable_get(:@v) #=> nil
+ *  Array.class_variable_get(:@@v)   # NameError
+ *  Array.const_get(:V)              # NameError
+ *  ```
+ *
+ *  ### Global variables
+ *
+ *  In boxes, changes on global variables are also isolated in the boxes. Changes on global variables in a box are visible/applied only in the box.
+ *
+ *  ```ruby
+ *  # foo.rb
+ *  $foo = "foo"
+ *  $VERBOSE = nil
+ *
+ *  puts "This appears: '#{$foo}'"
+ *
+ *  # main.rb
+ *  p $foo      #=> nil
+ *  p $VERBOSE  #=> false
+ *
+ *  box = Ruby::Box.new
+ *  box.require_relative('foo')  # "This appears: 'foo'"
+ *
+ *  p $foo      #=> nil
+ *  p $VERBOSE  #=> false
+ *  ```
+ *
+ *  ### Top level constants
+ *
+ *  Usually, top level constants are defined as constants of `Object`. In boxes, top level constants are constants of `Object` in the box. And the box object `box`'s constants are strictly equal to constants of `Object`.
+ *
+ *  ```ruby
+ *  # foo.rb
+ *  FOO = 100
+ *
+ *  FOO         #=> 100
+ *  Object::FOO #=> 100
+ *
+ *  # main.rb
+ *  box = Ruby::Box.new
+ *  box.require_relative('foo')
+ *
+ *  box::FOO      #=> 100
+ *
+ *  FOO          # NameError
+ *  Object::FOO  # NameError
+ *  ```
+ *
+ *  ### Top level methods
+ *
+ *  Top level methods are private instance methods of `Object`, in each box.
+ *
+ *  ```ruby
+ *  # foo.rb
+ *  def yay = "foo"
+ *
+ *  class Foo
+ *    def self.say = yay
+ *  end
+ *
+ *  Foo.say #=> "foo"
+ *  yay     #=> "foo"
+ *
+ *  # main.rb
+ *  box = Ruby::Box.new
+ *  box.require_relative('foo')
+ *
+ *  box::Foo.say  #=> "foo"
+ *
+ *  yay  # NoMethodError
+ *  ```
+ *
+ *  There is no way to expose top level methods in boxes to others.
+ *  (See "Expose top level methods as a method of the box object" in "Discussions" section below)
+ *
+ *  ### Ruby Box scopes
+ *
+ *  Ruby Box works in file scope. One `.rb` file runs in a single box.
+ *
+ *  Once a file is loaded in a box `box`, all methods/procs defined/created in the file run in `box`.
+ *
+ *  ### Utility methods
+ *
+ *  Several methods are available for trying/testing Ruby Box.
+ *
+ *  * `Ruby::Box.current` returns the current box
+ *  * `Ruby::Box.enabled?` returns true/false to represent `RUBY_BOX=1` is specified or not
+ *  * `Ruby::Box.root` returns the root box
+ *  * `Ruby::Box.main` returns the main box
+ *  * `Ruby::Box#eval` evaluates a Ruby code (String) in the receiver box, just like calling `#load` with a file
+ *
+ *  ## Implementation details
+ *
+ *  #### ISeq inline method/constant cache
+ *
+ *  As described above in "Ruby Box scopes", an ".rb" file runs in a box. So method/constant resolution will be done in a box consistently.
+ *
+ *  That means ISeq inline caches work well even with boxes. Otherwise, it's a bug.
+ *
+ *  #### Method call global cache (gccct)
+ *
+ *  `rb_funcall()` C function refers to the global cc cache table (gccct), and the cache key is calculated with the current box.
+ *
+ *  So, `rb_funcall()` calls have a performance penalty when Ruby Box is enabled.
+ *
+ *  #### Current box and loading box
+ *
+ *  The current box is the box that the executing code is in. `Ruby::Box.current` returns the current box object.
+ *
+ *  The loading box is an internally managed box to determine the box to load newly required/loaded files. For example, `box` is the loading box when `box.require("foo")` is called.
+ *
+ *  ## Discussions
+ *
+ *  #### More builtin methods written in Ruby
+ *
+ *  If Ruby Box is enabled by default, builtin methods can be written in Ruby because it can't be overridden by users' monkey patches. Builtin Ruby methods can be JIT-ed, and it could bring performance reward.
+ *
+ *  #### Monkey patching methods called by builtin methods
+ *
+ *  Builtin methods sometimes call other builtin methods. For example, `Hash#map` calls `Hash#each` to retrieve entries to be mapped. Without Ruby Box, Ruby users can overwrite `Hash#each` and expect the behavior change of `Hash#map` as a result.
+ *
+ *  But with boxes, `Hash#map` runs in the root box. Ruby users can define `Hash#each` only in user boxes, so users cannot change `Hash#map`'s behavior in this case. To achieve it, users should override both`Hash#map` and `Hash#each` (or only `Hash#map`).
+ *
+ *  It is a breaking change.
+ *
+ *  Users can define methods using `Ruby::Box.root.eval(...)`, but it's clearly not ideal API.
+ *
+ *  #### Assigning values to global variables used by builtin methods
+ *
+ *  Similar to monkey patching methods, global variables assigned in a box is separated from the root box. Methods defined in the root box referring a global variable can't find the re-assigned one.
+ *
+ *  #### Context of `$LOAD_PATH` and `$LOADED_FEATURES`
+ *
+ *  Global variables `$LOAD_PATH` and `$LOADED_FEATURES` control `require` method behaviors. So those variables are determined by the loading box instead of the current box.
+ *
+ *  This could potentially conflict with the user's expectations. We should find the solution.
+ *
+ *  #### Expose top level methods as a method of the box object
+ *
+ *  Currently, top level methods in boxes are not accessible from outside of the box. But there might be a use case to call other box's top level methods.
+ *
+ *  #### Separate `cc_tbl` and `callable_m_tbl`, `cvc_tbl` for less classext CoW
+ *
+ *  The fields of `rb_classext_t` contains several cache(-like) data, `cc_tbl`(callcache table), `callable_m_tbl`(table of resolved complemented methods) and `cvc_tbl`(class variable cache table).
+ *
+ *  The classext CoW is triggered when the contents of `rb_classext_t` are changed, including `cc_tbl`, `callable_m_tbl`, and `cvc_tbl`. But those three tables are changed by just calling methods or referring class variables. So, currently, classext CoW is triggered much more times than the original expectation.
+ *
+ *  If we can move those three tables outside of `rb_classext_t`, the number of copied `rb_classext_t` will be much less than the current implementation.
+ */
+void
+Init_Box(void)
+{
+    tmp_dir = system_tmpdir();
+    tmp_dir_has_dirsep = (strcmp(tmp_dir + (strlen(tmp_dir) - strlen(DIRSEP)), DIRSEP) == 0);
+
+    VALUE mRuby = rb_define_module("Ruby");
+
+    rb_cBox = rb_define_class_under(mRuby, "Box", rb_cModule);
+    rb_define_method(rb_cBox, "initialize", box_initialize, 0);
+
+    /* :nodoc: */
+    rb_cBoxEntry = rb_define_class_under(rb_cBox, "Entry", rb_cObject);
+    rb_define_alloc_func(rb_cBoxEntry, rb_box_entry_alloc);
+
+    initialize_master_box();
+
+    /* :nodoc: */
+    rb_mBoxLoader = rb_define_module_under(rb_cBox, "Loader");
+    box_define_loader_method("require");
+    box_define_loader_method("require_relative");
+    box_define_loader_method("load");
+
+    if (rb_box_available()) {
+        rb_include_module(rb_cObject, rb_mBoxLoader);
+
+        rb_define_singleton_method(rb_cBox, "master", rb_box_s_master, 0);
+        rb_define_singleton_method(rb_cBox, "root", rb_box_s_root, 0);
+        rb_define_singleton_method(rb_cBox, "main", rb_box_s_main, 0);
+        rb_define_method(rb_cBox, "master?", rb_box_master_p, 0);
+        rb_define_method(rb_cBox, "root?", rb_box_root_p, 0);
+        rb_define_method(rb_cBox, "main?", rb_box_main_p, 0);
+
+#if RUBY_DEBUG
+        rb_define_global_function("dump_classext", rb_f_dump_classext, 1);
+#endif
+    }
+
+    rb_define_singleton_method(rb_cBox, "enabled?", rb_box_s_getenabled, 0);
+    rb_define_singleton_method(rb_cBox, "current", rb_box_s_current, 0);
+
+    rb_define_method(rb_cBox, "load_path", rb_box_load_path, 0);
+    rb_define_method(rb_cBox, "load", rb_box_load, -1);
+    rb_define_method(rb_cBox, "require", rb_box_require, 1);
+    rb_define_method(rb_cBox, "require_relative", rb_box_require_relative, 1);
+    rb_define_method(rb_cBox, "eval", rb_box_eval, 1);
+
+    rb_define_method(rb_cBox, "inspect", rb_box_inspect, 0);
+}

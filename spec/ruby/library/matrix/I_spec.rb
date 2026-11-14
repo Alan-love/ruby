@@ -1,9 +1,8 @@
 require_relative '../../spec_helper'
+require 'matrix'
 
-ruby_version_is ""..."3.1" do
-  require_relative 'shared/identity'
-
-  describe "Matrix.I" do
-    it_behaves_like :matrix_identity, :I
+describe "Matrix.I" do
+  it "is an alias of Matrix.identity" do
+    Matrix.method(:I).should == Matrix.method(:identity)
   end
 end

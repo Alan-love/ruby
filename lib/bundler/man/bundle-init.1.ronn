@@ -14,8 +14,11 @@ created [`Gemfile(5)`][Gemfile(5)].
 
 ## OPTIONS
 
-* `--gemspec`:
+* `--gemspec=GEMSPEC`:
   Use the specified .gemspec to create the [`Gemfile(5)`][Gemfile(5)]
+
+* `--gemfile=GEMFILE`:
+  Use the specified name for the gemfile instead of `Gemfile`
 
 ## FILES
 
@@ -26,4 +29,4 @@ results in all string literals in the file being implicitly frozen.
 
 ## SEE ALSO
 
-[Gemfile(5)](https://bundler.io/man/gemfile.5.html)
+[Gemfile(5)](https://guides.rubygems.org/gemfile/)

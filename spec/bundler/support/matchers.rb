@@ -52,7 +52,7 @@ module Spec
     end
 
     def self.define_compound_matcher(matcher, preconditions, &declarations)
-      raise "Must have preconditions to define a compound matcher" if preconditions.empty?
+      raise ArgumentError, "Must have preconditions to define a compound matcher" if preconditions.empty?
       define_method(matcher) do |*expected, &block_arg|
         Precondition.new(
           RSpec::Matchers::DSL::Matcher.new(matcher, declarations, self, *expected, &block_arg),
@@ -75,28 +75,6 @@ module Spec
       end
     end
 
-    RSpec::Matchers.define :be_sorted do
-      diffable
-      attr_reader :expected
-      match do |actual|
-        expected = block_arg ? actual.sort_by(&block_arg) : actual.sort
-        actual.==(expected).tap do
-          # HACK: since rspec won't show a diff when everything is a string
-          differ = RSpec::Support::Differ.new
-          @actual = differ.send(:object_to_string, actual)
-          @expected = differ.send(:object_to_string, expected)
-        end
-      end
-    end
-
-    RSpec::Matchers.define :be_well_formed do
-      match(&:empty?)
-
-      failure_message do |actual|
-        actual.join("\n")
-      end
-    end
-
     define_compound_matcher :read_as, [exist] do |file_contents|
       diffable
 
@@ -116,8 +94,9 @@ module Spec
         source = opts.delete(:source)
         groups = Array(opts.delete(:groups)).map(&:inspect).join(", ")
         opts[:raise_on_error] = false
-        @errors = names.map do |full_name|
+        @errors = names.filter_map do |full_name|
           name, version, platform = full_name.split(/\s+/)
+          platform ||= "ruby"
           require_path = name.tr("-", "/")
           version_const = name == "bundler" ? "Bundler::VERSION" : Spec::Builders.constantize(name)
           source_const = "#{Spec::Builders.constantize(name)}_SOURCE"
@@ -127,6 +106,7 @@ module Spec
 
             require '#{require_path}'
             actual_version, actual_platform = #{version_const}.split(/\s+/, 2)
+            actual_platform ||= "ruby"
             unless Gem::Version.new(actual_version) == Gem::Version.new('#{version}')
               puts actual_version
               exit 64
@@ -157,7 +137,7 @@ module Spec
             next "Expected #{name} (#{version}) to be installed from `#{source}`, was actually from `#{actual_source}`"
           end
           next "Command to check for inclusion of gem #{full_name} failed"
-        end.compact
+        end
 
         @errors.empty?
       end
@@ -166,8 +146,9 @@ module Spec
         opts = names.last.is_a?(Hash) ? names.pop : {}
         groups = Array(opts.delete(:groups)).map(&:inspect).join(", ")
         opts[:raise_on_error] = false
-        @errors = names.map do |name|
+        @errors = names.filter_map do |name|
           name, version = name.split(/\s+/, 2)
+          require_path = name.tr("-", "/")
           ruby <<-R, opts
             begin
               require 'bundler'
@@ -177,8 +158,8 @@ module Spec
             end
 
             begin
-              require '#{name}'
-              name_constant = '#{Spec::Builders.constantize(name)}'
+              require '#{require_path}'
+              name_constant = #{Spec::Builders.constantize(name)}
               if #{version.nil?} || name_constant == '#{version}'
                 exit 64
               else
@@ -192,7 +173,7 @@ module Spec
           next "command to check version of #{name} installed failed" unless exitstatus == 64
           next "expected #{name} to not be installed, but it was" if version.nil?
           next "expected #{name} (#{version}) not to be installed, but it was"
-        end.compact
+        end
 
         @errors.empty?
       end
@@ -209,6 +190,7 @@ module Spec
     RSpec::Matchers.alias_matcher :include_gem, :include_gems
 
     def plugin_should_be_installed(*names)
+      Bundler::Plugin.instance_variable_set(:@index, nil)
       names.each do |name|
         expect(Bundler::Plugin).to be_installed(name)
         path = Pathname.new(Bundler::Plugin.installed?(name))
@@ -216,7 +198,17 @@ module Spec
       end
     end
 
+    def plugin_should_be_installed_with_version(name, version)
+      Bundler::Plugin.instance_variable_set(:@index, nil)
+      expect(Bundler::Plugin).to be_installed(name)
+      path = Pathname.new(Bundler::Plugin.installed?(name))
+
+      expect(File.basename(path)).to eq("#{name}-#{version}")
+      expect(path + "plugins.rb").to exist
+    end
+
     def plugin_should_not_be_installed(*names)
+      Bundler::Plugin.instance_variable_set(:@index, nil)
       names.each do |name|
         expect(Bundler::Plugin).not_to be_installed(name)
       end

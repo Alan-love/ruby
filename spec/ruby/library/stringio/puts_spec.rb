@@ -101,6 +101,20 @@ describe "StringIO#puts when passed 1 or more objects" do
     @io.puts ''
     @io.string.should == "\n"
   end
+
+  it "handles concurrent writes correctly" do
+    n = 8
+    go = false
+    threads = n.times.map { |i|
+      Thread.new {
+        Thread.pass until go
+        @io.puts i
+      }
+    }
+    go = true
+    threads.each(&:join)
+    @io.string.size.should == n.times.map { |i| "#{i}\n" }.join.size
+  end
 end
 
 describe "StringIO#puts when passed no arguments" do
@@ -109,7 +123,7 @@ describe "StringIO#puts when passed no arguments" do
   end
 
   it "returns nil" do
-    @io.puts.should be_nil
+    @io.puts.should == nil
   end
 
   it "prints a newline" do
@@ -131,7 +145,7 @@ end
 
 describe "StringIO#puts when in append mode" do
   before :each do
-    @io = StringIO.new("example", "a")
+    @io = StringIO.new(+"example", "a")
   end
 
   it "appends the passed argument to the end of self" do
@@ -144,24 +158,24 @@ describe "StringIO#puts when in append mode" do
 
   it "correctly updates self's position" do
     @io.puts(", testing")
-    @io.pos.should eql(17)
+    @io.pos.should.eql?(17)
   end
 end
 
 describe "StringIO#puts when self is not writable" do
   it "raises an IOError" do
-    io = StringIO.new("test", "r")
-    -> { io.puts }.should raise_error(IOError)
+    io = StringIO.new(+"test", "r")
+    -> { io.puts }.should.raise(IOError)
 
-    io = StringIO.new("test")
+    io = StringIO.new(+"test")
     io.close_write
-    -> { io.puts }.should raise_error(IOError)
+    -> { io.puts }.should.raise(IOError)
   end
 end
 
 describe "StringIO#puts when passed an encoded string" do
   it "stores the bytes unmodified" do
-    io = StringIO.new("")
+    io = StringIO.new(+"")
     io.puts "\x00\x01\x02"
     io.puts "æåø"
 

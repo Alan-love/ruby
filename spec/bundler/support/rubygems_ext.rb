@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+abort "RubyGems only supports Ruby 3.2 or higher" if RUBY_VERSION < "3.2.0"
+
 require_relative "path"
 
 $LOAD_PATH.unshift(Spec::Path.source_lib_dir.to_s)
@@ -8,22 +10,27 @@ module Spec
   module Rubygems
     extend self
 
-    def dev_setup
-      install_gems(dev_gemfile)
-    end
-
     def gem_load(gem_name, bin_container)
       require_relative "switch_rubygems"
 
       gem_load_and_activate(gem_name, bin_container)
     end
 
-    def gem_require(gem_name)
+    def gem_load_and_possibly_install(gem_name, bin_container)
+      require_relative "switch_rubygems"
+
+      gem_load_activate_and_possibly_install(gem_name, bin_container)
+    end
+
+    def gem_require(gem_name, entrypoint)
       gem_activate(gem_name)
-      require gem_name
+      require entrypoint
     end
 
     def test_setup
+      # Install test dependencies unless parallel-rspec is being used, since in that case they should be setup already
+      install_test_deps unless ENV["RSPEC_FORMATTER_OUTPUT_ID"]
+
       setup_test_paths
 
       require "fileutils"
@@ -32,44 +39,40 @@ module Spec
       FileUtils.mkdir_p(Path.tmpdir)
 
       ENV["HOME"] = Path.home.to_s
-      ENV["TMPDIR"] = Path.tmpdir.to_s
+      # Remove "RUBY_CODESIGN", which is used by mkmf-generated Makefile to
+      # sign extension bundles on macOS, to avoid trying to find the specified key
+      # from the fake $HOME/Library/Keychains directory.
+      ENV.delete "RUBY_CODESIGN"
+      if Path.ruby_core?
+        if (tmpdir = ENV["TMPDIR"])
+          tmpdir_real = begin
+            File.realpath(tmpdir)
+          rescue Errno::ENOENT, Errno::EACCES
+            tmpdir
+          end
+          ENV["TMPDIR"] = tmpdir_real if tmpdir_real != tmpdir
+        end
+      else
+        ENV["TMPDIR"] = Path.tmpdir.to_s
+      end
 
       require "rubygems/user_interaction"
       Gem::DefaultUserInteraction.ui = Gem::SilentUI.new
     end
 
-    def install_parallel_test_deps
-      Gem.clear_paths
-
-      require "parallel"
-      require "fileutils"
-
-      install_test_deps
-
-      (2..Parallel.processor_count).each do |n|
-        source = Path.source_root.join("tmp", "1")
-        destination = Path.source_root.join("tmp", n.to_s)
-
-        FileUtils.rm_rf destination
-        FileUtils.cp_r source, destination
-      end
-    end
-
     def setup_test_paths
-      Gem.clear_paths
-
       ENV["BUNDLE_PATH"] = nil
-      ENV["GEM_HOME"] = ENV["GEM_PATH"] = Path.base_system_gems.to_s
-      ENV["PATH"] = [Path.system_gem_path.join("bin"), ENV["PATH"]].join(File::PATH_SEPARATOR)
-      ENV["PATH"] = [Path.bindir, ENV["PATH"]].join(File::PATH_SEPARATOR) if Path.ruby_core?
+      ENV["PATH"] = [Path.system_gem_path("bin"), ENV["PATH"]].join(File::PATH_SEPARATOR)
+      ENV["PATH"] = [Path.exedir, ENV["PATH"]].join(File::PATH_SEPARATOR) if Path.ruby_core?
     end
 
     def install_test_deps
-      setup_test_paths
+      dev_bundle("install", gemfile: test_gemfile, path: Path.base_system_gem_path.to_s)
+      dev_bundle("install", gemfile: rubocop_gemfile, path: Path.rubocop_gem_path.to_s)
+      dev_bundle("install", gemfile: standard_gemfile, path: Path.standard_gem_path.to_s)
 
-      install_gems(test_gemfile)
-      install_gems(rubocop_gemfile, Path.rubocop_gems.to_s)
-      install_gems(standard_gemfile, Path.standard_gems.to_s)
+      require_relative "helpers"
+      Helpers.install_dev_bundler
     end
 
     def check_source_control_changes(success_message:, error_message:)
@@ -82,7 +85,7 @@ module Spec
         puts success_message
         puts
       else
-        system("git status --porcelain")
+        system("git diff")
 
         puts
         puts error_message
@@ -90,6 +93,36 @@ module Spec
 
         exit(1)
       end
+    end
+
+    def dev_bundle(*args, gemfile: dev_gemfile, path: nil)
+      old_gemfile = ENV["BUNDLE_GEMFILE"]
+      old_orig_gemfile = ENV["BUNDLER_ORIG_BUNDLE_GEMFILE"]
+      ENV["BUNDLE_GEMFILE"] = gemfile.to_s
+      ENV["BUNDLER_ORIG_BUNDLE_GEMFILE"] = nil
+
+      if path
+        old_path = ENV["BUNDLE_PATH"]
+        ENV["BUNDLE_PATH"] = path
+      else
+        old_path__system = ENV["BUNDLE_PATH__SYSTEM"]
+        ENV["BUNDLE_PATH__SYSTEM"] = "true"
+      end
+
+      require "shellwords"
+      # We don't use `Open3` here because it does not work on JRuby + Windows
+      output = `ruby #{Path.dev_binstub} #{args.shelljoin} 2>&1`
+      raise output unless $?.success?
+      output
+    ensure
+      if path
+        ENV["BUNDLE_PATH"] = old_path
+      else
+        ENV["BUNDLE_PATH__SYSTEM"] = old_path__system
+      end
+
+      ENV["BUNDLER_ORIG_BUNDLE_GEMFILE"] = old_orig_gemfile
+      ENV["BUNDLE_GEMFILE"] = old_gemfile
     end
 
     private
@@ -101,34 +134,23 @@ module Spec
       abort "We couldn't activate #{gem_name} (#{e.requirement}). Run `gem install #{gem_name}:'#{e.requirement}'`"
     end
 
-    def gem_activate(gem_name)
-      require "bundler"
-      gem_requirement = Bundler::LockfileParser.new(File.read(dev_lockfile)).dependencies[gem_name]&.requirement
-      gem gem_name, gem_requirement
+    def gem_load_activate_and_possibly_install(gem_name, bin_container)
+      gem_activate_and_possibly_install(gem_name)
+      load Gem.bin_path(gem_name, bin_container)
     end
 
-    def install_gems(gemfile, path = nil)
-      old_gemfile = ENV["BUNDLE_GEMFILE"]
-      ENV["BUNDLE_GEMFILE"] = gemfile.to_s
+    def gem_activate_and_possibly_install(gem_name)
+      gem_activate(gem_name)
+    rescue Gem::LoadError => e
+      Gem.install(gem_name, e.requirement)
+      retry
+    end
 
-      if path
-        old_path = ENV["BUNDLE_PATH"]
-        ENV["BUNDLE_PATH"] = path
-      else
-        old_path__system = ENV["BUNDLE_PATH__SYSTEM"]
-        ENV["BUNDLE_PATH__SYSTEM"] = "true"
-      end
-
-      output = `#{Gem.ruby} #{File.expand_path("support/bundle.rb", Path.spec_dir)} install`
-      raise "Error when installing gems in #{gemfile}: #{output}" unless $?.success?
-    ensure
-      if path
-        ENV["BUNDLE_PATH"] = old_path
-      else
-        ENV["BUNDLE_PATH__SYSTEM"] = old_path__system
-      end
-
-      ENV["BUNDLE_GEMFILE"] = old_gemfile
+    def gem_activate(gem_name)
+      require_relative "activate"
+      require "bundler"
+      gem_requirement = Bundler::LockfileParser.new(File.read(dev_lockfile)).specs.find {|spec| spec.name == gem_name }.version
+      gem gem_name, gem_requirement
     end
 
     def test_gemfile

@@ -11,78 +11,87 @@ describe "Processing RUBYOPT" do
 
   it "adds the -I path to $LOAD_PATH" do
     ENV["RUBYOPT"] = "-Ioptrubyspecincl"
-    result = ruby_exe("puts $LOAD_PATH.grep(/byspecin/)", escape: true)
+    result = ruby_exe("puts $LOAD_PATH.grep(/byspecin/)")
     result.chomp[-15..-1].should == "optrubyspecincl"
   end
 
   it "sets $DEBUG to true for '-d'" do
     ENV["RUBYOPT"] = '-d'
     command = %[puts "value of $DEBUG is \#{$DEBUG}"]
-    result = ruby_exe(command, escape: true, args: "2>&1")
+    result = ruby_exe(command, args: "2>&1")
     result.should =~ /value of \$DEBUG is true/
   end
 
-  guard -> { not CROSS_COMPILING } do
+  guard -> { RbConfig::CONFIG["CROSS_COMPILING"] != "yes" } do
     it "prints the version number for '-v'" do
       ENV["RUBYOPT"] = '-v'
-      ruby_exe("")[/\A.*/].should == RUBY_DESCRIPTION
+      ruby_exe("")[/\A.*/].gsub(/\s\+(YJIT( \w+)?|ZJIT( \w+)?|PRISM|GC(\[\w+\])?)(?=\s)/, "").should == RUBY_DESCRIPTION.gsub(/\s\+(YJIT( \w+)?|ZJIT( \w+)?|PRISM|GC(\[\w+\])?)(?=\s)/, "")
     end
 
     it "ignores whitespace around the option" do
       ENV["RUBYOPT"] = ' -v '
-      ruby_exe("")[/\A.*/].should == RUBY_DESCRIPTION
+      ruby_exe("")[/\A.*/].gsub(/\s\+(YJIT( \w+)?|ZJIT( \w+)?|PRISM|GC(\[\w+\])?)(?=\s)/, "").should == RUBY_DESCRIPTION.gsub(/\s\+(YJIT( \w+)?|ZJIT( \w+)?|PRISM|GC(\[\w+\])?)(?=\s)/, "")
     end
   end
 
   it "sets $VERBOSE to true for '-w'" do
     ENV["RUBYOPT"] = '-w'
-    ruby_exe("p $VERBOSE", escape: true).chomp.should == "true"
+    ruby_exe("p $VERBOSE").chomp.should == "true"
   end
 
   it "sets $VERBOSE to true for '-W'" do
     ENV["RUBYOPT"] = '-W'
-    ruby_exe("p $VERBOSE", escape: true).chomp.should == "true"
+    ruby_exe("p $VERBOSE").chomp.should == "true"
   end
 
   it "sets $VERBOSE to nil for '-W0'" do
     ENV["RUBYOPT"] = '-W0'
-    ruby_exe("p $VERBOSE", escape: true).chomp.should == "nil"
+    ruby_exe("p $VERBOSE").chomp.should == "nil"
   end
 
   it "sets $VERBOSE to false for '-W1'" do
     ENV["RUBYOPT"] = '-W1'
-    ruby_exe("p $VERBOSE", escape: true).chomp.should == "false"
+    ruby_exe("p $VERBOSE").chomp.should == "false"
   end
 
   it "sets $VERBOSE to true for '-W2'" do
     ENV["RUBYOPT"] = '-W2'
-    ruby_exe("p $VERBOSE", escape: true).chomp.should == "true"
+    ruby_exe("p $VERBOSE").chomp.should == "true"
   end
 
-  ruby_version_is "2.7" do
-    it "suppresses deprecation warnings for '-W:no-deprecated'" do
-      ENV["RUBYOPT"] = '-W:no-deprecated'
-      result = ruby_exe('$; = ""', args: '2>&1')
-      result.should == ""
-    end
+  it "is overwritten by a cli switch" do
+    ENV["RUBYOPT"] = "-W2"
+    ruby_exe("p $VERBOSE", options: "-W0").chomp.should == "nil"
+  end
 
-    it "suppresses experimental warnings for '-W:no-experimental'" do
-      ENV["RUBYOPT"] = '-W:no-experimental'
-      result = ruby_exe('case 0; in a; end', args: '2>&1')
-      result.should == ""
-    end
+  it "suppresses deprecation warnings for '-W:no-deprecated'" do
+    ENV["RUBYOPT"] = '-W:no-deprecated'
+    result = ruby_exe('$; = ""', args: '2>&1')
+    result.should == ""
+  end
 
-    it "suppresses deprecation and experimental warnings for '-W:no-deprecated -W:no-experimental'" do
-      ENV["RUBYOPT"] = '-W:no-deprecated -W:no-experimental'
-      result = ruby_exe('case ($; = ""); in a; end', args: '2>&1')
-      result.should == ""
-    end
+  it "suppresses experimental warnings for '-W:no-experimental'" do
+    ENV["RUBYOPT"] = '-W:no-experimental'
+    result = ruby_exe('case 0; in a; end', args: '2>&1')
+    result.should == ""
+  end
+
+  it "suppresses deprecation and experimental warnings for '-W:no-deprecated -W:no-experimental'" do
+    ENV["RUBYOPT"] = '-W:no-deprecated -W:no-experimental'
+    result = ruby_exe('case ($; = ""); in a; end', args: '2>&1')
+    result.should == ""
   end
 
   it "requires the file for '-r'" do
     f = fixture __FILE__, "rubyopt"
     ENV["RUBYOPT"] = "-r#{f}"
     ruby_exe("0", args: '2>&1').should =~ /^rubyopt.rb required/
+  end
+
+  it "requires from CLI -r first and then from RUBYOPT -r" do
+    ENV["RUBYOPT"] = "-r#{fixture(__FILE__, "rubyopt.rb")}"
+    ruby_exe("", options: "-r#{fixture(__FILE__, "test_file.rb")}").
+      should == "REQUIRED\nrubyopt.rb required\n"
   end
 
   it "raises a RuntimeError for '-a'" do

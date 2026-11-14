@@ -1,8 +1,51 @@
 # frozen_string_literal: true
 
 module Test
+
+  class << self
+    ##
+    # Filter object for backtraces.
+
+    attr_accessor :backtrace_filter
+  end
+
+  class BacktraceFilter # :nodoc:
+    def filter bt
+      return ["No backtrace"] unless bt
+
+      new_bt = []
+      pattern = %r[/(?:lib\/test/|core_assertions\.rb:)]
+
+      unless $DEBUG then
+        bt.each do |line|
+          break if pattern =~ line
+          new_bt << line
+        end
+
+        new_bt = bt.reject { |line| pattern =~ line } if new_bt.empty?
+        new_bt = bt.dup if new_bt.empty?
+      else
+        new_bt = bt.dup
+      end
+
+      new_bt
+    end
+  end
+
+  self.backtrace_filter = BacktraceFilter.new
+
+  Ractor.make_shareable(backtrace_filter) if defined?(Ractor.make_shareable)
+
+  def self.filter_backtrace bt # :nodoc:
+    backtrace_filter.filter bt
+  end
+
   module Unit
     module Assertions
+      def assert_raises(*exp, &b)
+        raise NoMethodError, "use assert_raise", caller
+      end
+
       def _assertions= n # :nodoc:
         @_assertions = n
       end
@@ -33,6 +76,21 @@ module Test
     module CoreAssertions
       require_relative 'envutil'
       require 'pp'
+      begin
+        require '-test-/sanitizers'
+      rescue LoadError
+        # in test-unit-ruby-core gem
+        def sanitizers
+          nil
+        end
+      else
+        def sanitizers
+          Test::Sanitizers
+        end
+      end
+      module_function :sanitizers
+
+      nil.pretty_inspect
 
       def mu_pp(obj) #:nodoc:
         obj.pretty_inspect.chomp
@@ -50,11 +108,14 @@ module Test
       end
 
       def assert_in_out_err(args, test_stdin = "", test_stdout = [], test_stderr = [], message = nil,
-                            success: nil, **opt)
+                            success: nil, failed: nil, gems: false, **opt)
         args = Array(args).dup
-        args.insert((Hash === args[0] ? 1 : 0), '--disable=gems')
+        unless gems.nil?
+          args.insert((Hash === args[0] ? 1 : 0), "--#{gems ? 'enable' : 'disable'}=gems")
+        end
         stdout, stderr, status = EnvUtil.invoke_ruby(args, test_stdin, true, true, **opt)
-        desc = FailDesc[status, message, stderr]
+        desc = failed[status, message, stderr] if failed
+        desc ||= FailDesc[status, message, stderr]
         if block_given?
           raise "test_stdout ignored, use block only or without block" if test_stdout != []
           raise "test_stderr ignored, use block only or without block" if test_stderr != []
@@ -105,15 +166,79 @@ module Test
         end
       end
 
-      def assert_no_memory_leak(args, prepare, code, message=nil, limit: 2.0, rss: false, **opt)
-        # TODO: consider choosing some appropriate limit for MJIT and stop skipping this once it does not randomly fail
-        pend 'assert_no_memory_leak may consider MJIT memory usage as leak' if defined?(RubyVM::JIT) && RubyVM::JIT.enabled?
+      private def memory_growth_rate(points)
+        n_1 = (n = points.length) - 1
+        mean_x = n_1 / 2.0
+        mean_y = points.inject(:+).fdiv(n)
+        covariance = 0
+        points.each_with_index {|value, i| covariance += (i - mean_x) * (value - mean_y)}
+        variance = (n_1 * n * (2 * n - 1) / 6) - (n_1 * n * mean_x) + (n * mean_x**2)
+        covariance / variance
+      end
+
+      private def memory_growth_rates(points)
+        midpoint = (points.length - 1) / 2
+        [memory_growth_rate(points[0..midpoint]), memory_growth_rate(points[midpoint..-1])]
+      end
+
+      private def memory_growth_tail_rates(points)
+        window = [points.length / 4, 2].max
+        first = points[[points.length - window * 2, 0].max, window]
+        last = points[-window, window]
+        [memory_growth_rate(first), memory_growth_rate(last)]
+      end
+
+      private def memory_growth_settled_in_tail?(points, growth_rate_ratio)
+        early_rate, late_rate = memory_growth_tail_rates(points)
+        memory_growth_settled?(early_rate, late_rate, growth_rate_ratio)
+      end
+
+      private def memory_growth_settled?(early_rate, late_rate, growth_rate_ratio)
+        if early_rate <= 0
+          late_rate <= 0
+        else
+          late_rate <= early_rate * growth_rate_ratio
+        end
+      end
+
+      # growth_rate_ratio compares late and early memory growth rates. With a
+      # sample range, sampling stops when the late rate is at most this ratio
+      # of the early rate, after collecting the minimum number of samples.
+      def assert_no_memory_leak(args, prepare, code, message=nil, limit: 2.0, rss: false, samples: 1, growth_rate_ratio: 0.25, **opt)
+        # TODO: consider choosing some appropriate limit for RJIT and stop skipping this once it does not randomly fail
+        pend 'assert_no_memory_leak may consider RJIT memory usage as leak' if defined?(RubyVM::RJIT) && RubyVM::RJIT.enabled?
+        # For previous versions which implemented MJIT
+        pend 'assert_no_memory_leak may consider MJIT memory usage as leak' if defined?(RubyVM::MJIT) && RubyVM::MJIT.enabled?
+        # ASAN has the same problem - its shadow memory greatly increases memory usage
+        # (plus asan has better ways to detect memory leaks than this assertion)
+        pend 'assert_no_memory_leak may consider ASAN memory usage as leak' if sanitizers&.asan_enabled?
 
         require_relative 'memory_status'
         raise Test::Unit::PendedError, "unsupported platform" unless defined?(Memory::Status)
 
         token_dump, token_re = new_test_token
+        start_re = /^#{token_re}START=(\{.*\})\n/
+        sample_re = /^#{token_re}SAMPLE=(\{.*\})\n/
+        final_re = /^#{token_re}FINAL=(\{.*\})\n/
         envs = args.shift if Array === args and Hash === args.first
+        case samples
+        when Integer
+          unless samples > 0
+            raise ArgumentError, "samples must be a positive integer or a bounded range"
+          end
+          min_samples = max_samples = samples
+          adaptive_samples = false
+        when Range
+          min_samples = samples.begin
+          max_samples = samples.end
+          max_samples -= 1 if samples.exclude_end? && Integer === max_samples
+          unless Integer === min_samples and Integer === max_samples and min_samples >= 2 and max_samples >= min_samples
+            raise ArgumentError, "samples range must have a minimum of 2 and a bounded positive maximum"
+          end
+          adaptive_samples = true
+        else
+          raise ArgumentError, "samples must be a positive integer or a bounded range"
+        end
         args = [
           "--disable=gems",
           "-r", File.expand_path("../memory_status", __FILE__),
@@ -126,23 +251,126 @@ module Test
           envs = newenvs if newenvs
         end
         args.unshift(envs) if envs
-        cmd = [
-          'END {STDERR.puts '"#{token_dump}"'"FINAL=#{Memory::Status.new}"}',
-          prepare,
-          'STDERR.puts('"#{token_dump}"'"START=#{$initial_status = Memory::Status.new}")',
-          '$initial_size = $initial_status.size',
-          code,
-          'GC.start',
-        ].join("\n")
-        _, err, status = EnvUtil.invoke_ruby(args, cmd, true, true, **opt)
-        before = err.sub!(/^#{token_re}START=(\{.*\})\n/, '') && Memory::Status.parse($1)
-        after = err.sub!(/^#{token_re}FINAL=(\{.*\})\n/, '') && Memory::Status.parse($1)
+        unless (0..1).cover?(growth_rate_ratio)
+          raise ArgumentError, "growth_rate_ratio must be between 0 and 1"
+        end
+
+        cmd = <<~RUBY
+          STDERR.sync = true
+          #{<<~ADAPTIVE if adaptive_samples}
+            memory_leak_control = STDIN.dup
+            STDIN.reopen(File::NULL, "r")
+          ADAPTIVE
+          END {STDERR.puts #{token_dump}"FINAL=\#{Memory::Status.new}"}
+          #{prepare}
+          STDERR.puts(#{token_dump}"START=\#{$initial_status = Memory::Status.new}")
+          $initial_size = $initial_status.size
+          #{max_samples}.times do
+            begin
+          #{code.gsub(/^/, '    ')}
+            ensure
+              GC.start
+              STDERR.puts(#{token_dump}"SAMPLE=\#{Memory::Status.new}")
+              #{<<~ADAPTIVE if adaptive_samples}
+                break unless memory_leak_control.gets == "continue\\n"
+              ADAPTIVE
+            end
+          end
+          __END__
+        RUBY
+        sample_statuses = []
+        before = after = nil
+        if adaptive_samples
+          stdout, err, status = EnvUtil.invoke_ruby(args, "", true, true, **opt) do |in_p, out_p, err_p, pid|
+            out_reader = Thread.new {out_p.read}
+            in_p.write(cmd)
+            in_p.flush
+            err = +""
+            timeout = EnvUtil.apply_timeout_scale(opt.fetch(:timeout, 10))
+            timed_out = nil
+            begin
+              Timeout.timeout(timeout) do
+                while line = err_p.gets
+                  case line
+                  when start_re
+                    before = Memory::Status.parse($1)
+                  when sample_re
+                    sample_statuses << Memory::Status.parse($1)
+                    count = sample_statuses.length
+                    settled = false
+                    if count >= min_samples && count < max_samples
+                      metrics = [:size, (rss && :rss)] & sample_statuses.last.members
+                      settled = metrics.all? do |n|
+                        values = [before[n], *sample_statuses.map {|sample| sample[n]}]
+                        next true unless values.all? {|value| value && value > 0}
+
+                        memory_growth_settled_in_tail?(values, growth_rate_ratio)
+                      end
+                    end
+                    if settled || count == max_samples
+                      in_p.close
+                    else
+                      in_p.write("continue\n")
+                      in_p.flush
+                    end
+                  when final_re
+                    after = Memory::Status.parse($1)
+                  else
+                    err << line
+                  end
+                end
+                in_p.close
+                status = Process.wait2(pid)[1]
+              end
+            rescue Timeout::Error
+              timed_out = Time.now
+              in_p.close
+              status = begin
+                EnvUtil.terminate(pid, opt.fetch(:signal, :TERM), opt[:pgroup], opt.fetch(:reprieve, 1))
+              rescue Errno::ESRCH, Errno::ECHILD
+                warn "child not found: #{pid}: #$!"
+              end
+            end
+            stdout = out_reader.value
+            if timed_out
+              message = "execution of assert_no_memory_leak expired timeout (#{timeout} sec)"
+              message = EnvUtil.failure_description(status, timed_out, message, [stdout, err].join("\n")) if status
+              raise opt.fetch(:timeout_error, Timeout::Error), message
+            end
+            [stdout, err, status]
+          end
+        else
+          stdout, err, status = EnvUtil.invoke_ruby(args, cmd, true, true, **opt)
+          before = err.sub!(start_re, '') && Memory::Status.parse($1)
+          err.gsub!(sample_re) {sample_statuses << Memory::Status.parse($1); ''}
+          after = err.sub!(final_re, '') && Memory::Status.parse($1)
+        end
         assert(status.success?, FailDesc[status, message, err])
+        assert_operator(sample_statuses.length, :>=, min_samples, "could not collect the minimum memory samples")
+        assert_operator(sample_statuses.length, :<=, max_samples, "collected more than the maximum memory samples")
+        assert_equal(samples, sample_statuses.length, "could not collect all memory samples") unless adaptive_samples
         ([:size, (rss && :rss)] & after.members).each do |n|
-          b = before[n]
-          a = after[n]
-          next unless a > 0 and b > 0
-          assert_operator(a.fdiv(b), :<, limit, message(message) {"#{n}: #{b} => #{a}"})
+          if max_samples == 1
+            b = before[n]
+            a = after[n]
+            next unless a > 0 and b > 0
+            assert_operator(a.fdiv(b), :<, limit, message(message) {"#{n}: #{b} => #{a}"})
+          else
+            values = [before[n], *sample_statuses.map {|sample| sample[n]}]
+            next unless values.all? {|value| value && value > 0}
+
+            if adaptive_samples
+              early_rate, late_rate = memory_growth_tail_rates(values)
+              settled = memory_growth_settled?(early_rate, late_rate, growth_rate_ratio)
+            else
+              early_rate, late_rate = memory_growth_rates(values)
+              settled = memory_growth_settled?(early_rate, late_rate, growth_rate_ratio)
+            end
+            assert(settled, message(message) {
+              "#{n} growth did not settle: #{values.inspect} " \
+                "(early rate: #{early_rate}, late rate: #{late_rate})"
+            })
+          end
         end
       rescue LoadError
         pend
@@ -235,15 +463,58 @@ module Test
         assert(status.success?, desc)
       end
 
-      ABORT_SIGNALS = Signal.list.values_at(*%w"ILL ABRT BUS SEGV TERM")
+      ABORT_SIGNALS = Signal.list.values_at(*%w"ILL ABRT BUS SEGV TERM").freeze
 
       def separated_runner(token, out = nil)
         include(*Test::Unit::TestCase.ancestors.select {|c| !c.is_a?(Class) })
+
         out = out ? IO.new(out, 'w') : STDOUT
+
+        # avoid method redefinitions
+        out_write = out.method(:write)
+        integer_to_s = Integer.instance_method(:to_s)
+        array_pack = Array.instance_method(:pack)
+        marshal_dump = Marshal.method(:dump)
+        assertions_ivar_get = Test::Unit::Assertions.method(:instance_variable_get)
+        Test::Unit::Assertions.module_eval do
+          @_assertions = 0
+
+          # These need to be defined with def (not define_method with a
+          # Proc) so that they can be called from non-main Ractors, where
+          # instance variables of modules are not accessible; assertions
+          # made in non-main Ractors are counted separately and merged by
+          # assert_in_ractor instead.
+          undef _assertions=
+          def _assertions=(n)
+            if !defined?(Ractor) || Ractor.main?
+              Test::Unit::Assertions.instance_variable_set(:@_assertions, n)
+            end
+          end
+
+          undef _assertions
+          def _assertions
+            if !defined?(Ractor) || Ractor.main?
+              Test::Unit::Assertions.instance_variable_get(:@_assertions)
+            else
+              0
+            end
+          end
+        end
+        # assume Method#call and UnboundMethod#bind_call need to work as the original
+
         at_exit {
-          out.puts "#{token}<error>", [Marshal.dump($!)].pack('m'), "#{token}</error>", "#{token}assertions=#{self._assertions}"
+          assertions = assertions_ivar_get.call(:@_assertions)
+          out_write.call <<~OUT
+          <error id="#{token}" assertions=#{integer_to_s.bind(assertions).call}>
+          #{array_pack.bind([marshal_dump.call($!)]).call('m0')}
+          </error id="#{token}">
+          OUT
         }
-        Test::Unit::Runner.class_variable_set(:@@stop_auto_run, true) if defined?(Test::Unit::Runner)
+        if defined?(Test::Unit::Runner)
+          Test::Unit::Runner.class_variable_set(:@@stop_auto_run, true)
+        elsif defined?(Test::Unit::AutoRunner)
+          Test::Unit::AutoRunner.need_auto_run = false
+        end
       end
 
       def assert_separately(args, file = nil, line = nil, src, ignore_stderr: nil, **opt)
@@ -253,7 +524,7 @@ module Test
           line ||= loc.lineno
         end
         capture_stdout = true
-        unless /mswin|mingw/ =~ RUBY_PLATFORM
+        unless /mswin|mingw/ =~ RbConfig::CONFIG['host_os']
           capture_stdout = false
           opt[:out] = Test::Unit::Runner.output if defined?(Test::Unit::Runner)
           res_p, res_c = IO.pipe
@@ -263,15 +534,27 @@ module Test
         src = <<eom
 # -*- coding: #{line += __LINE__; src.encoding}; -*-
 BEGIN {
-  require "test/unit";include Test::Unit::Assertions;include Test::Unit::CoreAssertions;require #{__FILE__.dump}
+  require "test/unit";include Test::Unit::Assertions;require #{__FILE__.dump};include Test::Unit::CoreAssertions
   separated_runner #{token_dump}, #{res_c&.fileno || 'nil'}
 }
 #{line -= __LINE__; src}
 eom
         args = args.dup
-        args.insert((Hash === args.first ? 1 : 0), "-w", "--disable=gems", *$:.map {|l| "-I#{l}"})
+        # -W:no-experimental after the -w, which would otherwise turn the category
+        # back on.  The option itself needs 2.7 or later.
+        warn_opts = RUBY_VERSION >= "2.7." ? ["-w", "-W:no-experimental"] : ["-w"]
+        args.insert((Hash === args.first ? 1 : 0), *warn_opts, "--disable=gems", *$:.map {|l| "-I#{l}"})
         args << "--debug" if RUBY_ENGINE == 'jruby' # warning: tracing (e.g. set_trace_func) will not capture all events without --debug flag
+        # power_assert 3 requires ruby 3.1 or later
+        args << "-W:no-experimental" if ("2.7."..."3.1.").cover?(RUBY_VERSION)
         stdout, stderr, status = EnvUtil.invoke_ruby(args, src, capture_stdout, true, **opt)
+
+        if sanitizers&.lsan_enabled?
+          # LSAN may output messages like the following line into stderr. We should ignore it.
+          #   ==276855==Running thread 276851 was not suspended. False leaks are possible.
+          # See https://github.com/google/sanitizers/issues/1479
+          stderr.gsub!(/==\d+==Running thread \d+ was not suspended\. False leaks are possible\.\n/, "")
+        end
       ensure
         if res_c
           res_c.close
@@ -282,27 +565,30 @@ eom
         end
         raise if $!
         abort = status.coredump? || (status.signaled? && ABORT_SIGNALS.include?(status.termsig))
+        marshal_error = nil
         assert(!abort, FailDesc[status, nil, stderr])
-        self._assertions += res[/^#{token_re}assertions=(\d+)/, 1].to_i
-        begin
-          res = Marshal.load(res[/^#{token_re}<error>\n\K.*\n(?=#{token_re}<\/error>$)/m].unpack1("m"))
-        rescue => marshal_error
-          ignore_stderr = nil
-          res = nil
-        end
-        if res and !(SystemExit === res)
-          if bt = res.backtrace
-            bt.each do |l|
-              l.sub!(/\A-:(\d+)/){"#{file}:#{line + $1.to_i}"}
-            end
-            bt.concat(caller)
+        res.scan(/^<error id="#{token_re}" assertions=(\d+)>\n(.*?)\n(?=<\/error id="#{token_re}">$)/m) do
+          self._assertions += $1.to_i
+          begin
+            res = Marshal.load($2.unpack1("m")) or next
+          rescue => marshal_error
+            ignore_stderr = nil
+            res = nil
           else
-            res.set_backtrace(caller)
+            next if SystemExit === res
+            if bt = res.backtrace
+              bt.each do |l|
+                l.sub!(/\A-:(\d+)/){"#{file}:#{line + $1.to_i}"}
+              end
+              bt.concat(caller)
+            else
+              res.set_backtrace(caller)
+            end
+            raise res
           end
-          raise res
         end
 
-        # really is it succeed?
+        # really did it succeed?
         unless ignore_stderr
           # the body of assert_separately must not output anything to detect error
           assert(stderr.empty?, FailDesc[status, "assert_separately failed with error message", stderr])
@@ -313,9 +599,17 @@ eom
 
       # Run Ractor-related test without influencing the main test suite
       def assert_ractor(src, args: [], require: nil, require_relative: nil, file: nil, line: nil, ignore_stderr: nil, **opt)
-        return unless defined?(Ractor)
+        omit unless defined?(Ractor)
 
-        require = "require #{require.inspect}" if require
+        # https://bugs.ruby-lang.org/issues/21262
+        shim_value = "class Ractor; alias value take; end" unless Ractor.method_defined?(:value)
+        shim_join = "class Ractor; alias join take; end" unless Ractor.method_defined?(:join)
+
+        if require
+          require = [require] unless require.is_a?(Array)
+          require = require.map {|r| "require #{r.inspect}"}.join("\n")
+        end
+
         if require_relative
           dir = File.dirname(caller_locations[0,1][0].absolute_path)
           full_path = File.expand_path(require_relative, dir)
@@ -323,6 +617,8 @@ eom
         end
 
         assert_separately(args, file, line, <<~RUBY, ignore_stderr: ignore_stderr, **opt)
+          #{shim_value}
+          #{shim_join}
           #{require}
           previous_verbose = $VERBOSE
           $VERBOSE = nil
@@ -433,19 +729,15 @@ eom
         case expected
         when String
           assert = :assert_equal
-        when Regexp
-          assert = :assert_match
         else
-          raise TypeError, "Expected #{expected.inspect} to be a kind of String or Regexp, not #{expected.class}"
+          assert_respond_to(expected, :===)
+          assert = :assert_match
         end
 
-        ex = m = nil
-        EnvUtil.with_default_internal(expected.encoding) do
-          ex = assert_raise(exception, msg || proc {"Exception(#{exception}) with message matches to #{expected.inspect}"}) do
-            yield
-          end
-          m = ex.message
+        ex = assert_raise(exception, msg || proc {"Exception(#{exception}) with message matches to #{expected.inspect}"}) do
+          yield
         end
+        m = ex.message
         msg = message(msg, "") {"Expected Exception(#{exception}) was raised, but the message doesn't match"}
 
         if assert == :assert_equal
@@ -458,7 +750,44 @@ eom
         ex
       end
 
-      TEST_DIR = File.join(__dir__, "test/unit") #:nodoc:
+      # :call-seq:
+      #   assert_raise_kind_of(*args, &block)
+      #
+      #Tests if the given block raises one of the given exceptions or
+      #sub exceptions of the given exceptions.  If the last argument
+      #is a String, it will be used as the error message.
+      #
+      #    assert_raise do #Fails, no Exceptions are raised
+      #    end
+      #
+      #    assert_raise SystemCallErr do
+      #      Dir.chdir(__FILE__) #Raises Errno::ENOTDIR, so assertion succeeds
+      #    end
+      def assert_raise_kind_of(*exp, &b)
+        case exp.last
+        when String, Proc
+          msg = exp.pop
+        end
+
+        begin
+          yield
+        rescue Test::Unit::PendedError => e
+          raise e unless exp.include? Test::Unit::PendedError
+        rescue *exp => e
+          pass
+        rescue Exception => e
+          flunk(message(msg) {"#{mu_pp(exp)} family exception expected, not #{mu_pp(e)}"})
+        ensure
+          unless e
+            exp = exp.first if exp.size == 1
+
+            flunk(message(msg) {"#{mu_pp(exp)} family expected but nothing was raised"})
+          end
+        end
+        e
+      end
+
+      TEST_DIR = File.join(__dir__, "test/unit").freeze #:nodoc:
 
       # :call-seq:
       #   assert(test, [failure_message])
@@ -530,11 +859,11 @@ eom
         refute_respond_to(obj, meth, msg)
       end
 
-      # pattern_list is an array which contains regexp and :*.
+      # pattern_list is an array which contains regexp, string and :*.
       # :* means any sequence.
       #
       # pattern_list is anchored.
-      # Use [:*, regexp, :*] for non-anchored match.
+      # Use [:*, regexp/string, :*] for non-anchored match.
       def assert_pattern_list(pattern_list, actual, message=nil)
         rest = actual
         anchored = true
@@ -543,11 +872,13 @@ eom
             anchored = false
           else
             if anchored
-              match = /\A#{pattern}/.match(rest)
+              match = rest.rindex(pattern, 0)
             else
-              match = pattern.match(rest)
+              match = rest.index(pattern)
             end
-            unless match
+            if match
+              post_match = $~ ? $~.post_match : rest[match+pattern.size..-1]
+            else
               msg = message(msg) {
                 expect_msg = "Expected #{mu_pp pattern}\n"
                 if /\n[^\n]/ =~ rest
@@ -564,7 +895,7 @@ eom
               }
               assert false, msg
             end
-            rest = match.post_match
+            rest = post_match
             anchored = true
           end
         }
@@ -575,7 +906,7 @@ eom
 
       def assert_warning(pat, msg = nil)
         result = nil
-        stderr = EnvUtil.with_default_internal(pat.encoding) {
+        stderr = EnvUtil.with_default_internal(of: pat) {
           EnvUtil.verbose_warning {
             result = yield
           }
@@ -589,17 +920,15 @@ eom
         assert_warning(*args) {$VERBOSE = false; yield}
       end
 
-      def assert_deprecated_warning(mesg = /deprecated/)
+      def assert_deprecated_warning(mesg = /deprecated/, &block)
         assert_warning(mesg) do
-          Warning[:deprecated] = true
-          yield
+          EnvUtil.deprecation_warning(&block)
         end
       end
 
-      def assert_deprecated_warn(mesg = /deprecated/)
+      def assert_deprecated_warn(mesg = /deprecated/, &block)
         assert_warn(mesg) do
-          Warning[:deprecated] = true
-          yield
+          EnvUtil.deprecation_warning(&block)
         end
       end
 
@@ -690,7 +1019,7 @@ eom
           msg = "exceptions on #{errs.length} threads:\n" +
             errs.map {|t, err|
             "#{t.inspect}:\n" +
-              RUBY_VERSION >= "2.5.0" ? err.full_message(highlight: false, order: :top) : err.message
+              (err.respond_to?(:full_message) ? err.full_message(highlight: false, order: :top) : err.message)
           }.join("\n---\n")
           if message
             msg = "#{message}\n#{msg}"
@@ -725,6 +1054,73 @@ eom
       end
       alias all_assertions_foreach assert_all_assertions_foreach
 
+      clocks = %w[
+        CLOCK_THREAD_CPUTIME_ID CLOCK_PROCESS_CPUTIME_ID
+        CLOCK_MONOTONIC
+      ]
+      # CLOCK_THREAD_CPUTIME_ID is per native thread, and an M:N thread moves
+      # between native threads, so it can go backwards and yield a negative
+      # elapsed time.  Measure process CPU time there instead.
+      clocks.shift if RUBY_DESCRIPTION.include?("+MN")
+      clocks.find do |c|
+        if Process.const_defined?(c)
+          [c.to_sym, Process.const_get(c)].find do |clk|
+            begin
+              Process.clock_gettime(clk)
+            rescue
+              # Constants may be defined but not implemented, e.g., mingw.
+            else
+              unless Process.clock_getres(clk) < 1.0e-03
+                next # needs msec precision
+              end
+              PERFORMANCE_CLOCK = clk
+            end
+          end
+        end
+      end
+
+      # Expect +seq+ to respond to +first+ and +each+ methods, e.g.,
+      # Array, Range, Enumerator::ArithmeticSequence and other
+      # Enumerable-s, and each elements should be size factors.
+      #
+      # :yield: each elements of +seq+.
+      def assert_linear_performance(seq, rehearsal: nil, pre: ->(n) {n})
+        pend "No PERFORMANCE_CLOCK found" unless defined?(PERFORMANCE_CLOCK)
+
+        # Timeout testing generally doesn't work when RJIT compilation happens.
+        rjit_enabled = defined?(RubyVM::RJIT) && RubyVM::RJIT.enabled?
+        measure = proc do |arg, message|
+          st = Process.clock_gettime(PERFORMANCE_CLOCK)
+          yield(*arg)
+          t = (Process.clock_gettime(PERFORMANCE_CLOCK) - st)
+          assert_operator 0, :<=, t, message unless rjit_enabled
+          t
+        end
+
+        first = seq.first
+        *arg = pre.call(first)
+        raw_times = (0..(rehearsal || (2 * first))).map do
+          measure[arg, "rehearsal"].nonzero?
+        end
+        times = raw_times.compact
+        raise "all measurements are zero: #{raw_times.inspect}" if times.empty?
+        tmin, tmax = times.minmax
+
+        # safe_factor * tmax * rehearsal_time_variance_factor(equals to 1 when variance is small)
+        tbase = 10 * tmax * [(tmax / tmin) ** 2 / 4, 1].max
+        info = "(tmin: #{tmin}, tmax: #{tmax}, tbase: #{tbase})"
+
+        seq.each do |i|
+          next if i == first
+          t = tbase * i.fdiv(first)
+          *arg = pre.call(i)
+          message = "[#{i}]: in #{t}s #{info}"
+          Timeout.timeout(t, Timeout::Error, message) do
+            measure[arg, message]
+          end
+        end
+      end
+
       def diff(exp, act)
         require 'pp'
         q = PP.new(+"")
@@ -744,6 +1140,82 @@ eom
       def new_test_token
         token = "\e[7;1m#{$$.to_s}:#{Time.now.strftime('%s.%L')}:#{rand(0x10000).to_s(16)}:\e[m"
         return token.dump, Regexp.quote(token)
+      end
+
+      # Platform predicates
+
+      def self.mswin?
+        defined?(@mswin) ? @mswin : @mswin = RUBY_PLATFORM.include?('mswin')
+      end
+      private def mswin?
+        CoreAssertions.mswin?
+      end
+
+      def self.mingw?
+        defined?(@mingw) ? @mingw : @mingw = RUBY_PLATFORM.include?('mingw')
+      end
+      private def mingw?
+        CoreAssertions.mingw?
+      end
+
+      module_function def windows?
+        mswin? or mingw?
+      end
+
+      def self.version_compare(expected, actual)
+        expected.zip(actual).each {|e, a| z = (e <=> a); return z if z.nonzero?}
+        0
+      end
+
+      def self.version_match?(expected, actual)
+        if !actual
+          false
+        elsif expected.empty?
+          true
+        elsif expected.size == 1 and Range === (range = expected.first)
+          b, e = range.begin, range.end
+          return false if b and (c = version_compare(Array(b), actual)) > 0
+          return false if e and (c = version_compare(Array(e), actual)) < 0
+          return false if e and range.exclude_end? and c == 0
+          true
+        else
+          version_compare(expected, actual).zero?
+        end
+      end
+
+      def self.linux?(*ver)
+        unless defined?(@linux)
+          @linux = RUBY_PLATFORM.include?('linux') && `uname -r`.scan(/\d+/).map(&:to_i)
+        end
+        version_match? ver, @linux
+      end
+      private def linux?(*ver)
+        CoreAssertions.linux?(*ver)
+      end
+
+      def self.glibc?(*ver)
+        unless defined?(@glibc)
+          libc = `/usr/bin/ldd /bin/sh`[/^\s*libc.*=> *\K\S*/]
+          if libc and /version (\d+)\.(\d+)\.$/ =~ IO.popen([libc], &:read)[]
+            @glibc = [$1.to_i, $2.to_i]
+          else
+            @glibc = false
+          end
+        end
+        version_match? ver, @glibc
+      end
+      private def glibc?(*ver)
+        CoreAssertions.glibc?(*ver)
+      end
+
+      def self.macos?(*ver)
+        unless defined?(@macos)
+          @macos = RUBY_PLATFORM.include?('darwin') && `sw_vers -productVersion`.scan(/\d+/).map(&:to_i)
+        end
+        version_match? ver, @macos
+      end
+      private def macos?(*ver)
+        CoreAssertions.macos?(*ver)
       end
     end
   end

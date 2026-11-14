@@ -13,28 +13,28 @@ describe "Logger#new" do
     rm_r @file_path
   end
 
-   it "creates a new logger object" do
-     l = Logger.new(STDERR)
-     -> { l.add(Logger::WARN, "Foo") }.should output_to_fd(/Foo/, STDERR)
-   end
+  it "creates a new logger object" do
+    l = Logger.new(STDERR)
+    -> { l.add(Logger::WARN, "Foo") }.should output_to_fd(/Foo/, STDERR)
+  end
 
-   it "receives a logging device as first argument" do
-     l = Logger.new(@log_file)
-     l.add(Logger::WARN, "Test message")
+  it "receives a logging device as first argument" do
+    l = Logger.new(@log_file)
+    l.add(Logger::WARN, "Test message")
 
-     @log_file.rewind
-     LoggerSpecs.strip_date(@log_file.readline).should == "WARN -- : Test message\n"
-     l.close
-   end
+    @log_file.rewind
+    LoggerSpecs.strip_date(@log_file.readline).should == "WARN -- : Test message\n"
+    l.close
+  end
 
   it "receives a frequency rotation as second argument" do
-     -> { Logger.new(@log_file, "daily") }.should_not raise_error
-     -> { Logger.new(@log_file, "weekly") }.should_not raise_error
-     -> { Logger.new(@log_file, "monthly") }.should_not raise_error
+    -> { Logger.new(@log_file, "daily") }.should_not.raise
+    -> { Logger.new(@log_file, "weekly") }.should_not.raise
+    -> { Logger.new(@log_file, "monthly") }.should_not.raise
   end
 
   it "also receives a number of log files to keep as second argument" do
-    -> { Logger.new(@log_file, 1).close }.should_not raise_error
+    -> { Logger.new(@log_file, 1).close }.should_not.raise
   end
 
   it "receives a maximum logfile size as third argument" do
@@ -94,7 +94,7 @@ describe "Logger#new" do
     logger.formatter.should == formatter
   end
 
-  it "receives shift_period_suffix " do
+  it "receives shift_period_suffix" do
     shift_period_suffix = "%Y-%m-%d"
     path                = tmp("shift_period_suffix_test.log")
     now                 = Time.now

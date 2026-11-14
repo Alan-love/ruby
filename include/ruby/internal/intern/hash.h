@@ -107,6 +107,17 @@ VALUE rb_hash(VALUE obj);
 VALUE rb_hash_new(void);
 
 /**
+ * Identical to rb_hash_new(), except it additionally specifies how many keys
+ * it is expected to contain. This way you can create a hash that is large enough
+ * for your need. For large hashes it means it won't need to be reallocated and
+ * rehashed as much, improving performance.
+ *
+ * @param[in]  capa  Designed capacity of the hash.
+ * @return     An empty Hash, whose capacity is `capa`.
+ */
+VALUE rb_hash_new_capa(rb_len_t capa);
+
+/**
  * Duplicates a hash.
  *
  * @param[in]  hash  An instance of ::rb_cHash.
@@ -245,7 +256,7 @@ VALUE rb_hash_delete(VALUE hash, VALUE key);
  * accept the newest (rightmost) one.  This behaviour also mimics repeated call
  * of rb_hash_aset().
  */
-void rb_hash_bulk_insert(long argc, const VALUE *argv, VALUE hash);
+void rb_hash_bulk_insert(rb_len_t argc, const VALUE *argv, VALUE hash);
 
 /**
  * Type of callback functions to pass to rb_hash_update_by().
@@ -272,29 +283,6 @@ typedef VALUE rb_hash_update_func(VALUE newkey, VALUE oldkey, VALUE value);
  *              are always taken.
  */
 VALUE rb_hash_update_by(VALUE hash1, VALUE hash2, rb_hash_update_func *func);
-
-/* file.c */
-
-/**
- * This function is mysterious.  What it does is not immediately obvious.  Also
- * what it does seems platform dependent.
- *
- * @param[in]  path       A local path.
- * @retval     0          The "check" succeeded.
- * @retval     otherwise  The "check" failed.
- */
-int rb_path_check(const char *path);
-
-/* hash.c */
-
-/**
- * @deprecated  This function  once was a thing  in the old days,  but makes no
- *              sense   any   longer   today.   Exists   here   for   backwards
- *              compatibility only.  You can safely forget about it.
- *
- * @return      0 always.
- */
-int rb_env_path_tainted(void);
 
 /**
  * Destructively removes every environment variables of the running process.

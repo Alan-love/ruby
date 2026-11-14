@@ -159,13 +159,65 @@ class TestProc < Test::Unit::TestCase
     assert_equal(*m_nest{}, "[ruby-core:84583] Feature #14627")
   end
 
-  def test_hash
+  def test_hash_equal
+    # iseq backed proc
+    p1 = proc {}
+    p2 = p1.dup
+
+    assert_equal p1.hash, p2.hash
+
+    # ifunc backed proc
+    p1 = {}.to_proc
+    p2 = p1.dup
+
+    assert_equal p1.hash, p2.hash
+
+    # symbol backed proc
+    p1 = :hello.to_proc
+    p2 = :hello.to_proc
+
+    assert_equal p1.hash, p2.hash
+  end
+
+  def test_hash_uniqueness
     def self.capture(&block)
       block
     end
 
-   procs = Array.new(1000){capture{:foo }}
-   assert_operator(procs.map(&:hash).uniq.size, :>=, 500)
+    procs = Array.new(1000){capture{:foo }}
+    assert_operator(procs.map(&:hash).uniq.size, :>=, 500)
+
+    # iseq backed proc
+    unique_hashes = 1000.times.map { proc {}.hash }.uniq
+    assert_operator(unique_hashes.size, :>=, 500)
+
+    # ifunc backed proc
+    unique_hashes = 1000.times.map { {}.to_proc.hash }.uniq
+    assert_operator(unique_hashes.size, :>=, 500)
+
+    # symbol backed proc
+    unique_hashes = 1000.times.map { |i| :"test#{i}".to_proc.hash }.uniq
+    assert_operator(unique_hashes.size, :>=, 500)
+  end
+
+  def test_hash_does_not_change_after_compaction
+    omit "compaction is not supported on this platform" unless GC.respond_to?(:compact)
+
+    # [Bug #20853]
+    [
+      "proc {}", # iseq backed proc
+      "{}.to_proc", # ifunc backed proc
+      ":hello.to_proc", # symbol backed proc
+    ].each do |proc|
+      assert_separately([], <<~RUBY)
+        p1 = #{proc}
+        hash = p1.hash
+
+        GC.verify_compaction_references(expand_heap: true, toward: :empty)
+
+        assert_equal(hash, p1.hash, "proc is `#{proc}`")
+      RUBY
+    end
   end
 
   def test_block_par
@@ -207,18 +259,24 @@ class TestProc < Test::Unit::TestCase
   end
 
   def test_block_given_method
+    verbose_bak, $VERBOSE = $VERBOSE, nil
     m = method(:m_block_given?)
     assert(!m.call, "without block")
     assert(m.call {}, "with block")
     assert(!m.call, "without block second")
+  ensure
+    $VERBOSE = verbose_bak
   end
 
   def test_block_given_method_to_proc
+    verbose_bak, $VERBOSE = $VERBOSE, nil
     bug8341 = '[Bug #8341]'
     m = method(:m_block_given?).to_proc
     assert(!m.call, "#{bug8341} without block")
     assert(m.call {}, "#{bug8341} with block")
     assert(!m.call, "#{bug8341} without block second")
+  ensure
+    $VERBOSE = verbose_bak
   end
 
   def test_block_persist_between_calls
@@ -284,12 +342,30 @@ class TestProc < Test::Unit::TestCase
     assert_equal(9, b)
   end
 
+  # Not named test_curry_* so that test_curry_with_trace does not re-run it
+  # under set_trace_func (which would be needlessly slow with GC.stress).
+  def test_proc_curry_keeps_args_alive
+    # The argument array passed down by `curry` must stay alive across the
+    # inner call; otherwise GC may reclaim it while it is still read as argv
+    # and crash with "try to mark T_NONE object". See the RB_GC_GUARD in `curry`.
+    assert_separately([], "#{<<~"begin;"}\n#{<<~'end;'}", timeout: 60)
+    begin;
+      GC.stress = true
+      l = ->(a, b, c) { a + b + c }
+      30.times do
+        l1 = l.curry.call(1)
+        l2 = l1.curry.call(2)
+        assert_equal(6, l2.curry.call(3))
+        assert_equal(6, l1.curry.call(2, 3))
+      end
+    end;
+  end
+
   def test_lambda?
     l = proc {}
     assert_equal(false, l.lambda?)
     assert_equal(false, l.curry.lambda?, '[ruby-core:24127]')
     assert_equal(false, proc(&l).lambda?)
-    assert_equal(false, assert_deprecated_warning {lambda(&l)}.lambda?)
     assert_equal(false, Proc.new(&l).lambda?)
     l = lambda {}
     assert_equal(true, l.lambda?)
@@ -299,47 +375,21 @@ class TestProc < Test::Unit::TestCase
     assert_equal(true, Proc.new(&l).lambda?)
   end
 
-  def self.helper_test_warn_lamda_with_passed_block &b
+  def helper_test_warn_lambda_with_passed_block &b
     lambda(&b)
   end
 
-  def self.def_lambda_warning name, warn
-    define_method(name, proc do
-      prev = Warning[:deprecated]
-      assert_warn warn do
-        Warning[:deprecated] = true
-        yield
-      end
-    ensure
-      Warning[:deprecated] = prev
-    end)
+  def test_lambda_warning_pass_proc
+    assert_raise(ArgumentError) do
+      b = proc{}
+      lambda(&b)
+    end
   end
 
-  def_lambda_warning 'test_lambda_warning_normal', '' do
-    lambda{}
-  end
-
-  def_lambda_warning 'test_lambda_warning_pass_lambda', '' do
-    b = lambda{}
-    lambda(&b)
-  end
-
-  def_lambda_warning 'test_lambda_warning_pass_symbol_proc', '' do
-    lambda(&:to_s)
-  end
-
-  def_lambda_warning 'test_lambda_warning_pass_proc', /deprecated/ do
-    b = proc{}
-    lambda(&b)
-  end
-
-  def_lambda_warning 'test_lambda_warning_pass_block', /deprecated/ do
-    helper_test_warn_lamda_with_passed_block{}
-  end
-
-  def_lambda_warning 'test_lambda_warning_pass_block_symbol_proc', '' do
-    # Symbol#to_proc returns lambda
-    helper_test_warn_lamda_with_passed_block(&:to_s)
+  def test_lambda_warning_pass_block
+    assert_raise(ArgumentError) do
+      helper_test_warn_lambda_with_passed_block{}
+    end
   end
 
   def test_curry_ski_fib
@@ -397,7 +447,20 @@ class TestProc < Test::Unit::TestCase
     assert_raise(ArgumentError) { ->(a, b=42){}.curry(3) }
   end
 
+  def test_curry_arity_to_int
+    bug22284 = '[Bug #22284]'
+    assert_equal(42, proc {|x, *y| x }.curry(1r)[42], bug22284)
+    assert_equal(42, lambda {|x, *y| x }.curry(1r)[42], bug22284)
+
+    called = 0
+    arity = Object.new
+    arity.define_singleton_method(:to_int) { called += 1; 2 }
+    assert_equal(3, proc {|x, y| x + y }.curry(arity)[1][2], bug22284)
+    assert_equal(1, called, bug22284)
+  end
+
   def test_dup_clone
+    # iseq backed proc
     b = proc {|x| x + "bar" }
     class << b; attr_accessor :foo; end
 
@@ -410,6 +473,833 @@ class TestProc < Test::Unit::TestCase
     assert_equal("foobar", bc.call("foo"))
     bc.foo = :foo
     assert_equal(:foo, bc.foo)
+
+    # ifunc backed proc
+    b = {foo: "bar"}.to_proc
+
+    bd = b.dup
+    assert_equal("bar", bd.call(:foo))
+
+    bc = b.clone
+    assert_equal("bar", bc.call(:foo))
+
+    # symbol backed proc
+    b = :to_s.to_proc
+
+    bd = b.dup
+    assert_equal("testing", bd.call(:testing))
+
+    bc = b.clone
+    assert_equal("testing", bc.call(:testing))
+  end
+
+  def test_dup_subclass
+    c1 = Class.new(Proc)
+    assert_equal c1, c1.new{}.dup.class, '[Bug #17545]'
+    c1 = Class.new(Proc) {def initialize_dup(*) throw :initialize_dup; end}
+    assert_throw(:initialize_dup) {c1.new{}.dup}
+  end
+
+  def test_dup_ifunc_proc_bug_20950
+    assert_normal_exit(<<~RUBY, "[Bug #20950]")
+      p = { a: 1 }.to_proc
+      100.times do
+        p = p.dup
+        GC.start
+        p.call
+      rescue ArgumentError
+      end
+    RUBY
+  end
+
+  def test_dup_curry_proc
+    pr = proc {|a, b| a + b }.curry.dup
+    assert_equal(3, pr.call(1).call(2))
+    assert_equal(3, pr.call(1, 2))
+  end
+
+  module RefinementsModule
+    refine String do
+      def shout = upcase + "!"
+    end
+    refine Integer do
+      def tripled = self * 3
+    end
+  end
+
+  def test_refined
+    orig = ->(s) { s.shout }
+    refined = orig.refined(RefinementsModule)
+    assert_equal("HI!", refined.call("hi"))
+    # the original Proc is unaffected
+    assert_raise(NoMethodError) { orig.call("hi") }
+    # idempotent: calling repeatedly keeps using the refinement
+    assert_equal("HI!", refined.call("hi"))
+  end
+
+  def test_refined_nested_block
+    orig = ->(a) { a.map { |s| s.shout } }
+    refined = orig.refined(RefinementsModule)
+    assert_equal(["A!", "B!"], refined.call(["a", "b"]))
+    assert_raise(NoMethodError) { orig.call(["a"]) }
+  end
+
+  def test_refined_multiple_modules
+    refined = ->(s, n) { "#{s.shout}#{n.tripled}" }.refined(RefinementsModule)
+    assert_equal("A!6", refined.call("a", 2))
+  end
+
+  def test_refined_shares_environment
+    counter = 0
+    inc = -> { counter += 1 }
+    refined = inc.refined(RefinementsModule)
+    refined.call
+    inc.call
+    # the closure environment is shared with the original Proc
+    assert_equal(2, counter)
+  end
+
+  def test_refined_via_yield
+    refined = ->(s) { s.shout }.refined(RefinementsModule)
+    result = [].tap {|a| [1, 2].each {|i| a << refined.call("x#{i}") } }
+    assert_equal(["X1!", "X2!"], result)
+
+    forwarded = []
+    rr = ->(s) { forwarded << s.shout }.refined(RefinementsModule)
+    %w[p q].each(&rr)
+    assert_equal(["P!", "Q!"], forwarded)
+  end
+
+  def test_refined_via_c_call_paths
+    refined = ->(s) { s.shout }.refined(RefinementsModule)
+    # These reach the proc via the C invocation path (rb_vm_invoke_proc) rather
+    # than the optimized opt_call, so the refinement cref must be carried there.
+    assert_equal("A!", refined.send(:call, "a"))
+    assert_equal("B!", refined.method(:call).call("b"))
+    assert_equal("C!", Fiber.new(&refined).resume("c"))
+    assert_equal("D!", Thread.new("d", &refined).value)
+  end
+
+  def test_refined_instance_eval
+    refined = proc { self.shout }.refined(RefinementsModule)
+    assert_equal("HI!", "hi".instance_eval(&refined))
+    assert_equal("HI!", "hi".instance_exec(&refined))
+    # the original Proc is still unaffected via instance_eval
+    orig = proc { self.shout }
+    assert_raise(NoMethodError) { "hi".instance_eval(&orig) }
+  end
+
+  def test_refined_module_eval
+    refined = proc { "ok".shout }.refined(RefinementsModule)
+    klass = Class.new
+    assert_equal("OK!", klass.class_eval(&refined))
+  end
+
+  def test_refined_instance_eval_does_not_leak_refinements
+    # instance_eval/class_eval gets its own copy of the refinements hash, so a
+    # `using` inside must not mutate the cref shared by every derived proc.
+    refined = proc { "ok".shout }.refined(RefinementsModule)
+    Class.new.class_eval(&refined)
+    # a second proc derived from the same source iseq still sees the refinement
+    again = proc { "ok".shout }.refined(RefinementsModule)
+    assert_equal("OK!", Class.new.class_eval(&again))
+  end
+
+  def test_refined_once_regexp
+    # A /o (once) regexp literal interpolating a refined-method call must be
+    # built under the refinement, and the copy's once cache is independent of
+    # the source iseq's (which may be mid-flight or already completed).
+    refined = ->(s) { /\A#{s.shout}\z/o }.refined(RefinementsModule)
+    r1 = refined.call("ab")
+    assert_equal('\AAB!\z', r1.source)
+    # /o caches the first regexp on the copy's own once entry
+    assert_same(r1, refined.call("zz"))
+    # the original proc has no refinement, so building the regexp raises
+    assert_raise(NoMethodError) { ->(s) { /\A#{s.shout}\z/o }.call("ab") }
+  end
+
+  def test_refined_preserved_by_dup
+    refined = ->(s) { s.shout }.refined(RefinementsModule)
+    # dup/clone copy the refinement cref (a hidden ivar) with the other ivars
+    assert_equal("Z!", refined.dup.call("z"))
+    assert_equal("Z!", refined.clone.call("z"))
+  end
+
+  def test_refined_no_arguments
+    original = -> {}
+    assert_same(original, original.refined)
+  end
+
+  def test_refined_errors
+    assert_raise(TypeError) { ->(s) { s }.refined(42) }
+    # non-iseq Procs are not supported
+    assert_raise(ArgumentError) { :upcase.to_proc.refined(RefinementsModule) }
+    assert_raise(ArgumentError) { method(:p).to_proc.refined(RefinementsModule) }
+  end
+
+  def test_refined_non_main_ractor
+    assert_separately([], <<~'RUBY')
+      Warning[:experimental] = false
+      module M1; refine(String) { def shout = upcase + "!" }; end
+      module M2; refine(String) { def shout = downcase }; end
+      ractors = 10.times.map { |i|
+        Ractor.new(i) { |i|
+          ->(s) { s.shout }.refined(i.even? ? M1 : M2).call("Hi")
+        }
+      }
+      values = ractors.map(&:value)
+      assert_equal(["HI!", "hi"] * 5, values)
+    RUBY
+  end
+
+  def test_refined_shareable_proc_across_ractors
+    assert_separately([], <<~'RUBY')
+      Warning[:experimental] = false
+      module RefMod; refine(String) { def shout = upcase + "!" }; end
+      module RefHolder
+        # module body: self is shareable, as make_shareable requires
+        PROC = Ractor.make_shareable(->(s) { s.shout })
+      end
+      orig = RefHolder::PROC
+      # Store a memo in the main Ractor first, then refine the same shareable
+      # proc in another Ractor: cross-Ractor reuse of the memo is legal
+      # because the memoized cref's refinements table is frozen and shareable.
+      assert_equal("HI!", orig.refined(RefMod).call("hi"))
+      r = Ractor.new(orig) { |pr| pr.refined(RefMod).call("hi") }
+      assert_equal("HI!", r.value)
+      assert_equal("HI!", orig.refined(RefMod).call("hi"))
+    RUBY
+  end
+
+  def test_refined_shareable_refined_proc_first_called_in_ractor
+    assert_separately([], <<~'RUBY')
+      Warning[:experimental] = false
+      module RefMod; refine(String) { def shout = upcase + "!" }; end
+      module RefHolder
+        REFINED = Ractor.make_shareable(->(s) { s.shout }.refined(RefMod))
+      end
+      refined = RefHolder::REFINED
+      # the first call, and so the deferred copy, happens in another Ractor
+      r = Ractor.new(refined) { |pr| pr.call("hi") }
+      assert_equal("HI!", r.value)
+      assert_equal("YO!", refined.call("yo"))
+    RUBY
+  end
+
+  def test_refined_coverage
+    assert_separately(%w[-rcoverage -rtempfile], <<~'RUBY')
+      f = Tempfile.open(["refined_coverage", ".rb"])
+      f.write(<<~'FIXTURE')
+        module RefinedCoverageExt
+          refine String do
+            def shout = upcase + "!"
+          end
+        end
+        REFINED_COVERAGE_PROC = ->(s) {
+          a = s.length
+          s.shout * a
+        }
+      FIXTURE
+      f.close
+      Coverage.start(lines: true)
+      load f.path
+      refined = REFINED_COVERAGE_PROC.refined(RefinedCoverageExt)
+      assert_equal("HI!HI!", refined.call("hi"))
+      lines = Coverage.result[f.path][:lines]
+      assert_equal(1, lines[6], "line 7 (a = s.length) must be counted when run through the refined copy")
+      assert_equal(1, lines[7], "line 8 (s.shout * a) must be counted when run through the refined copy")
+    RUBY
+  end
+
+  def test_refined_using_in_body_rejected
+    # The refinement set of a refined proc is fixed at refined() time: procs
+    # derived from the same source and modules share the copied iseq (and its
+    # refined call caches), so `using` inside the body would diverge one
+    # proc's refinement set and poison the caches its siblings use.
+    assert_separately([], <<~'RUBY')
+      module M1; refine(String) { def shout = upcase + "!" }; end
+      module M2; refine(String) { def whisper = downcase + "..." }; end
+      msg = /using is not permitted in a proc with refinements/
+      r = proc { using M2 }.refined(M1)
+      assert_raise_with_message(RuntimeError, msg) { r.call }
+      # through module_eval (Module#using) as well
+      e = proc { using M2 }.refined(M1)
+      assert_raise_with_message(RuntimeError, msg) { Module.new.module_eval(&e) }
+      # in a class body or a nested block inside the refined proc
+      c = proc { class ::RefinedUsingTmp; using M2; end }.refined(M1)
+      assert_raise_with_message(RuntimeError, msg) { c.call }
+      n = proc { -> { using M2 }.call }.refined(M1)
+      assert_raise_with_message(RuntimeError, msg) { n.call }
+      # plain procs are unaffected
+      assert_equal("ok...", Module.new.module_eval(&proc { using M2; "ok".whisper }))
+      # and the refined proc itself still works
+      assert_equal("OK!", proc { "ok".shout }.refined(M1).call)
+    RUBY
+  end
+
+  def test_refined_rejected_by_define_method
+    # A bmethod is invoked against its method entry, not the proc's refinement
+    # cref, so defining a method from a refined proc would silently drop
+    # the refinements; it is rejected instead.
+    refined = ->(s) { s.shout }.refined(RefinementsModule)
+    assert_raise(ArgumentError) { Class.new { define_method(:m, refined) } }
+    assert_raise(ArgumentError) { Class.new { define_method(:m, &refined) } }
+    assert_raise(ArgumentError) { Object.new.define_singleton_method(:m, refined) }
+  end
+
+  # Each refinement module refines only one class so the nested test below can
+  # tell apart the refinement added on the inner Proc (String) from the one
+  # inherited from the enclosing refined Proc (Integer).
+  module RefinementsStringOnly
+    refine String do
+      def shout = upcase + "!"
+    end
+  end
+
+  module RefinementsIntegerOnly
+    refine Integer do
+      def doubled = self * 2
+    end
+  end
+
+  def test_refined_nested_proc
+    result = -> {
+      inner = ->(s, n) { [s.shout, n.doubled] }
+      inner.refined(RefinementsStringOnly).call("hi", 3)
+    }.refined(RefinementsIntegerOnly).call
+    # RefinementsStringOnly is added on the inner copy; RefinementsIntegerOnly
+    # is inherited from the enclosing refined Proc.
+    assert_equal(["HI!", 6], result)
+
+    # define_method from such a nested Proc is allowed (it is not the
+    # refined result itself).
+    assert_nothing_raised do
+      -> { Class.new { define_method(:m, ->(s) { s }) } }.refined(RefinementsIntegerOnly).call
+    end
+  end
+
+  def test_refined_chain
+    refined = ->(s, n) { [s.shout, n.doubled] }.refined(RefinementsStringOnly).refined(RefinementsIntegerOnly)
+    assert_equal(["HI!", 6], refined.call("hi", 3))
+
+    refined2 = ->(s) { s.shout }.refined(RefinementsModule).refined(RefinementsModule2)
+    assert_equal("?", refined2.call("hi"))
+    refined3 = ->(s) { s.shout }.refined(RefinementsModule2).refined(RefinementsModule)
+    assert_equal("HI!", refined3.call("hi"))
+  end
+
+  def test_refined_chain_after_call
+    # The block of a Proc that has already run is the copy it is running, so
+    # chaining from it must not hand that copy to the new Proc: the two have
+    # different refinements for the same method.
+    pr = ->(s) { s.shout }
+    p1 = pr.refined(RefinementsModule)
+    assert_equal("HI!", p1.call("hi"))
+    p2 = p1.refined(RefinementsModule2)
+    assert_equal("?", p2.call("hi"))
+    assert_equal("HI!", p1.call("hi"))
+  end
+
+  def test_refined_inner_proc_after_call
+    # Likewise for a Proc created inside a refined Proc: its block is part of
+    # the enclosing copy.
+    outer = -> {
+      inner = ->(s) { s.shout }
+      [inner.refined(RefinementsModule2).call("hi"), inner.call("hi")]
+    }.refined(RefinementsModule)
+    assert_equal(["?", "HI!"], outer.call)
+  end
+
+  def test_refined_eq_and_hash
+    # Equality and hash come from what the Proc was built from (block, captured
+    # cref, modules), so they do not depend on whether the deferred copy has
+    # been made yet, and never alias a refined Proc with its source.
+    prc = ->(s) { s.shout }
+    rp = prc.refined(RefinementsModule)
+    rq = prc.refined(RefinementsModule2)
+    rr = prc.refined(RefinementsModule)
+    assert_not_equal(prc, rp)
+    assert_not_equal(rp, rq)
+    assert_equal(rp, rr)
+    assert_equal(rp.hash, rr.hash)
+    hash_before = rp.hash
+    rp.call("hi")
+    assert_equal(hash_before, rp.hash, "hash must not change on the first call")
+    assert_equal(rp, rr, "equality must not change on the first call")
+    assert_not_equal(prc, rp)
+    h = { prc => 1, rp => 2 }
+    assert_equal(2, h.size)
+    assert_equal(2, h[rr])
+  end
+
+  def test_refined_first_call_error_in_fiber
+    # The deferred copy runs inside the fiber's tag: an exception raised there
+    # (here from a Warning.warn override) must come out of Fiber#resume.
+    assert_separately([], <<~'RUBY')
+      module M1; refine(String) { def shout = "1" }; end
+      module M2; refine(String) { def shout = "2" }; end
+      Warning[:performance] = true
+      def Warning.warn(msg, category: nil) = raise "boom"
+      pr = ->(s) { s.shout }
+      pr.refined(M1).call("hi")
+      q = pr.refined(M2) # the first call will warn about the memo miss
+      assert_raise_with_message(RuntimeError, "boom") { Fiber.new(&q).resume("hi") }
+    RUBY
+  end
+
+  def test_refined_gc
+    assert_normal_exit(<<~RUBY)
+      module M
+        refine(String) { def shout = upcase + "!" }
+      end
+      procs = 100.times.map { |i| ->(s) { s.shout } .refined(M) }
+      GC.start
+      GC.compact rescue nil
+      procs.each { |pr| raise "bad" unless pr.call("a") == "A!" }
+    RUBY
+  end
+
+  def test_refined_gc_stress
+    # Under GC.stress, the memo store allocates its module array while the memo
+    # is reachable from the iseq; a GC during that allocation must not observe a
+    # half-initialized memo (argc set but mods not yet allocated).  Alternating
+    # module sets keeps missing the memo so each call re-runs the store; one
+    # small iseq keeps it cheap enough for slow CI runners.
+    assert_normal_exit(<<~RUBY)
+      module M1; refine(String) { def shout = upcase + "!" }; end
+      module M2; refine(String) { def shout = downcase }; end
+      orig = ->(s) { s.shout }
+      r = nil
+      GC.stress = true
+      6.times { |i| r = orig.refined(i.even? ? M1 : M2) }
+      GC.stress = false
+      raise "bad" unless r.call("Hi") == "hi"
+    RUBY
+  end
+
+  def test_refined_iseq_to_binary
+    # A block iseq that has memoized copies must still serialize cleanly
+    # (the memo lives outside the iseq).
+    assert_separately([], <<~'RUBY')
+      module M
+        refine(String) { def shout = upcase + "!" }
+      end
+      src = 'x = ->(s) { s.shout }; x.refined(M).call("hi")'
+      iseq = RubyVM::InstructionSequence.compile(src)
+      eval(src) # runs refined, setting the memo on the block iseq
+      bin = iseq.to_binary
+      loaded = RubyVM::InstructionSequence.load_from_binary(bin)
+      assert_equal("HI!", loaded.eval)
+    RUBY
+  end
+
+  module RefinementsModule2
+    refine String do
+      def shout = "?"
+    end
+  end
+
+  def test_refined_memoized
+    orig = ->(s) { s.shout }
+    # Repeating the same (proc, modules) reuses the cached copy but stays correct.
+    assert_equal("HI!", orig.refined(RefinementsModule).call("hi"))
+    assert_equal("HI!", orig.refined(RefinementsModule).call("hi"))
+    # A different module set must not return the previously cached copy.
+    assert_equal("?", orig.refined(RefinementsModule2).call("hi"))
+    # ...and switching back is still correct.
+    assert_equal("HI!", orig.refined(RefinementsModule).call("hi"))
+  end
+
+  def test_refined_memo_replaced_before_first_call
+    # The copy of the block is made on the first call, out of the memo entry
+    # that produced the proc's refinements.  A proc whose entry has since been
+    # replaced by another module set makes its own copy instead.
+    orig = ->(s) { s.shout }
+    q1 = orig.refined(RefinementsModule)
+    q2 = orig.refined(RefinementsModule2) # replaces the memo entry
+    assert_equal("?", q2.call("hi"))
+    assert_equal("HI!", q1.call("hi"))
+  end
+
+  def test_refined_ruby2_keywords_memo
+    # Proc#ruby2_keywords marks the shared block iseq, possibly after a copy
+    # was memoized.  The stale memo is rebuilt (with a warning naming the
+    # cause) rather than reused or mutated: the new proc delegates keywords
+    # like its source, while a proc already running a copy keeps it.  A proc
+    # that has not been called yet has no copy of its own, so it picks the mark
+    # up like any other proc made from the same block.
+    assert_separately([], <<~'RUBY')
+      module M; refine(String) { def shout = upcase + "!" }; end
+      Warning[:performance] = true
+      $warned = []
+      def Warning.warn(msg, category: nil) = $warned << msg
+      target = ->(a, k: nil) { [a, k] }
+      pr = proc { |*args| target.call(*args) }
+      q1 = pr.refined(M)
+      assert_raise(ArgumentError) { q1.call(1, k: 2) } # memoizes a copy before the mark
+      pr.ruby2_keywords
+      assert_equal([1, 2], pr.call(1, k: 2))
+      q2 = pr.refined(M)
+      assert_equal([1, 2], q2.call(1, k: 2))
+      assert_equal(1, $warned.grep(/ruby2_keywords/).size)
+      # the copy q1 is running is not retroactively changed
+      assert_raise(ArgumentError) { q1.call(1, k: 2) }
+      # the rebuilt memo is hit from now on; no further warnings
+      assert_equal([1, 2], pr.refined(M).call(1, k: 2))
+      assert_equal(1, $warned.grep(/ruby2_keywords/).size)
+    RUBY
+  end
+
+  def test_refined_ruby2_keywords_does_not_leak_to_siblings
+    # Proc#ruby2_keywords on a refined Proc marks a copy of its own, since its
+    # block may be the memoized copy shared with sibling Procs, or, before the
+    # first call, the source block itself.
+    assert_separately([], <<~'RUBY')
+      module M; refine(String) { def shout = upcase + "!" }; end
+      Warning[:performance] = true
+      $warned = []
+      def Warning.warn(msg, category: nil) = $warned << msg
+      target = ->(a, k: nil) { [a, k] }
+      pr = proc { |*args| target.call(*args) }
+      q1 = pr.refined(M)
+      q2 = pr.refined(M)
+      q1.call(1); q2.call(1) # both run the memoized copy
+      q1.ruby2_keywords
+      assert_equal([1, 2], q1.call(1, k: 2))
+      assert_raise(ArgumentError) { q2.call(1, k: 2) }
+      assert_raise(ArgumentError) { pr.call(1, k: 2) }
+      # the memoized copy is untouched, so new procs neither warn nor delegate
+      $warned.clear
+      assert_raise(ArgumentError) { pr.refined(M).call(1, k: 2) }
+      assert_equal([], $warned)
+      # likewise before the first call: the mark must not reach the source
+      r1 = pr.refined(M)
+      r1.ruby2_keywords
+      assert_equal([1, 2], r1.call(1, k: 2))
+      assert_raise(ArgumentError) { pr.call(1, k: 2) }
+    RUBY
+  end
+
+  def test_refined_memo_distinct_environments
+    # Procs sharing the same block iseq but capturing different closure
+    # environments hit the same memo entry (env is not part of the key), yet each
+    # result must keep its own environment.
+    factory = ->(tag) { ->(s) { "#{tag}:#{s.shout}" } }
+    p1 = factory.call("A")
+    p2 = factory.call("B")
+    r1 = p1.refined(RefinementsModule)
+    r2 = p2.refined(RefinementsModule)
+    assert_equal("A:X!", r1.call("x"))
+    assert_equal("B:Y!", r2.call("y"))
+    # the original closures still see their own captured tag too
+    assert_equal("A:X!", r1.call("x"))
+  end
+
+  def test_refined_memo_avoids_recopy
+    orig = ->(s) { s.shout }
+    orig.refined(RefinementsModule).call("hi") # warm the memo
+    GC.disable
+    begin
+      before = GC.stat(:total_allocated_objects)
+      100.times { orig.refined(RefinementsModule).call("hi") }
+      hits = GC.stat(:total_allocated_objects) - before
+
+      before = GC.stat(:total_allocated_objects)
+      100.times do |i|
+        orig.refined(i.even? ? RefinementsModule : RefinementsModule2).call("hi")
+      end
+      misses = GC.stat(:total_allocated_objects) - before
+    ensure
+      GC.enable
+    end
+    # Memo hits must allocate far less than recomputing the iseq copy each time.
+    assert_operator(misses, :>, hits * 2,
+                    "expected memo hits (#{hits}) to allocate much less than misses (#{misses})")
+  end
+
+  def test_refined_memo_different_modules_warning
+    assert_separately([], <<~'RUBY')
+      module M1; refine(String) { def shout = "1" }; end
+      module M2; refine(String) { def shout = "2" }; end
+      Warning[:performance] = true
+      $warned = []
+      def Warning.warn(msg, category: nil) = $warned << msg
+      pr = ->(s) { s.shout }
+      pr.refined(M1).call("hi")
+      pr.refined(M2).call("hi") # evicts the M1 entry
+      assert_equal(1, $warned.grep(/different modules/).size)
+      # nothing is memoized until the copy is made, so creating the procs
+      # without calling them warns about nothing
+      $warned.clear
+      pr.refined(M1)
+      pr.refined(M2)
+      assert_equal([], $warned)
+    RUBY
+  end
+
+  def test_refined_memo_shared_by_procs_built_before_first_call
+    # Procs built before any of them ran hold equal but distinct recipes; the
+    # first call must still share one copy among them, without the
+    # different-modules warning.
+    assert_separately([], <<~'RUBY')
+      module M1; refine(String) { def shout = "1" }; end
+      Warning[:performance] = true
+      $warned = []
+      def Warning.warn(msg, category: nil) = $warned << msg
+      pr = ->(s) { s.shout }
+      procs = 5.times.map { pr.refined(M1) }
+      procs.each { |q| assert_equal("1", q.call("hi")) }
+      assert_equal([], $warned)
+    RUBY
+  end
+
+  def test_refined_chain_memoized
+    # A chain is memoized as a whole: the recipe of the last link carries the
+    # modules of all of them, so it shares its memo entry with a single call of
+    # the same modules, and repeating the chain hits it.
+    assert_separately([], <<~'RUBY')
+      module M1; refine(String) { def shout = upcase }; end
+      module M2; refine(Integer) { def dbl = self * 2 }; end
+      Warning[:performance] = true
+      $warned = []
+      def Warning.warn(msg, category: nil) = $warned << msg
+      pr = ->(s, i) { [s.shout, i.dbl] }
+      3.times { assert_equal(["A", 2], pr.refined(M1).refined(M2).call("a", 1)) }
+      assert_equal(["A", 2], pr.refined(M1, M2).call("a", 1))
+      assert_equal([], $warned)
+    RUBY
+  end
+
+  def test_refined_chain_warning
+    # Only a block that is already a copy is left out of the memo.
+    assert_separately([], <<~'RUBY')
+      module M1; refine(String) { def shout = "1" }; end
+      module M2; refine(String) { def shout = "2" }; end
+      Warning[:performance] = true
+      $warned = []
+      def Warning.warn(msg, category: nil) = $warned << msg
+      pr = ->(s) { s.shout }
+      p1 = pr.refined(M1)
+      p1.refined(M2)
+      assert_equal([], $warned)
+      p1.call("hi") # p1 now runs its copy
+      assert_equal("2", p1.refined(M2).call("hi"))
+      assert_equal(1, $warned.grep(/already copied/).size)
+    RUBY
+  end
+
+  def test_refined_memo_survives_gc
+    assert_separately([], <<~'RUBY')
+      module M; refine(String) { def shout = upcase + "!" }; end
+      pr = ->(s) { [1].each { }; s.shout }
+      # the memo lives as long as its source iseq, so the copy stays
+      # memoized even when no refined proc survives the GC
+      pr.refined(M)
+      GC.start
+      assert_equal("HI!", pr.refined(M).call("hi"))
+      rp = pr.refined(M)
+      GC.start
+      assert_equal("HI!", rp.call("hi"))
+      assert_equal("HI!", pr.refined(M).call("hi"))
+    RUBY
+  end
+
+  def test_refined_memo_gc_compact
+    assert_separately([], <<~'RUBY')
+      module M; refine(String) { def shout = upcase + "!" }; end
+      pr = ->(s) { [1].each { }; s.shout }
+      rp = pr.refined(M)
+      begin
+        GC.compact
+      rescue NotImplementedError
+        omit "GC compaction not supported on this platform"
+      end
+      assert_equal("HI!", rp.call("hi"))
+      assert_equal("HI!", pr.refined(M).call("hi"))
+    RUBY
+  end
+
+  def test_refined_memo_survives_compaction
+    # the memo is a hidden identity Hash: its keys (source iseqs) are pinned,
+    # while its values (copied iseqs, crefs) move and must be updated correctly
+    assert_separately([], <<~'RUBY')
+      omit "compaction unsupported" unless GC.respond_to?(:verify_compaction_references)
+      module M; refine(String) { def shout = upcase + "!" }; end
+      blocks = eval("[" + (["->(s) { s.shout }"] * 500).join(",\n") + "]")
+      kept = blocks.map { |b| b.refined(M) }
+      begin
+        GC.verify_compaction_references(expand_heap: true, toward: :empty)
+      rescue NotImplementedError
+        omit "compaction unsupported on this platform"
+      end
+      kept.each { |r| assert_equal("HI!", r.call("hi")) }
+      blocks.each { |b| assert_equal("HI!", b.refined(M).call("hi")) }
+      GC.compact
+      blocks.each { |b| assert_equal("HI!", b.refined(M).call("hi")) }
+    RUBY
+  end
+
+  def test_refined_rescue_ensure
+    # exercises the copied catch table and shared rescue local table
+    refined = ->(s) {
+      r = nil
+      begin
+        r = s.shout
+      rescue NoMethodError
+        r = "rescued"
+      ensure
+        r = "#{r}."
+      end
+      r
+    }.refined(RefinementsModule)
+    assert_equal("YO!.", refined.call("yo"))
+  end
+
+  def test_refined_def_in_block
+    # a literal def inside the block creates a nested method iseq whose
+    # local_iseq is itself (in-subtree); the copy must rebuild it.
+    # Specified behavior: like a def inside a `using` scope, a method defined
+    # inside the block sees the refinements (the def captures the block's
+    # cref), so the refinement also applies when the method is called later.
+    refined = ->(s) {
+      o = Object.new
+      def o.m = "hi".shout
+      [s.shout, o.m]
+    }.refined(RefinementsModule)
+    assert_equal(["YO!", "HI!"], refined.call("yo"))
+  end
+
+  def test_refined_keyword_and_optional_args
+    refined = ->(a, b = "z", c:, d: "w") {
+      [a, b, c, d].map(&:shout).join
+    }.refined(RefinementsModule)
+    assert_equal("A!Z!C!W!", refined.call("a", c: "c"))
+    assert_equal("A!B!C!D!", refined.call("a", "b", c: "c", d: "d"))
+  end
+
+  def test_refined_case_when_literal
+    # literal when-clauses compile to a CDHASH operand that must round-trip
+    refined = ->(s) {
+      case s.shout
+      when "A!" then 1
+      when "B!" then 2
+      else 0
+      end
+    }.refined(RefinementsModule)
+    assert_equal(1, refined.call("a"))
+    assert_equal(2, refined.call("b"))
+    assert_equal(0, refined.call("c"))
+  end
+
+  def test_refined_flip_flop
+    # flip-flop allocates a special-variable slot keyed off the local iseq;
+    # the copy must run its own flip state independent of the original
+    body = ->(arr) {
+      out = []
+      arr.each { |i| out << i if (i == 2)..(i == 4) }
+      out
+    }
+    refined = body.refined(RefinementsModule)
+    assert_equal([2, 3, 4], refined.call([1, 2, 3, 4, 5]))
+    # a second call starts from a fresh flip state
+    assert_equal([2, 3, 4], refined.call([1, 2, 3, 4, 5]))
+  end
+
+  def test_refined_preserves_location_and_parameters
+    orig = ->(a, b = 1, *c, d:, **e, &f) { a }
+    refined = orig.refined(RefinementsModule)
+    assert_equal(orig.source_location, refined.source_location)
+    assert_equal(orig.parameters, refined.parameters)
+    assert_equal(orig.arity, refined.arity)
+  end
+
+  module RefinementsOperators
+    refine Integer do
+      def +(other) = "plus(#{self},#{other})"
+      def <(other) = "lt"
+    end
+    refine Array do
+      def [](i) = "at#{i}"
+    end
+  end
+
+  def test_refined_operators
+    # Specialized instructions (opt_plus, opt_lt, opt_aref, ...) must honor the
+    # refinement on the copy without leaking it into the original Proc.
+    refined = ->(a, b) { [a + b, a < b] }.refined(RefinementsOperators)
+    assert_equal(["plus(1,2)", "lt"], refined.call(1, 2))
+    aref = ->(a) { a[0] }.refined(RefinementsOperators)
+    assert_equal("at0", aref.call([9]))
+    # the original Procs keep using the builtin operators
+    assert_equal(3, ->(a, b) { a + b }.call(1, 2))
+  end
+
+  def test_refined_preserves_lambda
+    # The copy must keep the receiver's lambda/proc nature, including a lambda's
+    # strict argument checking.
+    lam = ->(a, b) { [a, b] }.refined(RefinementsModule)
+    assert_equal(true, lam.lambda?)
+    assert_raise(ArgumentError) { lam.call(1) }
+    pr = proc { |a, b| [a, b] }.refined(RefinementsModule)
+    assert_equal(false, pr.lambda?)
+    # proc argument handling fills missing parameters with nil instead of raising
+    assert_equal([1, nil], pr.call(1))
+  end
+
+  def test_refined_preserved_by_clone
+    refined = ->(s) { s.shout }.refined(RefinementsModule)
+    assert_equal("Z!", refined.clone.call("z"))
+  end
+
+  def test_refined_module_precedence
+    # When several modules refine the same method, the last one wins, matching
+    # the precedence of nested `using`.
+    body = ->(s) { s.shout }
+    assert_equal("?", body.refined(RefinementsModule, RefinementsModule2).call("Hi"))
+    assert_equal("HI!", body.refined(RefinementsModule2, RefinementsModule).call("Hi"))
+  end
+
+  class RefinementsSuperBase
+    def greet = "base"
+  end
+
+  module RefinementsSuperModule
+    refine RefinementsSuperBase do
+      def greet = "ref-" + super
+    end
+  end
+
+  def test_refined_super
+    # A refined method may call super to reach the method it refines.
+    refined = ->(o) { o.greet }.refined(RefinementsSuperModule)
+    assert_equal("ref-base", refined.call(RefinementsSuperBase.new))
+  end
+
+  def test_refined_tracepoint
+    # Line events fire on the copied iseq just like on the original.
+    src = "->(s) {\n  x = s.shout\n  x\n}"
+    refined = eval(src, binding, "wr_trace_eval").refined(RefinementsModule)
+    lines = []
+    tp = TracePoint.new(:line) { |t| lines << t.lineno if t.path == "wr_trace_eval" }
+    result = tp.enable { refined.call("hi") }
+    assert_equal("HI!", result)
+    assert_equal([2, 3], lines)
+  end
+
+  def test_refined_recursion_sees_refinements
+    # The copy shares the source Proc's environment, so a recursive call through
+    # the captured local reaches the refined Proc and keeps the refinements.
+    fact = nil
+    fact = ->(s) { s.empty? ? "" : s[0].shout + fact.call(s[1..]) }
+              .refined(RefinementsModule)
+    assert_equal("A!B!C!", fact.call("abc"))
+  end
+
+  def test_clone_subclass
+    c1 = Class.new(Proc)
+    assert_equal c1, c1.new{}.clone.class, '[Bug #17545]'
+    c1 = Class.new(Proc) {def initialize_clone(*) throw :initialize_clone; end}
+    assert_throw(:initialize_clone) {c1.new{}.clone}
   end
 
   def test_binding
@@ -438,6 +1328,11 @@ class TestProc < Test::Unit::TestCase
     file, lineno = method(:source_location_test).to_proc.binding.source_location
     assert_match(/^#{ Regexp.quote(__FILE__) }$/, file)
     assert_equal(@@line_of_source_location_test, lineno, 'Bug #2427')
+  end
+
+  def test_binding_error_unless_ruby_frame
+    define_singleton_method :binding_from_c!, method(:binding).to_proc >> ->(bndg) {bndg}
+    assert_raise(RuntimeError) { binding_from_c! }
   end
 
   def test_proc_lambda
@@ -847,6 +1742,88 @@ class TestProc < Test::Unit::TestCase
     assert_equal [[1, 2], Proc, :x], (pr.call(1, 2){|x| x})
   end
 
+  def test_proc_args_single_kw_no_autosplat
+    pr = proc {|c, a: 1| [c, a] }
+    assert_equal [nil, 1], pr.call()
+    assert_equal [1, 1], pr.call(1)
+    assert_equal [[1], 1], pr.call([1])
+    assert_equal [1, 1], pr.call(1,2)
+    assert_equal [[1, 2], 1], pr.call([1,2])
+
+    assert_equal [nil, 3], pr.call(a: 3)
+    assert_equal [1, 3], pr.call(1, a: 3)
+    assert_equal [[1], 3], pr.call([1], a: 3)
+    assert_equal [1, 3], pr.call(1,2, a: 3)
+    assert_equal [[1, 2], 3], pr.call([1,2], a: 3)
+  end
+
+  def test_proc_args_single_kwsplat_no_autosplat
+    pr = proc {|c, **kw| [c, kw] }
+    assert_equal [nil, {}], pr.call()
+    assert_equal [1, {}], pr.call(1)
+    assert_equal [[1], {}], pr.call([1])
+    assert_equal [1, {}], pr.call(1,2)
+    assert_equal [[1, 2], {}], pr.call([1,2])
+
+    assert_equal [nil, {a: 3}], pr.call(a: 3)
+    assert_equal [1, {a: 3}], pr.call(1, a: 3)
+    assert_equal [[1], {a: 3}], pr.call([1], a: 3)
+    assert_equal [1, {a: 3}], pr.call(1,2, a: 3)
+    assert_equal [[1, 2], {a: 3}], pr.call([1,2], a: 3)
+  end
+
+  def test_proc_args_multiple_kw_autosplat
+    pr = proc {|c, b, a: 1| [c, b, a] }
+    assert_equal [1, 2, 1], pr.call([1,2])
+
+    pr = proc {|c=nil, b=nil, a: 1| [c, b, a] }
+    assert_equal [nil, nil, 1], pr.call([])
+    assert_equal [1, nil, 1], pr.call([1])
+    assert_equal [1, 2, 1], pr.call([1,2])
+
+    pr = proc {|c, b=nil, a: 1| [c, b, a] }
+    assert_equal [1, nil, 1], pr.call([1])
+    assert_equal [1, 2, 1], pr.call([1,2])
+
+    pr = proc {|c=nil, b, a: 1| [c, b, a] }
+    assert_equal [nil, 1, 1], pr.call([1])
+    assert_equal [1, 2, 1], pr.call([1,2])
+
+    pr = proc {|c, *b, a: 1| [c, b, a] }
+    assert_equal [1, [], 1], pr.call([1])
+    assert_equal [1, [2], 1], pr.call([1,2])
+
+    pr = proc {|*c, b, a: 1| [c, b, a] }
+    assert_equal [[], 1, 1], pr.call([1])
+    assert_equal [[1], 2, 1], pr.call([1,2])
+  end
+
+  def test_proc_args_multiple_kwsplat_autosplat
+    pr = proc {|c, b, **kw| [c, b, kw] }
+    assert_equal [1, 2, {}], pr.call([1,2])
+
+    pr = proc {|c=nil, b=nil, **kw| [c, b, kw] }
+    assert_equal [nil, nil, {}], pr.call([])
+    assert_equal [1, nil, {}], pr.call([1])
+    assert_equal [1, 2, {}], pr.call([1,2])
+
+    pr = proc {|c, b=nil, **kw| [c, b, kw] }
+    assert_equal [1, nil, {}], pr.call([1])
+    assert_equal [1, 2, {}], pr.call([1,2])
+
+    pr = proc {|c=nil, b, **kw| [c, b, kw] }
+    assert_equal [nil, 1, {}], pr.call([1])
+    assert_equal [1, 2, {}], pr.call([1,2])
+
+    pr = proc {|c, *b, **kw| [c, b, kw] }
+    assert_equal [1, [], {}], pr.call([1])
+    assert_equal [1, [2], {}], pr.call([1,2])
+
+    pr = proc {|*c, b, **kw| [c, b, kw] }
+    assert_equal [[], 1, {}], pr.call([1])
+    assert_equal [[1], 2, {}], pr.call([1,2])
+  end
+
   def test_proc_args_only_rest
     pr = proc {|*c| c }
     assert_equal [], pr.call()
@@ -1219,7 +2196,8 @@ class TestProc < Test::Unit::TestCase
     assert_equal([[:opt, :a], [:rest, :b], [:opt, :c]], proc {|a, *b, c|}.parameters)
     assert_equal([[:opt, :a], [:rest, :b], [:opt, :c], [:block, :d]], proc {|a, *b, c, &d|}.parameters)
     assert_equal([[:opt, :a], [:opt, :b], [:rest, :c], [:opt, :d], [:block, :e]], proc {|a, b=:b, *c, d, &e|}.parameters)
-    assert_equal([[:opt, nil], [:block, :b]], proc {|(a), &b|a}.parameters)
+    assert_equal([[:opt], [:block, :b]], proc {|(a), &b|a}.parameters)
+    assert_equal([[:opt], [:rest, :_], [:opt]], proc {|(a_), *_, (b_)|}.parameters)
     assert_equal([[:opt, :a], [:opt, :b], [:opt, :c], [:opt, :d], [:rest, :e], [:opt, :f], [:opt, :g], [:block, :h]], proc {|a,b,c=:c,d=:d,*e,f,g,&h|}.parameters)
 
     assert_equal([[:req]], method(:putc).parameters)
@@ -1227,6 +2205,59 @@ class TestProc < Test::Unit::TestCase
 
     pr = eval("proc{|"+"(_),"*30+"|}")
     assert_empty(pr.parameters.map{|_,n|n}.compact)
+
+    assert_equal([[:opt]], proc { it }.parameters)
+  end
+
+  def test_proc_autosplat_with_multiple_args_with_ruby2_keywords_splat_bug_19759
+    def self.yielder_ab(splat)
+      yield([:a, :b], *splat)
+    end
+
+    res = yielder_ab([[:aa, :bb], Hash.ruby2_keywords_hash({k: :k})]) do |a, b, k:|
+      [a, b, k]
+    end
+    assert_equal([[:a, :b], [:aa, :bb], :k], res)
+
+    def self.yielder(splat)
+      yield(*splat)
+    end
+    res = yielder([ [:a, :b] ]){|a, b, **| [a, b]}
+    assert_equal([:a, :b], res)
+
+    res = yielder([ [:a, :b], Hash.ruby2_keywords_hash({}) ]){|a, b, **| [a, b]}
+    assert_equal([[:a, :b], nil], res)
+
+    res = yielder([ [:a, :b], Hash.ruby2_keywords_hash({c: 1}) ]){|a, b, **| [a, b]}
+    assert_equal([[:a, :b], nil], res)
+
+    res = yielder([ [:a, :b], Hash.ruby2_keywords_hash({}) ]){|a, b, **nil| [a, b]}
+    assert_equal([[:a, :b], nil], res)
+  end
+
+  def test_parameters_lambda
+    assert_equal([], proc {}.parameters(lambda: true))
+    assert_equal([], proc {||}.parameters(lambda: true))
+    assert_equal([[:req, :a]], proc {|a|}.parameters(lambda: true))
+    assert_equal([[:req, :a], [:req, :b]], proc {|a, b|}.parameters(lambda: true))
+    assert_equal([[:opt, :a], [:block, :b]], proc {|a=:a, &b|}.parameters(lambda: true))
+    assert_equal([[:req, :a], [:opt, :b]], proc {|a, b=:b|}.parameters(lambda: true))
+    assert_equal([[:rest, :a]], proc {|*a|}.parameters(lambda: true))
+    assert_equal([[:req, :a], [:rest, :b], [:block, :c]], proc {|a, *b, &c|}.parameters(lambda: true))
+    assert_equal([[:req, :a], [:rest, :b], [:req, :c]], proc {|a, *b, c|}.parameters(lambda: true))
+    assert_equal([[:req, :a], [:rest, :b], [:req, :c], [:block, :d]], proc {|a, *b, c, &d|}.parameters(lambda: true))
+    assert_equal([[:req, :a], [:opt, :b], [:rest, :c], [:req, :d], [:block, :e]], proc {|a, b=:b, *c, d, &e|}.parameters(lambda: true))
+    assert_equal([[:req], [:block, :b]], proc {|(a), &b|a}.parameters(lambda: true))
+    assert_equal([[:req, :a], [:req, :b], [:opt, :c], [:opt, :d], [:rest, :e], [:req, :f], [:req, :g], [:block, :h]], proc {|a,b,c=:c,d=:d,*e,f,g,&h|}.parameters(lambda: true))
+
+    pr = eval("proc{|"+"(_),"*30+"|}")
+    assert_empty(pr.parameters(lambda: true).map{|_,n|n}.compact)
+
+    assert_equal([[:opt, :a]], lambda {|a|}.parameters(lambda: false))
+    assert_equal([[:opt, :a], [:opt, :b], [:opt, :c], [:opt, :d], [:rest, :e], [:opt, :f], [:opt, :g], [:block, :h]], lambda {|a,b,c=:c,d=:d,*e,f,g,&h|}.parameters(lambda: false))
+
+    assert_equal([[:req]], proc { it }.parameters(lambda: true))
+    assert_equal([[:opt]], lambda { it }.parameters(lambda: false))
   end
 
   def pm0() end
@@ -1261,7 +2292,7 @@ class TestProc < Test::Unit::TestCase
     assert_equal([[:req, :a], [:rest, :b], [:req, :c], [:block, :d]], method(:pmo6).to_proc.parameters)
     assert_equal([[:req, :a], [:opt, :b], [:rest, :c], [:req, :d], [:block, :e]], method(:pmo7).to_proc.parameters)
     assert_equal([[:req], [:block, :b]], method(:pma1).to_proc.parameters)
-    assert_equal([[:keyrest]], method(:pmk1).to_proc.parameters)
+    assert_equal([[:keyrest, :**]], method(:pmk1).to_proc.parameters)
     assert_equal([[:keyrest, :o]], method(:pmk2).to_proc.parameters)
     assert_equal([[:req, :a], [:keyrest, :o]], method(:pmk3).to_proc.parameters)
     assert_equal([[:opt, :a], [:keyrest, :o]], method(:pmk4).to_proc.parameters)
@@ -1416,6 +2447,10 @@ class TestProc < Test::Unit::TestCase
     assert_equal(3, b.local_variable_get(:when))
     assert_equal(4, b.local_variable_get(:begin))
     assert_equal(5, b.local_variable_get(:end))
+
+    assert_raise_with_message(NameError, /local variable \Wdefault\W/) {
+      binding.local_variable_get(:default)
+    }
   end
 
   def test_local_variable_set
@@ -1426,6 +2461,274 @@ class TestProc < Test::Unit::TestCase
     assert_equal(20, b.local_variable_get(:b))
     assert_equal(10, b.eval("a"))
     assert_equal(20, b.eval("b"))
+  end
+
+  def test_numparam_is_not_local_variables
+    "foo".tap do
+      _9 and flunk
+      assert_equal([], binding.local_variables)
+      assert_raise(NameError) { binding.local_variable_get(:_9) }
+      assert_raise(NameError) { binding.local_variable_set(:_9, 1) }
+      assert_raise(NameError) { binding.local_variable_defined?(:_9) }
+      "bar".tap do
+        assert_equal([], binding.local_variables)
+        assert_raise(NameError) { binding.local_variable_get(:_9) }
+        assert_raise(NameError) { binding.local_variable_set(:_9, 1) }
+        assert_raise(NameError) { binding.local_variable_defined?(:_9) }
+      end
+      assert_equal([], binding.local_variables)
+      assert_raise(NameError) { binding.local_variable_get(:_9) }
+      assert_raise(NameError) { binding.local_variable_set(:_9, 1) }
+      assert_raise(NameError) { binding.local_variable_defined?(:_9) }
+    end
+
+    "foo".tap do
+      assert_equal([], binding.local_variables)
+      assert_raise(NameError) { binding.local_variable_get(:_9) }
+      assert_raise(NameError) { binding.local_variable_set(:_9, 1) }
+      assert_raise(NameError) { binding.local_variable_defined?(:_9) }
+      "bar".tap do
+        _9 and flunk
+        assert_equal([], binding.local_variables)
+        assert_raise(NameError) { binding.local_variable_get(:_9) }
+        assert_raise(NameError) { binding.local_variable_set(:_9, 1) }
+        assert_raise(NameError) { binding.local_variable_defined?(:_9) }
+      end
+      assert_equal([], binding.local_variables)
+      assert_raise(NameError) { binding.local_variable_get(:_9) }
+      assert_raise(NameError) { binding.local_variable_set(:_9, 1) }
+      assert_raise(NameError) { binding.local_variable_defined?(:_9) }
+    end
+  end
+
+  def test_implicit_parameters_for_numparams
+    x = x = 1
+    assert_raise(NameError) { binding.implicit_parameter_get(:x) }
+    assert_raise(NameError) { binding.implicit_parameter_defined?(:x) }
+
+    "foo".tap do
+      _5 and flunk
+      assert_equal([:_1, :_2, :_3, :_4, :_5], binding.implicit_parameters)
+      assert_equal("foo", binding.implicit_parameter_get(:_1))
+      assert_equal(nil, binding.implicit_parameter_get(:_5))
+      assert_raise(NameError) { binding.implicit_parameter_get(:_6) }
+      assert_raise(NameError) { binding.implicit_parameter_get(:it) }
+      assert_equal(true, binding.implicit_parameter_defined?(:_1))
+      assert_equal(true, binding.implicit_parameter_defined?(:_5))
+      assert_equal(false, binding.implicit_parameter_defined?(:_6))
+      assert_equal(false, binding.implicit_parameter_defined?(:it))
+      "bar".tap do
+        assert_equal([], binding.implicit_parameters)
+        assert_raise(NameError) { binding.implicit_parameter_get(:_1) }
+        assert_raise(NameError) { binding.implicit_parameter_get(:_6) }
+        assert_raise(NameError) { binding.implicit_parameter_get(:it) }
+        assert_equal(false, binding.implicit_parameter_defined?(:_1))
+        assert_equal(false, binding.implicit_parameter_defined?(:_6))
+        assert_equal(false, binding.implicit_parameter_defined?(:it))
+      end
+      assert_equal([:_1, :_2, :_3, :_4, :_5], binding.implicit_parameters)
+      assert_equal("foo", binding.implicit_parameter_get(:_1))
+      assert_equal(nil, binding.implicit_parameter_get(:_5))
+      assert_raise(NameError) { binding.implicit_parameter_get(:_6) }
+      assert_raise(NameError) { binding.implicit_parameter_get(:it) }
+      assert_equal(true, binding.implicit_parameter_defined?(:_1))
+      assert_equal(true, binding.implicit_parameter_defined?(:_5))
+      assert_equal(false, binding.implicit_parameter_defined?(:_6))
+      assert_equal(false, binding.implicit_parameter_defined?(:it))
+    end
+
+    "foo".tap do
+      assert_equal([], binding.implicit_parameters)
+      assert_raise(NameError) { binding.implicit_parameter_get(:_1) }
+      assert_raise(NameError) { binding.implicit_parameter_get(:_6) }
+      assert_equal(false, binding.implicit_parameter_defined?(:_1))
+      assert_equal(false, binding.implicit_parameter_defined?(:_6))
+      assert_equal(false, binding.implicit_parameter_defined?(:it))
+      "bar".tap do
+        _5 and flunk
+        assert_equal([:_1, :_2, :_3, :_4, :_5], binding.implicit_parameters)
+        assert_equal("bar", binding.implicit_parameter_get(:_1))
+        assert_equal(nil, binding.implicit_parameter_get(:_5))
+        assert_raise(NameError) { binding.implicit_parameter_get(:_6) }
+        assert_raise(NameError) { binding.implicit_parameter_get(:it) }
+        assert_equal(true, binding.implicit_parameter_defined?(:_1))
+        assert_equal(true, binding.implicit_parameter_defined?(:_5))
+        assert_equal(false, binding.implicit_parameter_defined?(:_6))
+        assert_equal(false, binding.implicit_parameter_defined?(:it))
+      end
+      assert_equal([], binding.implicit_parameters)
+      assert_raise(NameError) { binding.implicit_parameter_get(:_1) }
+      assert_raise(NameError) { binding.implicit_parameter_get(:_6) }
+      assert_equal(false, binding.implicit_parameter_defined?(:_1))
+      assert_equal(false, binding.implicit_parameter_defined?(:_6))
+      assert_equal(false, binding.implicit_parameter_defined?(:it))
+    end
+  end
+
+  def test_it_is_not_local_variable
+    "foo".tap do
+      it
+      assert_equal([], binding.local_variables)
+      assert_raise(NameError) { binding.local_variable_get(:it) }
+      assert_equal(false, binding.local_variable_defined?(:it))
+      "bar".tap do
+        assert_equal([], binding.local_variables)
+        assert_raise(NameError) { binding.local_variable_get(:it) }
+        assert_equal(false, binding.local_variable_defined?(:it))
+      end
+      assert_equal([], binding.local_variables)
+      assert_raise(NameError) { binding.local_variable_get(:it) }
+      assert_equal(false, binding.local_variable_defined?(:it))
+      "bar".tap do
+        it
+        assert_equal([], binding.local_variables)
+        assert_raise(NameError) { binding.local_variable_get(:it) }
+        assert_equal(false, binding.local_variable_defined?(:it))
+      end
+      assert_equal([], binding.local_variables)
+      assert_raise(NameError) { binding.local_variable_get(:it) }
+      assert_equal(false, binding.local_variable_defined?(:it))
+    end
+
+    "foo".tap do
+      assert_equal([], binding.local_variables)
+      assert_raise(NameError) { binding.local_variable_get(:it) }
+      assert_equal(false, binding.local_variable_defined?(:it))
+      "bar".tap do
+        it
+        assert_equal([], binding.local_variables)
+        assert_raise(NameError) { binding.local_variable_get(:it) }
+        assert_equal(false, binding.local_variable_defined?(:it))
+      end
+      assert_equal([], binding.local_variables)
+      assert_raise(NameError) { binding.local_variable_get(:it) }
+      assert_equal(false, binding.local_variable_defined?(:it))
+    end
+  end
+
+  def test_implicit_parameters_for_it
+    "foo".tap do
+      it or flunk
+      assert_equal([:it], binding.implicit_parameters)
+      assert_equal("foo", binding.implicit_parameter_get(:it))
+      assert_raise(NameError) { binding.implicit_parameter_get(:_1) }
+      assert_equal(true, binding.implicit_parameter_defined?(:it))
+      assert_equal(false, binding.implicit_parameter_defined?(:_1))
+      "bar".tap do
+        assert_equal([], binding.implicit_parameters)
+        assert_raise(NameError) { binding.implicit_parameter_get(:it) }
+        assert_raise(NameError) { binding.implicit_parameter_get(:_1) }
+        assert_equal(false, binding.implicit_parameter_defined?(:it))
+        assert_equal(false, binding.implicit_parameter_defined?(:_1))
+      end
+      assert_equal([:it], binding.implicit_parameters)
+      assert_equal("foo", binding.implicit_parameter_get(:it))
+      assert_raise(NameError) { binding.implicit_parameter_get(:_1) }
+      assert_equal(true, binding.implicit_parameter_defined?(:it))
+      assert_equal(false, binding.implicit_parameter_defined?(:_1))
+    end
+
+    "foo".tap do
+      assert_equal([], binding.implicit_parameters)
+      assert_raise(NameError) { binding.implicit_parameter_get(:it) }
+      assert_raise(NameError) { binding.implicit_parameter_get(:_1) }
+      assert_equal(false, binding.implicit_parameter_defined?(:it))
+      assert_equal(false, binding.implicit_parameter_defined?(:_1))
+      "bar".tap do
+        it or flunk
+        assert_equal([:it], binding.implicit_parameters)
+        assert_equal("bar", binding.implicit_parameter_get(:it))
+        assert_raise(NameError) { binding.implicit_parameter_get(:_1) }
+        assert_equal(true, binding.implicit_parameter_defined?(:it))
+        assert_equal(false, binding.implicit_parameter_defined?(:_1))
+      end
+      assert_equal([], binding.implicit_parameters)
+      assert_raise(NameError) { binding.implicit_parameter_get(:it) }
+      assert_raise(NameError) { binding.implicit_parameter_get(:_1) }
+      assert_equal(false, binding.implicit_parameter_defined?(:it))
+      assert_equal(false, binding.implicit_parameter_defined?(:_1))
+    end
+  end
+
+  def test_implicit_parameters_for_it_complex
+    "foo".tap do
+      it = it = "bar"
+
+      assert_equal([], binding.implicit_parameters)
+      assert_raise(NameError) { binding.implicit_parameter_get(:it) }
+      assert_equal(false, binding.implicit_parameter_defined?(:it))
+
+      assert_equal([:it], binding.local_variables)
+      assert_equal("bar", binding.local_variable_get(:it))
+      assert_equal(true, binding.local_variable_defined?(:it))
+    end
+
+    "foo".tap do
+      it or flunk
+
+      assert_equal([:it], binding.implicit_parameters)
+      assert_equal("foo", binding.implicit_parameter_get(:it))
+      assert_equal(true, binding.implicit_parameter_defined?(:it))
+
+      assert_equal([], binding.local_variables)
+      assert_raise(NameError) { binding.local_variable_get(:it) }
+      assert_equal(false, binding.local_variable_defined?(:it))
+    end
+
+    "foo".tap do
+      it or flunk
+      it = it = "bar"
+
+      assert_equal([:it], binding.implicit_parameters)
+      assert_equal("foo", binding.implicit_parameter_get(:it))
+      assert_equal(true, binding.implicit_parameter_defined?(:it))
+
+      assert_equal([:it], binding.local_variables)
+      assert_equal("bar", binding.local_variable_get(:it))
+      assert_equal(true, binding.local_variable_defined?(:it))
+    end
+  end
+
+  def test_implicit_parameters_for_it_and_numparams
+    "foo".tap do
+      it or flunk
+      "bar".tap do
+        _5 and flunk
+        assert_equal([:_1, :_2, :_3, :_4, :_5], binding.implicit_parameters)
+        assert_raise(NameError) { binding.implicit_parameter_get(:it) }
+        assert_equal("bar", binding.implicit_parameter_get(:_1))
+        assert_equal(nil, binding.implicit_parameter_get(:_5))
+        assert_raise(NameError) { binding.implicit_parameter_get(:_6) }
+        assert_equal(false, binding.implicit_parameter_defined?(:it))
+        assert_equal(true, binding.implicit_parameter_defined?(:_1))
+        assert_equal(true, binding.implicit_parameter_defined?(:_5))
+        assert_equal(false, binding.implicit_parameter_defined?(:_6))
+      end
+    end
+
+    "foo".tap do
+      _5 and flunk
+      "bar".tap do
+        it or flunk
+        assert_equal([:it], binding.implicit_parameters)
+        assert_equal("bar", binding.implicit_parameter_get(:it))
+        assert_raise(NameError) { binding.implicit_parameter_get(:_1) }
+        assert_raise(NameError) { binding.implicit_parameter_get(:_5) }
+        assert_raise(NameError) { binding.implicit_parameter_get(:_6) }
+        assert_equal(true, binding.implicit_parameter_defined?(:it))
+        assert_equal(false, binding.implicit_parameter_defined?(:_1))
+        assert_equal(false, binding.implicit_parameter_defined?(:_5))
+        assert_equal(false, binding.implicit_parameter_defined?(:_6))
+      end
+    end
+  end
+
+  def test_implicit_parameter_invalid_name
+    message_pattern = /is not an implicit parameter/
+    assert_raise_with_message(NameError, message_pattern) { binding.implicit_parameter_defined?(:foo) }
+    assert_raise_with_message(NameError, message_pattern) { binding.implicit_parameter_get(:foo) }
+    assert_raise_with_message(NameError, message_pattern) { binding.implicit_parameter_defined?("wrong_implicit_parameter_name_#{rand(10000)}") }
+    assert_raise_with_message(NameError, message_pattern) { binding.implicit_parameter_get("wrong_implicit_parameter_name_#{rand(10000)}") }
   end
 
   def test_local_variable_set_wb
@@ -1724,4 +3027,3 @@ class TestProcKeywords < Test::Unit::TestCase
     assert_raise(ArgumentError) { (f >> g).call(**{})[:a] }
   end
 end
-

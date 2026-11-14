@@ -1,6 +1,6 @@
 module URI
   # :stopdoc:
-  VERSION_CODE = '001100'.freeze
-  VERSION = VERSION_CODE.scan(/../).collect{|n| n.to_i}.join('.').freeze
+  VERSION = '1.1.2'.freeze
+  VERSION_CODE = VERSION.split('.').map{|s| s.rjust(2, '0')}.join.freeze
   # :startdoc:
 end

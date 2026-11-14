@@ -1,4 +1,5 @@
 # -*- encoding: utf-8 -*-
+# frozen_string_literal: false
 require_relative '../../spec_helper'
 require_relative 'fixtures/classes'
 
@@ -14,7 +15,7 @@ describe "String#delete" do
   end
 
   it "raises an ArgumentError when given no arguments" do
-    -> { "hell yeah".delete }.should raise_error(ArgumentError)
+    -> { "hell yeah".delete }.should.raise(ArgumentError)
   end
 
   it "negates sets starting with ^" do
@@ -53,31 +54,25 @@ describe "String#delete" do
     '哥哥我倒'.delete('哥').should == "我倒"
   end
 
-  it "respects backslash for escaping a -" do
+  it "respects backslash for escaping" do
     'Non-Authoritative Information'.delete(' \-\'').should ==
       'NonAuthoritativeInformation'
+    "a-b".delete("a\\-b").should == ""
+    "^".delete("\\^").should == ""
+    "\\".delete("\\\\").should == ""
   end
 
-  it "raises if the given ranges are invalid" do
+  it "raises an ArgumentError when the sequence is invalid" do
     not_supported_on :opal do
       xFF = [0xFF].pack('C')
       range = "\x00 - #{xFF}".force_encoding('utf-8')
-      -> { "hello".delete(range).should == "" }.should raise_error(ArgumentError)
+      -> { "hello".delete(range).should == "" }.should.raise(ArgumentError)
     end
-    -> { "hello".delete("h-e") }.should raise_error(ArgumentError)
-    -> { "hello".delete("^h-e") }.should raise_error(ArgumentError)
+    -> { "hello".delete("h-e") }.should.raise(ArgumentError)
+    -> { "hello".delete("^h-e") }.should.raise(ArgumentError)
   end
 
-  ruby_version_is ''...'2.7' do
-    it "taints result when self is tainted" do
-      "hello".taint.delete("e").should.tainted?
-      "hello".taint.delete("a-z").should.tainted?
-
-      "hello".delete("e".taint).should_not.tainted?
-    end
-  end
-
-  it "tries to convert each set arg to a string using to_str" do
+  it "tries to convert each argument to a string using to_str" do
     other_string = mock('lo')
     other_string.should_receive(:to_str).and_return("lo")
 
@@ -87,29 +82,30 @@ describe "String#delete" do
     "hello world".delete(other_string, other_string2).should == "hell wrld"
   end
 
-  it "raises a TypeError when one set arg can't be converted to a string" do
-    -> { "hello world".delete(100)       }.should raise_error(TypeError)
-    -> { "hello world".delete([])        }.should raise_error(TypeError)
-    -> { "hello world".delete(mock('x')) }.should raise_error(TypeError)
+  it "raises a TypeError when an argument can't be converted to a string" do
+    -> { "hello world".delete(100)       }.should.raise(TypeError)
+    -> { "hello world".delete([])        }.should.raise(TypeError)
+    -> { "hello world".delete(mock('x')) }.should.raise(TypeError)
   end
 
-  ruby_version_is ''...'3.0' do
-    it "returns subclass instances when called on a subclass" do
-      StringSpecs::MyString.new("oh no!!!").delete("!").should be_an_instance_of(StringSpecs::MyString)
-    end
+  it "returns String instances when called on a subclass" do
+    StringSpecs::MyString.new("oh no!!!").delete("!").should.instance_of?(String)
   end
 
-  ruby_version_is '3.0' do
-    it "returns String instances when called on a subclass" do
-      StringSpecs::MyString.new("oh no!!!").delete("!").should be_an_instance_of(String)
-    end
+  it "returns a String in the same encoding as self" do
+    "hello".encode("US-ASCII").delete("lo").encoding.should == Encoding::US_ASCII
+  end
+
+  it "raises an Encoding::CompatibilityError when the encodings are incompatible" do
+    -> { "hello".delete("e".encode("UTF-16LE")) }.should.raise(Encoding::CompatibilityError)
+    -> { "hello".encode("UTF-16LE").delete("e") }.should.raise(Encoding::CompatibilityError)
   end
 end
 
 describe "String#delete!" do
   it "modifies self in place and returns self" do
     a = "hello"
-    a.delete!("aeiou", "^e").should equal(a)
+    a.delete!("aeiou", "^e").should.equal?(a)
     a.should == "hell"
   end
 
@@ -123,7 +119,7 @@ describe "String#delete!" do
     a = "hello"
     a.freeze
 
-    -> { a.delete!("")            }.should raise_error(FrozenError)
-    -> { a.delete!("aeiou", "^e") }.should raise_error(FrozenError)
+    -> { a.delete!("")            }.should.raise(FrozenError)
+    -> { a.delete!("aeiou", "^e") }.should.raise(FrozenError)
   end
 end

@@ -1,0 +1,4 @@
+:a => 'a': | 1
+           ^ unexpected '|', expecting end-of-input
+           ^ unexpected '|', ignoring it
+

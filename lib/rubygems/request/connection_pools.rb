@@ -1,17 +1,18 @@
 # frozen_string_literal: true
 
 class Gem::Request::ConnectionPools # :nodoc:
-  @client = Net::HTTP
+  @client = Gem::Net::HTTP
 
   class << self
     attr_accessor :client
   end
 
-  def initialize(proxy_uri, cert_files)
+  def initialize(proxy_uri, cert_files, pool_size = 1)
     @proxy_uri  = proxy_uri
     @cert_files = cert_files
     @pools      = {}
     @pool_mutex = Thread::Mutex.new
+    @pool_size  = pool_size
   end
 
   def pool_for(uri)
@@ -20,15 +21,15 @@ class Gem::Request::ConnectionPools # :nodoc:
     @pool_mutex.synchronize do
       @pools[key] ||=
         if https? uri
-          Gem::Request::HTTPSPool.new(http_args, @cert_files, @proxy_uri)
+          Gem::Request::HTTPSPool.new(http_args, @cert_files, @proxy_uri, @pool_size)
         else
-          Gem::Request::HTTPPool.new(http_args, @cert_files, @proxy_uri)
+          Gem::Request::HTTPPool.new(http_args, @cert_files, @proxy_uri, @pool_size)
         end
     end
   end
 
   def close_all
-    @pools.each_value {|pool| pool.close_all }
+    @pools.each_value(&:close_all)
   end
 
   private
@@ -37,18 +38,24 @@ class Gem::Request::ConnectionPools # :nodoc:
   # Returns list of no_proxy entries (if any) from the environment
 
   def get_no_proxy_from_env
-    env_no_proxy = ENV['no_proxy'] || ENV['NO_PROXY']
+    env_no_proxy = ENV["no_proxy"] || ENV["NO_PROXY"]
 
-    return [] if env_no_proxy.nil? or env_no_proxy.empty?
+    return [] if env_no_proxy.nil? || env_no_proxy.empty?
 
     env_no_proxy.split(/\s*,\s*/)
   end
 
   def https?(uri)
-    uri.scheme.downcase == 'https'
+    uri.scheme.casecmp("https").zero?
   end
 
   def no_proxy?(host, env_no_proxy)
+    # A lone "*" entry bypasses the proxy for every host
+    return true if env_no_proxy.include?("*")
+
+    # A URI such as the typo "https:/host" has no host to match
+    return false if host.nil?
+
     host = host.downcase
 
     env_no_proxy.any? do |pattern|
@@ -78,10 +85,9 @@ class Gem::Request::ConnectionPools # :nodoc:
 
     no_proxy = get_no_proxy_from_env
 
-    if proxy_uri and not no_proxy?(hostname, no_proxy)
-      proxy_hostname = proxy_uri.respond_to?(:hostname) ? proxy_uri.hostname : proxy_uri.host
+    if proxy_uri && !no_proxy?(hostname, no_proxy)
       net_http_args + [
-        proxy_hostname,
+        proxy_uri.hostname,
         proxy_uri.port,
         Gem::UriFormatter.new(proxy_uri.user).unescape,
         Gem::UriFormatter.new(proxy_uri.password).unescape,

@@ -1,15 +1,15 @@
-# -*- encoding: binary -*-
+# encoding: binary
 describe :string_codepoints, shared: true do
   it "returns self" do
     s = "foo"
     result = s.send(@method) {}
-    result.should equal s
+    result.should.equal? s
   end
 
   it "raises an ArgumentError when self has an invalid encoding and a method is called on the returned Enumerator" do
-    s = "\xDF".force_encoding(Encoding::UTF_8)
-    s.valid_encoding?.should be_false
-    -> { s.send(@method).to_a }.should raise_error(ArgumentError)
+    s = "\xDF".dup.force_encoding(Encoding::UTF_8)
+    s.valid_encoding?.should == false
+    -> { s.send(@method).to_a }.should.raise(ArgumentError)
   end
 
   it "yields each codepoint to the block if one is given" do
@@ -21,14 +21,14 @@ describe :string_codepoints, shared: true do
   end
 
   it "raises an ArgumentError if self's encoding is invalid and a block is given" do
-    s = "\xDF".force_encoding(Encoding::UTF_8)
-    s.valid_encoding?.should be_false
-    -> { s.send(@method) { } }.should raise_error(ArgumentError)
+    s = "\xDF".dup.force_encoding(Encoding::UTF_8)
+    s.valid_encoding?.should == false
+    -> { s.send(@method) { } }.should.raise(ArgumentError)
   end
 
   it "yields codepoints as Integers" do
     "glark\u{20}".send(@method).to_a.each do |codepoint|
-      codepoint.should be_an_instance_of(Integer)
+      codepoint.should.instance_of?(Integer)
     end
   end
 
@@ -49,14 +49,19 @@ describe :string_codepoints, shared: true do
 
   it "round-trips to the original String using Integer#chr" do
     s = "\u{13}\u{7711}\u{1010}"
-    s2 = ""
+    s2 = +""
     s.send(@method) {|n| s2 << n.chr(Encoding::UTF_8)}
     s.should == s2
   end
 
   it "is synonymous with #bytes for Strings which are single-byte optimizable" do
     s = "(){}".encode('ascii')
-    s.ascii_only?.should be_true
+    s.ascii_only?.should == true
     s.send(@method).to_a.should == s.bytes.to_a
+  end
+
+  it "returns individual bytes for dummy encodings UTF-16 and UTF-32" do
+    "abcd".dup.force_encoding(Encoding::UTF_16).send(@method).to_a.should == [97, 98, 99, 100]
+    "abcd".dup.force_encoding(Encoding::UTF_32).send(@method).to_a.should == [97, 98, 99, 100]
   end
 end

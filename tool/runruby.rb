@@ -11,6 +11,8 @@ when ENV['RUNRUBY_USE_GDB'] == 'true'
   debugger = :gdb
 when ENV['RUNRUBY_USE_LLDB'] == 'true'
   debugger = :lldb
+when ENV['RUNRUBY_USE_RR'] == 'true'
+  debugger = :rr
 when ENV['RUNRUBY_YJIT_STATS']
   use_yjit_stat = true
 end
@@ -122,18 +124,36 @@ if e = ENV["RUBYLIB"]
 end
 env["RUBYLIB"] = $:.replace(libs).join(File::PATH_SEPARATOR)
 
+gem_path = [abs_archdir, srcdir].map {|d| File.realdirpath(".bundle", d)}
+if e = ENV["GEM_PATH"]
+ gem_path |= e.split(File::PATH_SEPARATOR)
+end
+env["GEM_PATH"] = gem_path.join(File::PATH_SEPARATOR)
+
 libruby_so = File.join(abs_archdir, config['LIBRUBY_SO'])
 if File.file?(libruby_so)
   if e = config['LIBPATHENV'] and !e.empty?
     env[e] = [abs_archdir, ENV[e]].compact.join(File::PATH_SEPARATOR)
   end
-  unless runner
-    if e = config['PRELOADENV']
-      e = nil if e.empty?
-      e ||= "LD_PRELOAD" if /linux/ =~ RUBY_PLATFORM
-    end
-    if e
-      env[e] = [libruby_so, ENV[e]].compact.join(File::PATH_SEPARATOR)
+end
+# Work around a bug in FreeBSD 13.2 which can cause fork(2) to hang
+# See: https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=271490
+env['LD_BIND_NOW'] = 'yes' if /freebsd/ =~ RUBY_PLATFORM
+
+# On Windows the freshly built ruby often has no usable default CA bundle (its
+# OpenSSL's OPENSSLDIR does not exist), which breaks HTTPS in tests such as
+# test-bundler. Fall back to whatever bundle baseruby (the installed ruby the
+# build was bootstrapped with, recorded in the fake script) resolves to: it may
+# point SSL_CERT_FILE at one on startup rather than rely on OPENSSLDIR.
+if /mswin|mingw/ =~ RUBY_PLATFORM and !ENV["SSL_CERT_FILE"] and !ENV["SSL_CERT_DIR"]
+  fake = File.join(abs_archdir, "#{config['arch']}-fake.rb")
+  if File.exist?(fake) and /^baseruby\s*=\s*"([^"\n]+)"/ =~ File.read(fake)
+    baseruby = $1
+    script = "f = ENV['SSL_CERT_FILE'] || OpenSSL::X509::DEFAULT_CERT_FILE; print f if File.exist?(f)"
+    begin
+      cert = IO.popen([baseruby, "-ropenssl", "-e", script], err: File::NULL, &:read)
+      env["SSL_CERT_FILE"] = cert if $?.success? and !cert.empty?
+    rescue SystemCallError
     end
   end
 end
@@ -142,11 +162,13 @@ ENV.update env
 
 if debugger
   case debugger
-  when :gdb, nil
-    debugger = %W'gdb -x #{srcdir}/.gdbinit'
+  when :gdb
+    debugger = %W'gdb'
     if File.exist?(gdb = 'run.gdb') or
       File.exist?(gdb = File.join(abs_archdir, 'run.gdb'))
       debugger.push('-x', gdb)
+    else
+      debugger.push('-x', "#{srcdir}/.gdbinit")
     end
     debugger << '--args'
   when :lldb
@@ -156,6 +178,8 @@ if debugger
       debugger.push('-s', lldb)
     end
     debugger << '--'
+  when :rr
+    debugger = ['rr', 'record']
   end
 
   if idx = precommand.index(:debugger)

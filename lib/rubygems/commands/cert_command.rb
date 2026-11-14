@@ -1,69 +1,73 @@
 # frozen_string_literal: true
-require_relative '../command'
-require_relative '../security'
+
+require_relative "../command"
+require_relative "../security"
 
 class Gem::Commands::CertCommand < Gem::Command
   def initialize
-    super 'cert', 'Manage RubyGems certificates and signing settings',
-          :add => [], :remove => [], :list => [], :build => [], :sign => []
+    super "cert", "Manage RubyGems certificates and signing settings",
+          add: [], remove: [], list: [], build: [], sign: []
 
-    add_option('-a', '--add CERT',
-               'Add a trusted certificate.') do |cert_file, options|
+    add_option("-a", "--add CERT",
+               "Add a trusted certificate.") do |cert_file, options|
       options[:add] << open_cert(cert_file)
     end
 
-    add_option('-l', '--list [FILTER]',
-               'List trusted certificates where the',
-               'subject contains FILTER') do |filter, options|
-      filter ||= ''
+    add_option("-l", "--list [FILTER]",
+               "List trusted certificates where the",
+               "subject contains FILTER") do |filter, options|
+      filter ||= ""
 
       options[:list] << filter
     end
 
-    add_option('-r', '--remove FILTER',
-               'Remove trusted certificates where the',
-               'subject contains FILTER') do |filter, options|
+    add_option("-r", "--remove FILTER",
+               "Remove trusted certificates where the",
+               "subject contains FILTER") do |filter, options|
       options[:remove] << filter
     end
 
-    add_option('-b', '--build EMAIL_ADDR',
-               'Build private key and self-signed',
-               'certificate for EMAIL_ADDR') do |email_address, options|
+    add_option("-b", "--build EMAIL_ADDR",
+               "Build private key and self-signed",
+               "certificate for EMAIL_ADDR") do |email_address, options|
       options[:build] << email_address
     end
 
-    add_option('-C', '--certificate CERT',
-               'Signing certificate for --sign') do |cert_file, options|
+    add_option("-C", "--certificate CERT",
+               "Signing certificate for --sign") do |cert_file, options|
       options[:issuer_cert] = open_cert(cert_file)
       options[:issuer_cert_file] = cert_file
     end
 
-    add_option('-K', '--private-key KEY',
-               'Key for --sign or --build') do |key_file, options|
+    add_option("-K", "--private-key KEY",
+               "Key for --sign or --build") do |key_file, options|
       options[:key] = open_private_key(key_file)
     end
 
-    add_option('-A', '--key-algorithm ALGORITHM',
-               'Select which key algorithm to use for --build') do |algorithm, options|
+    add_option("-A", "--key-algorithm ALGORITHM",
+               "Select key algorithm for --build from",
+               "RSA, DSA, EC, ML-DSA-44, ML-DSA-65,",
+               "or ML-DSA-87. Defaults to "\
+               "#{Gem::Security::DEFAULT_KEY_ALGORITHM}.") do |algorithm, options|
       options[:key_algorithm] = algorithm
     end
 
-    add_option('-s', '--sign CERT',
-               'Signs CERT with the key from -K',
-               'and the certificate from -C') do |cert_file, options|
+    add_option("-s", "--sign CERT",
+               "Signs CERT with the key from -K",
+               "and the certificate from -C") do |cert_file, options|
       raise Gem::OptionParser::InvalidArgument, "#{cert_file}: does not exist" unless
         File.file? cert_file
 
       options[:sign] << cert_file
     end
 
-    add_option('-d', '--days NUMBER_OF_DAYS',
-               'Days before the certificate expires') do |days, options|
+    add_option("-d", "--days NUMBER_OF_DAYS",
+               "Days before the certificate expires") do |days, options|
       options[:expiration_length_days] = days.to_i
     end
 
-    add_option('-R', '--re-sign',
-               'Re-signs the certificate from -C with the key from -K') do |resign, options|
+    add_option("-R", "--re-sign",
+               "Re-signs the certificate from -C with the key from -K") do |resign, options|
       options[:resign] = resign
     end
   end
@@ -93,15 +97,14 @@ class Gem::Commands::CertCommand < Gem::Command
 
   def open_private_key(key_file)
     check_openssl
-    passphrase = ENV['GEM_PRIVATE_KEY_PASSPHRASE']
+    passphrase = ENV["GEM_PRIVATE_KEY_PASSPHRASE"]
     key = OpenSSL::PKey.read File.read(key_file), passphrase
-    raise Gem::OptionParser::InvalidArgument,
-      "#{key_file}: private key not found" unless key.private?
     key
   rescue Errno::ENOENT
     raise Gem::OptionParser::InvalidArgument, "#{key_file}: does not exist"
   rescue OpenSSL::PKey::PKeyError, ArgumentError
-    raise Gem::OptionParser::InvalidArgument, "#{key_file}: invalid RSA, DSA, or EC key"
+    raise Gem::OptionParser::InvalidArgument, "#{key_file}: invalid "\
+      "RSA, DSA, EC, ML-DSA-44, ML-DSA-65, or ML-DSA-87 key"
   end
 
   def execute
@@ -135,7 +138,7 @@ class Gem::Commands::CertCommand < Gem::Command
   end
 
   def build(email)
-    if !valid_email?(email)
+    unless valid_email?(email)
       raise Gem::CommandLineError, "Invalid email address #{email}"
     end
 
@@ -152,24 +155,24 @@ class Gem::Commands::CertCommand < Gem::Command
 
   def build_cert(email, key) # :nodoc:
     expiration_length_days = options[:expiration_length_days] ||
-      Gem.configuration.cert_expiration_length_days
+                             Gem.configuration.cert_expiration_length_days
 
     cert = Gem::Security.create_cert_email(
       email,
       key,
-      (Gem::Security::ONE_DAY * expiration_length_days)
+      Gem::Security::ONE_DAY * expiration_length_days
     )
 
-    Gem::Security.write cert, "gem-public_cert.pem"
+    Gem::Security.write_certificate cert, "gem-public_cert.pem"
   end
 
   def build_key # :nodoc:
     return options[:key] if options[:key]
 
-    passphrase = ask_for_password 'Passphrase for your Private Key:'
+    passphrase = ask_for_password "Passphrase for your Private Key:"
     say "\n"
 
-    passphrase_confirmation = ask_for_password 'Please repeat the passphrase for your Private Key:'
+    passphrase_confirmation = ask_for_password "Please repeat the passphrase for your Private Key:"
     say "\n"
 
     raise Gem::CommandLineError,
@@ -177,9 +180,9 @@ class Gem::Commands::CertCommand < Gem::Command
 
     algorithm = options[:key_algorithm] || Gem::Security::DEFAULT_KEY_ALGORITHM
     key = Gem::Security.create_key(algorithm)
-    key_path = Gem::Security.write key, "gem-private_key.pem", 0600, passphrase
+    key_path = Gem::Security.write_private_key key, "gem-private_key.pem", 0o600, passphrase
 
-    return key, key_path
+    [key, key_path]
   end
 
   def certificates_matching(filter)
@@ -260,9 +263,8 @@ For further reading on signing gems see `ri Gem::Security`.
   def load_default_key
     key_file = File.join Gem.default_key_path
     key = File.read key_file
-    passphrase = ENV['GEM_PRIVATE_KEY_PASSPHRASE']
+    passphrase = ENV["GEM_PRIVATE_KEY_PASSPHRASE"]
     options[:key] = OpenSSL::PKey.read key, passphrase
-
   rescue Errno::ENOENT
     alert_error \
       "--private-key not specified and ~/.gem/gem-private_key.pem does not exist"
@@ -291,14 +293,14 @@ For further reading on signing gems see `ri Gem::Security`.
     cert = File.read cert_file
     cert = OpenSSL::X509::Certificate.new cert
 
-    permissions = File.stat(cert_file).mode & 0777
+    permissions = File.stat(cert_file).mode & 0o777
 
     issuer_cert = options[:issuer_cert]
     issuer_key = options[:key]
 
     cert = Gem::Security.sign cert, issuer_key, issuer_cert
 
-    Gem::Security.write cert, cert_file, permissions
+    Gem::Security.write_certificate cert, cert_file, permissions
   end
 
   def sign_certificates # :nodoc:

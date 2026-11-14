@@ -1,3 +1,4 @@
+# frozen_string_literal: false
 require_relative '../../spec_helper'
 require_relative 'fixtures/classes'
 
@@ -6,7 +7,7 @@ describe "String#sub with pattern, replacement" do
     a = "hello"
     b = a.sub(/w.*$/, "*")
 
-    b.should_not equal(a)
+    b.should_not.equal?(a)
     b.should == "hello"
   end
 
@@ -137,28 +138,6 @@ describe "String#sub with pattern, replacement" do
     "hello".sub(/./, 'hah\\').should == 'hah\\ello'
   end
 
-  ruby_version_is ''...'2.7' do
-    it "taints the result if the original string or replacement is tainted" do
-      hello = "hello"
-      hello_t = "hello"
-      a = "a"
-      a_t = "a"
-      empty = ""
-      empty_t = ""
-
-      hello_t.taint; a_t.taint; empty_t.taint
-
-      hello_t.sub(/./, a).should.tainted?
-      hello_t.sub(/./, empty).should.tainted?
-
-      hello.sub(/./, a_t).should.tainted?
-      hello.sub(/./, empty_t).should.tainted?
-      hello.sub(//, empty_t).should.tainted?
-
-      hello.sub(//.taint, "foo").should_not.tainted?
-    end
-  end
-
   it "tries to convert pattern to a string using to_str" do
     pattern = mock('.')
     pattern.should_receive(:to_str).and_return(".")
@@ -168,16 +147,16 @@ describe "String#sub with pattern, replacement" do
 
   not_supported_on :opal do
     it "raises a TypeError when pattern is a Symbol" do
-      -> { "hello".sub(:woot, "x") }.should raise_error(TypeError)
+      -> { "hello".sub(:woot, "x") }.should.raise(TypeError)
     end
   end
 
   it "raises a TypeError when pattern is an Array" do
-    -> { "hello".sub([], "x") }.should raise_error(TypeError)
+    -> { "hello".sub([], "x") }.should.raise(TypeError)
   end
 
   it "raises a TypeError when pattern can't be converted to a string" do
-    -> { "hello".sub(Object.new, nil) }.should raise_error(TypeError)
+    -> { "hello".sub(Object.new, nil) }.should.raise(TypeError)
   end
 
   it "tries to convert replacement to a string using to_str" do
@@ -188,26 +167,15 @@ describe "String#sub with pattern, replacement" do
   end
 
   it "raises a TypeError when replacement can't be converted to a string" do
-    -> { "hello".sub(/[aeiou]/, []) }.should raise_error(TypeError)
-    -> { "hello".sub(/[aeiou]/, 99) }.should raise_error(TypeError)
+    -> { "hello".sub(/[aeiou]/, []) }.should.raise(TypeError)
+    -> { "hello".sub(/[aeiou]/, 99) }.should.raise(TypeError)
   end
 
-  ruby_version_is ''...'3.0' do
-    it "returns subclass instances when called on a subclass" do
-      StringSpecs::MyString.new("").sub(//, "").should be_an_instance_of(StringSpecs::MyString)
-      StringSpecs::MyString.new("").sub(/foo/, "").should be_an_instance_of(StringSpecs::MyString)
-      StringSpecs::MyString.new("foo").sub(/foo/, "").should be_an_instance_of(StringSpecs::MyString)
-      StringSpecs::MyString.new("foo").sub("foo", "").should be_an_instance_of(StringSpecs::MyString)
-    end
-  end
-
-  ruby_version_is '3.0' do
-    it "returns String instances when called on a subclass" do
-      StringSpecs::MyString.new("").sub(//, "").should be_an_instance_of(String)
-      StringSpecs::MyString.new("").sub(/foo/, "").should be_an_instance_of(String)
-      StringSpecs::MyString.new("foo").sub(/foo/, "").should be_an_instance_of(String)
-      StringSpecs::MyString.new("foo").sub("foo", "").should be_an_instance_of(String)
-    end
+  it "returns String instances when called on a subclass" do
+    StringSpecs::MyString.new("").sub(//, "").should.instance_of?(String)
+    StringSpecs::MyString.new("").sub(/foo/, "").should.instance_of?(String)
+    StringSpecs::MyString.new("foo").sub(/foo/, "").should.instance_of?(String)
+    StringSpecs::MyString.new("foo").sub("foo", "").should.instance_of?(String)
   end
 
   it "sets $~ to MatchData of match and nil when there's none" do
@@ -236,6 +204,17 @@ describe "String#sub with pattern, replacement" do
     "ababa".sub(/(b)/, '\\\\\1').should == "a\\baba"
   end
 
+  it "handles a pattern in a superset encoding" do
+    result = 'abc'.force_encoding(Encoding::US_ASCII).sub('é', 'è')
+    result.should == 'abc'
+    result.encoding.should == Encoding::US_ASCII
+  end
+
+  it "handles a pattern in a subset encoding" do
+    result = 'été'.sub('t'.force_encoding(Encoding::US_ASCII), 'u')
+    result.should == 'éué'
+    result.encoding.should == Encoding::UTF_8
+  end
 end
 
 describe "String#sub with pattern and block" do
@@ -253,10 +232,10 @@ describe "String#sub with pattern and block" do
     offsets = []
 
     str.sub(/([aeiou])/) do
-       md = $~
-       md.string.should == str
-       offsets << md.offset(0)
-       str
+      md = $~
+      md.string.should == str
+      offsets << md.offset(0)
+      str
     end.should == "hhellollo"
 
     offsets.should == [[1, 2]]
@@ -297,43 +276,13 @@ describe "String#sub with pattern and block" do
     obj.should_receive(:to_s).and_return("ok")
     "hello".sub(/.+/) { obj }.should == "ok"
   end
-
-  ruby_version_is ''...'2.7' do
-    it "taints the result if the original string or replacement is tainted" do
-      hello = "hello"
-      hello_t = "hello"
-      a = "a"
-      a_t = "a"
-      empty = ""
-      empty_t = ""
-
-      hello_t.taint; a_t.taint; empty_t.taint
-
-      hello_t.sub(/./) { a }.should.tainted?
-      hello_t.sub(/./) { empty }.should.tainted?
-
-      hello.sub(/./) { a_t }.should.tainted?
-      hello.sub(/./) { empty_t }.should.tainted?
-      hello.sub(//) { empty_t }.should.tainted?
-
-      hello.sub(//.taint) { "foo" }.should_not.tainted?
-    end
-  end
 end
 
 describe "String#sub! with pattern, replacement" do
   it "modifies self in place and returns self" do
     a = "hello"
-    a.sub!(/[aeiou]/, '*').should equal(a)
+    a.sub!(/[aeiou]/, '*').should.equal?(a)
     a.should == "h*llo"
-  end
-
-  ruby_version_is ''...'2.7' do
-    it "taints self if replacement is tainted" do
-      a = "hello"
-      a.sub!(/./.taint, "foo").should_not.tainted?
-      a.sub!(/./, "foo".taint).should.tainted?
-    end
   end
 
   it "returns nil if no modifications were made" do
@@ -347,16 +296,37 @@ describe "String#sub! with pattern, replacement" do
     s = "hello"
     s.freeze
 
-    -> { s.sub!(/ROAR/, "x")    }.should raise_error(FrozenError)
-    -> { s.sub!(/e/, "e")       }.should raise_error(FrozenError)
-    -> { s.sub!(/[aeiou]/, '*') }.should raise_error(FrozenError)
+    -> { s.sub!(/ROAR/, "x")    }.should.raise(FrozenError)
+    -> { s.sub!(/e/, "e")       }.should.raise(FrozenError)
+    -> { s.sub!(/[aeiou]/, '*') }.should.raise(FrozenError)
+  end
+
+  it "handles a pattern in a superset encoding" do
+    string = 'abc'.force_encoding(Encoding::US_ASCII)
+
+    result = string.sub!('é', 'è')
+
+    result.should == nil
+    string.should == 'abc'
+    string.encoding.should == Encoding::US_ASCII
+  end
+
+  it "handles a pattern in a subset encoding" do
+    string = 'été'
+    pattern = 't'.force_encoding(Encoding::US_ASCII)
+
+    result = string.sub!(pattern, 'u')
+
+    result.should == string
+    string.should == 'éué'
+    string.encoding.should == Encoding::UTF_8
   end
 end
 
 describe "String#sub! with pattern and block" do
   it "modifies self in place and returns self" do
     a = "hello"
-    a.sub!(/[aeiou]/) { '*' }.should equal(a)
+    a.sub!(/[aeiou]/) { '*' }.should.equal?(a)
     a.should == "h*llo"
   end
 
@@ -369,21 +339,13 @@ describe "String#sub! with pattern and block" do
     offsets = []
 
     str.dup.sub!(/([aeiou])/) do
-       md = $~
-       md.string.should == str
-       offsets << md.offset(0)
-       str
+      md = $~
+      md.string.should == str
+      offsets << md.offset(0)
+      str
     end.should == "hhellollo"
 
     offsets.should == [[1, 2]]
-  end
-
-  ruby_version_is ''...'2.7' do
-    it "taints self if block's result is tainted" do
-      a = "hello"
-      a.sub!(/./.taint) { "foo" }.should_not.tainted?
-      a.sub!(/./) { "foo".taint }.should.tainted?
-    end
   end
 
   it "returns nil if no modifications were made" do
@@ -395,16 +357,16 @@ describe "String#sub! with pattern and block" do
 
   it "raises a RuntimeError if the string is modified while substituting" do
     str = "hello"
-    -> { str.sub!(//) { str << 'x' } }.should raise_error(RuntimeError)
+    -> { str.sub!(//) { str << 'x' } }.should.raise(RuntimeError)
   end
 
   it "raises a FrozenError when self is frozen" do
     s = "hello"
     s.freeze
 
-    -> { s.sub!(/ROAR/) { "x" }    }.should raise_error(FrozenError)
-    -> { s.sub!(/e/) { "e" }       }.should raise_error(FrozenError)
-    -> { s.sub!(/[aeiou]/) { '*' } }.should raise_error(FrozenError)
+    -> { s.sub!(/ROAR/) { "x" }    }.should.raise(FrozenError)
+    -> { s.sub!(/e/) { "e" }       }.should.raise(FrozenError)
+    -> { s.sub!(/[aeiou]/) { '*' } }.should.raise(FrozenError)
   end
 end
 
@@ -471,28 +433,6 @@ describe "String#sub with pattern and Hash" do
     "hello".sub(/(.+)/, 'hello' => repl ).should == repl
   end
 
-  ruby_version_is ''...'2.7' do
-    it "untrusts the result if the original string is untrusted" do
-      str = "Ghana".untrust
-      str.sub(/[Aa]na/, 'ana' => '').untrusted?.should be_true
-    end
-
-    it "untrusts the result if a hash value is untrusted" do
-      str = "Ghana"
-      str.sub(/a$/, 'a' => 'di'.untrust).untrusted?.should be_true
-    end
-
-    it "taints the result if the original string is tainted" do
-      str = "Ghana".taint
-      str.sub(/[Aa]na/, 'ana' => '').tainted?.should be_true
-    end
-
-    it "taints the result if a hash value is tainted" do
-      str = "Ghana"
-      str.sub(/a$/, 'a' => 'di'.taint).tainted?.should be_true
-    end
-  end
-
 end
 
 describe "String#sub! with pattern and Hash" do
@@ -557,38 +497,16 @@ describe "String#sub! with pattern and Hash" do
     repl = '\& \0 \1 \` \\\' \+ \\\\ foo'
     "hello".sub!(/(.+)/, 'hello' => repl ).should == repl
   end
-
-  ruby_version_is ''...'2.7' do
-    it "keeps untrusted state" do
-      str = "Ghana".untrust
-      str.sub!(/[Aa]na/, 'ana' => '').untrusted?.should be_true
-    end
-
-    it "untrusts self if a hash value is untrusted" do
-      str = "Ghana"
-      str.sub!(/a$/, 'a' => 'di'.untrust).untrusted?.should be_true
-    end
-
-    it "keeps tainted state" do
-      str = "Ghana".taint
-      str.sub!(/[Aa]na/, 'ana' => '').tainted?.should be_true
-    end
-
-    it "taints self if a hash value is tainted" do
-      str = "Ghana"
-      str.sub!(/a$/, 'a' => 'di'.taint).tainted?.should be_true
-    end
-  end
 end
 
 describe "String#sub with pattern and without replacement and block" do
   it "raises a ArgumentError" do
-    -> { "abca".sub(/a/) }.should raise_error(ArgumentError)
+    -> { "abca".sub(/a/) }.should.raise(ArgumentError)
   end
 end
 
 describe "String#sub! with pattern and without replacement and block" do
   it "raises a ArgumentError" do
-    -> { "abca".sub!(/a/) }.should raise_error(ArgumentError)
+    -> { "abca".sub!(/a/) }.should.raise(ArgumentError)
   end
 end

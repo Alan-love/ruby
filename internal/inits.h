@@ -9,6 +9,10 @@
  * @brief      Internal header aggregating init functions.
  */
 
+/* box.c */
+void Init_enable_box(void);
+void Init_master_box(void);
+
 /* class.c */
 void Init_class_hierarchy(void);
 
@@ -19,14 +23,14 @@ void Init_ext(void);
 /* file.c */
 void Init_File(void);
 
-/* gc.c */
-void Init_heap(void);
-
 /* localeinit.c */
 int Init_enc_set_filesystem_encoding(void);
 
 /* newline.c */
 void Init_newline(void);
+
+/* shape.c */
+void Init_default_shapes(void);
 
 /* vm.c */
 void Init_BareVM(void);

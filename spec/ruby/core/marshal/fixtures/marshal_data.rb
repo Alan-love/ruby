@@ -1,4 +1,7 @@
-# -*- encoding: binary -*-
+# encoding: binary
+
+require_relative 'marshal_multibyte_data'
+
 class UserDefined
   class Nested
     def ==(other)
@@ -38,7 +41,7 @@ class UserDefinedWithIvar
   attr_reader :a, :b, :c
 
   def initialize
-    @a = 'stuff'
+    @a = +'stuff'
     @a.instance_variable_set :@foo, :UserDefinedWithIvar
     @b = 'more'
     @c = @b
@@ -75,6 +78,41 @@ class UserDefinedImmediate
 
   def self._load(data)
     nil
+  end
+end
+
+class UserDefinedString
+  attr_reader :string
+
+  def initialize(string)
+    @string = string
+  end
+
+  def _dump(depth)
+    @string
+  end
+
+  def self._load(data)
+    new(data)
+  end
+end
+
+module MarshalSpec
+  class UserDefinedDumpWithIVars
+    attr_reader :string
+
+    def initialize(string, ivar_value)
+      @string = string
+      @string.instance_variable_set(:@foo, ivar_value)
+    end
+
+    def _dump(depth)
+      @string
+    end
+
+    def self._load(data)
+      new(data)
+    end
   end
 end
 
@@ -117,6 +155,74 @@ class UserMarshalWithIvar
   def ==(other)
     self.class === other and
     @data = other.data
+  end
+end
+
+module MarshalSpec
+  class UserMarshalWithModuleCheck
+    def marshal_dump
+      :data
+    end
+
+    def marshal_load(data)
+      ScratchPad.record respond_to?(:meths_method)
+    end
+  end
+
+  class UserMarshalWithPayload
+    attr_accessor :payload
+
+    def initialize(payload)
+      @payload = payload
+    end
+
+    def marshal_dump
+      @payload
+    end
+
+    def marshal_load(payload)
+      @payload = payload
+    end
+  end
+
+  class UserDefinedWithPayload
+    attr_accessor :payload
+
+    def initialize(payload)
+      @payload = payload
+    end
+
+    def _dump(depth)
+      Marshal.dump(@payload)
+    end
+
+    def self._load(str)
+      new(Marshal.load(str))
+    end
+  end
+
+  class UserMarshalDumpWithIvar
+    attr_reader :data
+
+    def initialize(data, ivar_value)
+      @data = data
+      @ivar_value = ivar_value
+    end
+
+    def marshal_dump
+      obj = [data]
+      obj.instance_variable_set(:@foo, @ivar_value)
+      obj
+    end
+
+    def marshal_load(o)
+      @data = o[0]
+    end
+
+    def ==(other)
+      self.class === other and
+        @data = other.data
+    end
   end
 end
 
@@ -167,10 +273,15 @@ module MarshalSpec
     end
   end
 
+  StructToDump = Struct.new(:a, :b)
+
   class BasicObjectSubWithRespondToFalse < BasicObject
     def respond_to?(method_name, include_all=false)
       false
     end
+  end
+
+  module ModuleToExtendBy
   end
 
   def self.random_data
@@ -190,6 +301,70 @@ module MarshalSpec
 
   def self.reset_swapped_class
     set_swapped_class(nil)
+  end
+
+  class ClassWithOverriddenName
+    def self.name
+      "Foo"
+    end
+  end
+
+  class ModuleWithOverriddenName
+    def self.name
+      "Foo"
+    end
+  end
+
+  class TimeWithOverriddenName < Time
+    def self.name
+      "Foo"
+    end
+  end
+
+  class StructWithOverriddenName < Struct.new(:a)
+    def self.name
+      "Foo"
+    end
+  end
+
+  class UserDefinedWithOverriddenName < UserDefined
+    def self.name
+      "Foo"
+    end
+  end
+
+  class StringWithOverriddenName < String
+    def self.name
+      "Foo"
+    end
+  end
+
+  class ArrayWithOverriddenName < Array
+    def self.name
+      "Foo"
+    end
+  end
+
+  class HashWithOverriddenName < Hash
+    def self.name
+      "Foo"
+    end
+  end
+
+  class RegexpWithOverriddenName < Regexp
+    def self.name
+      "Foo"
+    end
+  end
+
+  class ObjectWithFreezeRaisingException < Object
+    def freeze
+      raise
+    end
+  end
+
+  class ObjectWithoutFreeze < Object
+    undef freeze
   end
 
   DATA = {
@@ -217,7 +392,7 @@ module MarshalSpec
                        "\004\b\"\012small"],
     "String big" => ['big' * 100,
                      "\004\b\"\002,\001#{'big' * 100}"],
-    "String extended" => [''.extend(Meths), # TODO: check for module on load
+    "String extended" => [''.dup.extend(Meths), # TODO: check for module on load
                           "\004\be:\nMeths\"\000"],
     "String subclass" => [UserString.new,
                           "\004\bC:\017UserString\"\000"],
@@ -324,7 +499,7 @@ module MarshalSpec
                     "\x04\bI\"\nsmall\x06:\x06EF"],
     "String big" => ['big' * 100,
                     "\x04\bI\"\x02,\x01bigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbigbig\x06:\x06EF"],
-    "String extended" => [''.extend(Meths), # TODO: check for module on load
+    "String extended" => [''.dup.extend(Meths), # TODO: check for module on load
                           "\x04\bIe:\nMeths\"\x00\x06:\x06EF"],
     "String subclass" => [UserString.new,
                           "\004\bC:\017UserString\"\000"],
@@ -398,6 +573,20 @@ module MarshalSpec
                  "\004\bS:\024Struct::Pyramid\000"],
     "Random" => random_data,
   }
+
+  module DataSpec
+    Measure = Data.define(:amount, :unit)
+    Empty = Data.define
+
+    MeasureExtended = Class.new(Measure)
+    MeasureExtended.extend(Enumerable)
+
+    class MeasureWithOverriddenName < Measure
+      def self.name
+        "Foo"
+      end
+    end
+  end
 end
 
 class ArraySub < Array

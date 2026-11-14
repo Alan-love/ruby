@@ -3,6 +3,7 @@
 
 #include <ruby/ruby.h>
 #include "../digest.h"
+#include "../defs.h"
 #if defined(MD5_USE_COMMONDIGEST)
 #include "md5cc.h"
 #else
@@ -53,9 +54,8 @@ Init_md5(void)
     mDigest = rb_define_module("Digest"); /* let rdoc know */
 #endif
     mDigest = rb_digest_namespace();
-    cDigest_Base = rb_path2class("Digest::Base");
+    cDigest_Base = rb_const_get(mDigest, rb_intern_const("Base"));
 
     cDigest_MD5 = rb_define_class_under(mDigest, "MD5", cDigest_Base);
-
     rb_iv_set(cDigest_MD5, "metadata", rb_digest_make_metadata(&md5));
 }

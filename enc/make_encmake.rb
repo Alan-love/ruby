@@ -1,9 +1,12 @@
 #! ./miniruby
 
 dir = File.expand_path("../..", __FILE__)
-$:.unshift(dir)
-$:.unshift(".")
-if $".grep(/mkmf/).empty?
+# The source lib directory provides the standard library for miniruby.
+# Don't add it when running with baseruby to avoid loading both
+# baseruby's cgi/escape.so and source cgi/escape.rb via erb.
+$:.unshift("#{dir}/lib") unless defined?(CROSS_COMPILING)
+$:.unshift(Dir.pwd, "#{dir}/tool/lib")
+unless $".any? {|feat| File.basename(feat) == "mkmf.rb"}
   $" << "mkmf.rb"
   load File.expand_path("lib/mkmf.rb", dir)
 end
@@ -120,40 +123,35 @@ MODULE_TYPE = module_type
 ENCS, ENC_DEPS = target_encodings
 ATRANS, TRANS = target_transcoders
 
-if File.exist?(depend = File.join($srcdir, "depend"))
-  if ERB.instance_method(:initialize).parameters.assoc(:key) # Ruby 2.6+
-    erb = ERB.new(File.read(depend), trim_mode: '%')
-  else
-    erb = ERB.new(File.read(depend), nil, '%')
-  end
+depend = File.join(Dir.pwd, ".deps/enc/depend")
+depend = File.join($srcdir, "depend") unless File.file?(depend)
+if File.exist?(depend)
+  erb = ERB.new(File.read(depend), trim_mode: '%')
   erb.filename = depend
   tmp = erb.result(binding)
-  dep = "\n#### depend ####\n\n" << depend_rules(tmp).join
+  dep = "\n#### depend ####\n\n" + depend_rules(tmp).join
 else
   dep = ""
 end
 mkin = File.read(File.join($srcdir, "Makefile.in"))
-mkin.gsub!(/@(#{CONFIG.keys.join('|')})@/) {CONFIG[$1]}
-open(ARGV[0], 'wb') {|f|
+# Variables that should not be expanded in Makefile.in to allow
+# overriding inherited variables at make-time.
+not_expand_vars = %w(CFLAGS)
+mkin.gsub!(/@(#{RbConfig::CONFIG.keys.join('|')})@/) do
+  not_expand_vars.include?($1) ? CONFIG[$1] : RbConfig::CONFIG[$1]
+end
+File.open(ARGV[0], 'wb') {|f|
   f.puts mkin, dep
 }
 if MODULE_TYPE == :static
   filename = "encinit.c.erb"
-  if ERB.instance_method(:initialize).parameters.assoc(:key) # Ruby 2.6+
-    erb = ERB.new(File.read(File.join($srcdir, filename)), trim_mode: '%-')
-  else
-    erb = ERB.new(File.read(File.join($srcdir, filename)), nil, '%-')
-  end
+  erb = ERB.new(File.read(File.join($srcdir, filename)), trim_mode: '%-')
   erb.filename = "enc/#{filename}"
   tmp = erb.result(binding)
   begin
     Dir.mkdir 'enc'
   rescue Errno::EEXIST
   end
-  File.open("enc/encinit.c", "w") {|f|
-    f.puts "/* Automatically generated from enc/encinit.c.erb"
-    f.puts " * Do not edit."
-    f.puts " */"
-    f.puts tmp
-  }
+  require 'output'
+  Output.new(path: "enc/encinit.c", ifchange: true).write(tmp)
 end

@@ -69,11 +69,11 @@ class TestEnumerable < Test::Unit::TestCase
     assert_equal(['z', 42, nil], [:a, 'b', 'z', :c, 42, nil].grep_v(/[a-d]/), bug17030)
     assert_equal('match', $1, bug17030)
 
-    regexp = Regexp.new('x')
-    assert_equal([], @obj.grep(regexp), bug17030) # sanity check
-    def regexp.===(other)
-      true
-    end
+    regexp = Class.new(Regexp) {
+      def ===(other)
+        true
+      end
+    }.new('x')
     assert_equal([1, 2, 3, 1, 2], @obj.grep(regexp), bug17030)
 
     o = Object.new
@@ -234,6 +234,8 @@ class TestEnumerable < Test::Unit::TestCase
     assert_equal(24, @obj.inject(2) {|z, x| z * x })
     assert_equal(24, assert_warning(/given block not used/) {@obj.inject(2, :*) {|z, x| z * x }})
     assert_equal(nil, @empty.inject() {9})
+
+    assert_raise(ArgumentError) {@obj.inject}
   end
 
   FIXNUM_MIN = RbConfig::LIMITS['FIXNUM_MIN']
@@ -461,6 +463,17 @@ class TestEnumerable < Test::Unit::TestCase
       empty.first
       empty.block.call
     end;
+
+    bug18475 = '[ruby-dev:107059]'
+    assert_in_out_err([], <<-'end;', [], /unexpected break/, bug18475)
+      e = Enumerator.new do |g|
+        Thread.new do
+          g << 1
+        end.join
+      end
+
+      e.first
+    end;
   end
 
   def test_sort
@@ -639,6 +652,32 @@ class TestEnumerable < Test::Unit::TestCase
     assert_equal([3, 1], [2,3,1].minmax {|a,b| b <=> a })
     assert_equal([1, 3], [2,2,3,3,1,1].minmax)
     assert_equal([nil, nil], [].minmax)
+  end
+
+  %i[min max min_by max_by].each do |method|
+    define_method("test_#{method}_with_count_and_saved_block") do
+      with_block = method.end_with?("_by")
+      assert_separately([], <<~RUBY)
+        enum = Object.new
+        class << enum
+          include Enumerable
+          attr_reader :block
+
+          def each(&block)
+            @block = block
+          end
+        end
+
+        yielded = []
+        assert_equal([], enum.#{method}(2) { |x| yielded << x; x })
+        block = enum.block
+        assert_nil(block.call(1))
+        assert_equal(#{with_block ? '[1]' : '[]'}, yielded)
+        GC.start
+        assert_nil(block.call(2))
+        assert_equal(#{with_block ? '[1, 2]' : '[]'}, yielded)
+      RUBY
+    end
   end
 
   def test_min_by
@@ -830,6 +869,8 @@ class TestEnumerable < Test::Unit::TestCase
   end
 
   def test_callcc
+    omit 'requires callcc support' unless respond_to?(:callcc, true)
+
     assert_raise(RuntimeError) do
       c = nil
       @obj.sort_by {|x| callcc {|c2| c ||= c2 }; x }
@@ -875,6 +916,19 @@ class TestEnumerable < Test::Unit::TestCase
       end
       [o, o].min(1)
       assert_operator(i, :<=, 5, "infinite loop")
+      c.call
+    end
+
+    assert_raise_with_message(RuntimeError, /reentered/) do
+      c = nil
+      cmp = Object.new
+      cmp.define_singleton_method(:>) do |other|
+        callcc {|c2| c ||= c2}
+        true
+      end
+      o = Object.new
+      o.define_singleton_method(:<=>) {|x| cmp}
+      [o, o].min(1)
       c.call
     end
   end
@@ -1237,6 +1291,31 @@ class TestEnumerable < Test::Unit::TestCase
     assert_equal([1, [2], 3], [[1], [[2]], [3]].each.sum([]))
   end
 
+  [false, true].each do |with_block|
+    define_method("test_sum_with_saved_block#{'_and_block' if with_block}") do
+      assert_separately([], <<~RUBY)
+        enum = Object.new
+        class << enum
+          include Enumerable
+          attr_reader :block
+
+          def each(&block)
+            @block = block
+          end
+        end
+
+        yielded = []
+        assert_equal(0, enum.sum #{'{ |x| yielded << x; x * 2 }' if with_block})
+        block = enum.block
+        assert_nil(block.call(1))
+        assert_equal(#{with_block ? '[1]' : '[]'}, yielded)
+        GC.start
+        assert_nil(block.call(2))
+        assert_equal(#{with_block ? '[1, 2]' : '[]'}, yielded)
+      RUBY
+    end
+  end
+
   def test_hash_sum
     histogram = { 1 => 6, 2 => 4, 3 => 3, 4 => 7, 5 => 5, 6 => 4 }
     assert_equal(100, histogram.sum {|v, n| v * n })
@@ -1280,6 +1359,15 @@ class TestEnumerable < Test::Unit::TestCase
                  olympics.uniq{|k,v| v})
     assert_equal([1, 2, 3, 4, 5, 10], (1..100).uniq{|x| (x**2) % 10 }.first(6))
     assert_equal([1, [1, 2]], Foo.new.to_enum.uniq)
+
+    b = Struct.new(:block) do
+      def each(&blk)
+        self.block = blk
+        nil
+      end
+    end.new
+    b.uniq {|x| x}
+    assert_nil(b.block.call(:foo))
   end
 
   def test_compact
@@ -1320,5 +1408,25 @@ class TestEnumerable < Test::Unit::TestCase
     assert_equal([], @obj.filter_map { false })
     assert_equal([], @obj.filter_map { nil })
     assert_instance_of(Enumerator, @obj.filter_map)
+  end
+
+  def test_ruby_svar
+    klass = Class.new do
+      include Enumerable
+      def each
+        %w(bar baz).each{|e| yield e}
+      end
+    end
+    svars = []
+    klass.new.grep(/(b.)/) { svars << $1 }
+    assert_equal(["ba", "ba"], svars)
+  end
+
+  def test_all_fast
+    data = { "key" => { "key2" => 1 } }
+    kk = vv = nil
+    data.all? { |(k, v)| kk, vv = k, v }
+    assert_equal(kk, "key")
+    assert_equal(vv, { "key2" => 1 })
   end
 end

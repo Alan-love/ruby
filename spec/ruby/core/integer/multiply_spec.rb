@@ -10,7 +10,7 @@ describe "Integer#*" do
       (1342177 * 800).should == 1073741600
       (65536 * 65536).should == 4294967296
 
-      (256 * bignum_value).should == 2361183241434822606848
+      (256 * bignum_value).should == 4722366482869645213696
       (6712 * 0.25).should == 1678.0
     end
 
@@ -18,9 +18,9 @@ describe "Integer#*" do
       -> {
         (obj = mock('10')).should_receive(:to_int).any_number_of_times.and_return(10)
         13 * obj
-      }.should raise_error(TypeError)
-      -> { 13 * "10"    }.should raise_error(TypeError)
-      -> { 13 * :symbol }.should raise_error(TypeError)
+      }.should.raise(TypeError)
+      -> { 13 * "10"    }.should.raise(TypeError)
+      -> { 13 * :symbol }.should.raise(TypeError)
     end
   end
 
@@ -32,14 +32,14 @@ describe "Integer#*" do
     it "returns self multiplied by the given Integer" do
       (@bignum * (1/bignum_value(0xffff).to_f)).should be_close(1.0, TOLERANCE)
       (@bignum * (1/bignum_value(0xffff).to_f)).should be_close(1.0, TOLERANCE)
-      (@bignum * 10).should == 92233720368547765800
-      (@bignum * (@bignum - 40)).should == 85070591730234629737795195287525433200
+      (@bignum * 10).should == 184467440737095523880
+      (@bignum * (@bignum - 40)).should == 340282366920938491207277694290934407024
     end
 
     it "raises a TypeError when given a non-Integer" do
-      -> { @bignum * mock('10') }.should raise_error(TypeError)
-      -> { @bignum * "10" }.should raise_error(TypeError)
-      -> { @bignum * :symbol }.should raise_error(TypeError)
+      -> { @bignum * mock('10') }.should.raise(TypeError)
+      -> { @bignum * "10" }.should.raise(TypeError)
+      -> { @bignum * :symbol }.should.raise(TypeError)
     end
   end
 end

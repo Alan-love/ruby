@@ -29,13 +29,19 @@ class TestThread < Test::Unit::TestCase
   end
 
   def test_inspect
+    m = Thread::Mutex.new
+    m.lock
     line = __LINE__+1
-    th = Module.new {break module_eval("class C\u{30b9 30ec 30c3 30c9} < Thread; self; end")}.start{}
+    th = Module.new {break module_eval("class C\u{30b9 30ec 30c3 30c9} < Thread; self; end")}.start do
+      m.synchronize {}
+    end
+    Thread.pass until th.stop?
     s = th.inspect
     assert_include(s, "::C\u{30b9 30ec 30c3 30c9}:")
     assert_include(s, " #{__FILE__}:#{line} ")
     assert_equal(s, th.to_s)
   ensure
+    m.unlock
     th.join
   end
 
@@ -237,6 +243,10 @@ class TestThread < Test::Unit::TestCase
 
   def test_join_argument_conversion
     t = Thread.new {}
+
+    # Make sure that the thread terminates
+    Thread.pass while t.status
+
     assert_raise(TypeError) {t.join(:foo)}
 
     limit = Struct.new(:to_f, :count).new(0.05)
@@ -317,7 +327,6 @@ class TestThread < Test::Unit::TestCase
       s += 1
     end
     Thread.pass until t.stop?
-    sleep 1 if defined?(RubyVM::JIT) && RubyVM::JIT.enabled? # t.stop? behaves unexpectedly with --jit-wait
     assert_equal(1, s)
     t.wakeup
     Thread.pass while t.alive?
@@ -389,7 +398,7 @@ class TestThread < Test::Unit::TestCase
       end
     INPUT
 
-    assert_in_out_err(%w(--disable-gems -d), <<-INPUT, %w(false 2), %r".+")
+    assert_in_out_err(%w(-d), <<-INPUT, %w(false 2), %r".+")
       p Thread.abort_on_exception
       begin
         t = Thread.new { raise }
@@ -500,7 +509,7 @@ class TestThread < Test::Unit::TestCase
 
   def test_ignore_deadlock
     if /mswin|mingw/ =~ RUBY_PLATFORM
-      skip "can't trap a signal from another process on Windows"
+      omit "can't trap a signal from another process on Windows"
     end
     assert_in_out_err([], <<-INPUT, %w(false :sig), [], :signal=>:INT, timeout: 1, timeout_error: nil)
       p Thread.ignore_deadlock
@@ -731,7 +740,7 @@ class TestThread < Test::Unit::TestCase
   end
 
   def test_no_valid_cfp
-    skip 'with win32ole, cannot run this testcase because win32ole redefines Thread#initialize' if defined?(WIN32OLE)
+    omit 'with win32ole, cannot run this testcase because win32ole redefines Thread#initialize' if defined?(WIN32OLE)
     bug5083 = '[ruby-dev:44208]'
     assert_equal([], Thread.new(&Module.method(:nesting)).value, bug5083)
     assert_instance_of(Thread, Thread.new(:to_s, &Class.new.method(:undef_method)).join, bug5083)
@@ -789,7 +798,7 @@ class TestThread < Test::Unit::TestCase
 
   def for_test_handle_interrupt_with_return
     Thread.handle_interrupt(Object => :never){
-      Thread.current.raise RuntimeError.new("have to be rescured")
+      Thread.current.raise RuntimeError.new("have to be rescued")
       return
     }
   rescue
@@ -806,13 +815,66 @@ class TestThread < Test::Unit::TestCase
     assert_nothing_raised do
       begin
         Thread.handle_interrupt(Object => :never){
-          Thread.current.raise RuntimeError.new("have to be rescured")
+          Thread.current.raise RuntimeError.new("have to be rescued")
           break
         }
       rescue
       end
       _dummy_for_check_ints=nil
     end
+  end
+
+  # Thread.handle_interrupt checks for interrupts after the block returns,
+  # before re-raising the jump (break/return/raise) that left the block.
+  # Running a signal handler there must not clobber ec->errinfo, which still
+  # holds the payload of that jump.
+  def test_handle_interrupt_with_return_and_trap_handler
+    omit "needs fork" unless Process.respond_to?(:fork)
+    omit "SIGUSR1 is not supported" unless Signal.list.key?("USR1")
+
+    assert_separately([], "#{<<~"begin;"}\n#{<<~'end;'}", timeout: 120)
+    begin;
+      trap(:USR1) do
+        begin
+          raise "entering a rescue clause clears errinfo"
+        rescue
+        end
+      end
+
+      def return_from_handle_interrupt(array)
+        array.each do |i|
+          Thread.handle_interrupt(Exception => :immediate) { return i }
+        end
+        nil
+      end
+
+      # Signal from another process: a thread of this process would only get
+      # scheduled a few times a second while the main thread spins.
+      pid = Process.pid
+      killer = fork do
+        begin
+          # Process.ppid changes if the parent crashes.
+          while Process.ppid == pid
+            Process.kill(:USR1, pid)
+            sleep 0.001
+          end
+        rescue Errno::ESRCH
+        end
+        exit!(0)
+      end
+
+      returned = nil
+      begin
+        500_000.times do
+          returned = return_from_handle_interrupt([1, 2, 3])
+          break unless returned == 1
+        end
+      ensure
+        Process.kill(:KILL, killer) rescue Errno::ESRCH
+        Process.waitpid(killer)
+      end
+      assert_equal(1, returned)
+    end;
   end
 
   def test_handle_interrupt_blocking
@@ -836,6 +898,36 @@ class TestThread < Test::Unit::TestCase
     }
     assert_raise(e) {q << true; th.join}
     assert_equal(:ok, r)
+  end
+
+  def test_handle_interrupt_masks_sigint
+    assert_in_out_err([], <<-INPUT, %w(outer false), [])
+      waiting = Thread::Queue.new
+      release = Thread::Queue.new
+      inner = false
+
+      Thread.new do
+        waiting.pop
+        Process.kill(:INT, Process.pid)
+        release.push(true)
+      end
+
+      begin
+        Thread.handle_interrupt(SignalException => :never) do
+          begin
+            waiting.push(true)
+            release.pop
+          rescue Interrupt
+            inner = true
+            raise
+          end
+        end
+      rescue Interrupt
+        puts "outer"
+      end
+
+      puts inner
+    INPUT
   end
 
   def test_handle_interrupt_and_io
@@ -971,11 +1063,10 @@ _eom
     cmd = 'Signal.trap(:INT, "DEFAULT"); pipe=IO.pipe; Thread.start {Thread.pass until Thread.main.stop?; puts; STDOUT.flush}; pipe[0].read'
     opt = {}
     opt[:new_pgroup] = true if /mswin|mingw/ =~ RUBY_PLATFORM
-    s, t, _err = EnvUtil.invoke_ruby(['-e', cmd], "", true, true, **opt) do |in_p, out_p, err_p, cpid|
+    s, _err = EnvUtil.invoke_ruby(['-e', cmd], "", true, true, **opt) do |in_p, out_p, err_p, cpid|
       assert IO.select([out_p], nil, nil, 10), 'subprocess not ready'
       out_p.gets
       pid = cpid
-      t0 = Time.now.to_f
       Process.kill(:SIGINT, pid)
       begin
         Timeout.timeout(10) { Process.wait(pid) }
@@ -983,14 +1074,12 @@ _eom
         EnvUtil.terminate(pid)
         raise
       end
-      t1 = Time.now.to_f
-      [$?, t1 - t0, err_p.read]
+      [$?, err_p.read]
     end
     assert_equal(pid, s.pid, bug5757)
     assert_equal([false, true, false, Signal.list["INT"]],
                  [s.exited?, s.signaled?, s.stopped?, s.termsig],
                  "[s.exited?, s.signaled?, s.stopped?, s.termsig]")
-    assert_include(0..2, t, bug5757)
   end
 
   def test_thread_join_in_trap
@@ -1068,7 +1157,7 @@ q.pop
         puts mth.status
         Process.kill(:INT, $$)
       }
-      sleep 0.1
+      sleep
     INPUT
   end
 
@@ -1196,7 +1285,7 @@ q.pop
     assert_operator(size_default, :>=, size_0, "0 size")
     size_large = invoke_rec script, vm_stack_size, 1024 * 1024 * 10
     assert_operator(size_default, :<=, size_large, "large size")
-  end unless /mswin|mingw/ =~ RUBY_PLATFORM
+  end
 
   def test_blocking_mutex_unlocked_on_fork
     bug8433 = '[ruby-core:55102] [Bug #8433]'
@@ -1244,6 +1333,21 @@ q.pop
     assert_predicate(status, :success?, bug9751)
   end if Process.respond_to?(:fork)
 
+  def test_fork_value
+    bug18902 = "[Bug #18902]"
+    th = Thread.start { sleep 2 }
+    begin
+      pid = fork do
+        th.value
+      end
+      _, status = Process.wait2(pid)
+      assert_predicate(status, :success?, bug18902)
+    ensure
+      th.kill
+      th.join
+    end
+  end if Process.respond_to?(:fork)
+
   def test_fork_while_locked
     m = Thread::Mutex.new
     thrs = []
@@ -1256,7 +1360,7 @@ q.pop
   end if Process.respond_to?(:fork)
 
   def test_fork_while_parent_locked
-    skip 'needs fork' unless Process.respond_to?(:fork)
+    omit 'needs fork' unless Process.respond_to?(:fork)
     m = Thread::Mutex.new
     nr = 1
     thrs = []
@@ -1277,7 +1381,7 @@ q.pop
   end
 
   def test_fork_while_mutex_locked_by_forker
-    skip 'needs fork' unless Process.respond_to?(:fork)
+    omit 'needs fork' unless Process.respond_to?(:fork)
     m = Thread::Mutex.new
     m.synchronize do
       pid = fork do
@@ -1319,6 +1423,57 @@ q.pop
     t.join
   end
 
+  def test_thread_name_native
+    omit "requires /proc/self/task" unless File.directory?("/proc/self/task")
+    assert_separately([{'RUBY_MN_THREADS' => '0'}], "#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      t = Thread.start {sleep}
+      sleep 0.001 until t.stop?
+      t.name = "foo"
+      assert_equal "foo", File.read("/proc/self/task/#{t.native_thread_id}/comm").chomp
+      t.kill.join
+    end;
+  end
+
+  def test_thread_name_after_join
+    omit "requires /proc/self/task" unless File.directory?("/proc/self/task")
+    assert_separately([{'RUBY_MN_THREADS' => '0'}], "#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      tid = nil
+      t1 = Thread.new { tid = Thread.current.native_thread_id }
+      t1.join
+      # Wait for the native thread to exit so that t2 reuses its stack
+      sleep 0.001 while File.exist?("/proc/self/task/#{tid}")
+      q = Thread::Queue.new
+      t2 = Thread.new { q.pop }
+      sleep 0.001 until t2.stop?
+      t1.name = "foo"
+      assert_equal "foo", t1.name
+      assert_not_equal "foo", File.read("/proc/self/task/#{t2.native_thread_id}/comm").chomp, "[Bug #22471]"
+      q << nil
+      t2.join
+    end;
+  end
+
+  def test_thread_name_set_before_start
+    omit "needs /proc/self/task" unless File.directory?("/proc/self/task")
+    # Thread#name= may run before the new thread has recorded its own id;
+    # the native name must still be applied, by whichever side gets there.
+    assert_separately([{'RUBY_MN_THREADS' => '0'}], "#{<<~"begin;"}\n#{<<~'end;'}", timeout: 30)
+    begin;
+      10.times do |i|
+        q = Thread::Queue.new
+        t = Thread.new do
+          q.pop
+          File.read("/proc/self/task/#{Thread.current.native_thread_id}/comm").chomp
+        end
+        t.name = "name#{i}"
+        q << true
+        assert_equal "name#{i}", t.value
+      end
+    end;
+  end
+
   def test_thread_invalid_name
     bug11756 = '[ruby-core:71774] [Bug #11756]'
     t = Thread.start {}
@@ -1338,6 +1493,61 @@ q.pop
     t.join
   end
 
+  def test_yield_across_thread_through_enum
+    bug18649 = '[ruby-core:107980] [Bug #18649]'
+    @log = []
+
+    def self.p(arg)
+      @log << arg
+    end
+
+    def self.synchronize
+      yield
+    end
+
+    def self.execute(task)
+      success = true
+      value = reason = nil
+      end_sync = false
+
+      synchronize do
+        begin
+          p :before
+          value = task.call
+          p :never_reached
+          success = true
+        rescue StandardError => ex
+          ex = ex.class
+          p [:rescue, ex]
+          reason = ex
+          success = false
+        end
+
+        end_sync = true
+        p :end_sync
+      end
+
+      p :should_not_reach_here! unless end_sync
+      [success, value, reason]
+    end
+
+    def self.foo
+      Thread.new do
+        result = execute(-> { yield 42 })
+        p [:result, result]
+      end.join
+    end
+
+    value = to_enum(:foo).first
+    expected = [:before,
+      [:rescue, LocalJumpError],
+      :end_sync,
+      [:result, [false, nil, LocalJumpError]]]
+
+    assert_equal(expected, @log, bug18649)
+    assert_equal(42, value, bug18649)
+  end
+
   def test_thread_setname_in_initialize
     bug12290 = '[ruby-core:74963] [Bug #12290]'
     c = Class.new(Thread) {def initialize() self.name = "foo"; super; end}
@@ -1345,7 +1555,7 @@ q.pop
   end
 
   def test_thread_native_thread_id
-    skip "don't support native_thread_id" unless Thread.method_defined?(:native_thread_id)
+    omit "don't support native_thread_id" unless Thread.method_defined?(:native_thread_id)
     assert_instance_of Integer, Thread.main.native_thread_id
 
     th1 = Thread.start{sleep}
@@ -1356,7 +1566,8 @@ q.pop
     Thread.pass until th1.stop?
 
     # After a thread starts (and execute `sleep`), it returns native_thread_id
-    assert_instance_of Integer, th1.native_thread_id
+    native_tid = th1.native_thread_id
+    assert_instance_of Integer, native_tid if native_tid # it can be nil
 
     th1.wakeup
     Thread.pass while th1.alive?
@@ -1365,11 +1576,40 @@ q.pop
     assert_nil th1.native_thread_id
   end
 
+  def test_thread_native_thread_id_across_fork_on_linux
+    begin
+      require '-test-/thread/id'
+    rescue LoadError
+      omit "this test is only for Linux"
+    else
+      extend Bug::ThreadID
+    end
+
+    parent_thread_id = Thread.main.native_thread_id
+    real_parent_thread_id = gettid
+
+    assert_equal real_parent_thread_id, parent_thread_id
+
+    child_lines = nil
+    IO.popen('-') do |pipe|
+      if pipe
+        # parent
+        child_lines = pipe.read.lines
+      else
+        # child
+        puts Thread.main.native_thread_id
+        puts gettid
+      end
+    end
+    child_thread_id = child_lines[0].chomp.to_i
+    real_child_thread_id = child_lines[1].chomp.to_i
+
+    assert_equal real_child_thread_id, child_thread_id
+    refute_equal parent_thread_id, child_thread_id
+  end
+
   def test_thread_interrupt_for_killed_thread
     opts = { timeout: 5, timeout_error: nil }
-
-    # prevent SIGABRT from slow shutdown with MJIT
-    opts[:reprieve] = 3 if defined?(RubyVM::JIT) && RubyVM::JIT.enabled?
 
     assert_normal_exit(<<-_end, '[Bug #8996]', **opts)
       Thread.report_on_exception = false
@@ -1384,9 +1624,10 @@ q.pop
 
   def test_signal_at_join
     if /mswin|mingw/ =~ RUBY_PLATFORM
-      skip "can't trap a signal from another process on Windows"
+      omit "can't trap a signal from another process on Windows"
       # opt = {new_pgroup: true}
     end
+
     assert_separately([], "#{<<~"{#"}\n#{<<~'};'}", timeout: 120)
     {#
       n = 1000
@@ -1432,5 +1673,208 @@ q.pop
         end
       end
     };
+  end
+
+  def test_pending_interrupt?
+    t = Thread.handle_interrupt(Exception => :never) { Thread.new { Thread.stop } }
+    t.raise(StandardError)
+    assert_equal(true, t.pending_interrupt?)
+    assert_equal(true, t.pending_interrupt?(Exception))
+    assert_equal(false, t.pending_interrupt?(ArgumentError))
+  end
+
+  def test_deadlock_backtrace
+    bug21127 = '[ruby-core:120930] [Bug #21127]'
+
+    expected_stderr = [
+      /-:12:in 'Thread#join': No live threads left. Deadlock\? \(fatal\)\n/,
+      /2 threads, 2 sleeps current:\w+ main thread:\w+\n/,
+      /\* #<Thread:\w+ sleep_forever>\n/,
+      :*,
+      /^\s*-:6:in 'Object#frame_for_deadlock_test_2'/,
+      :*,
+      /\* #<Thread:\w+ -:10 sleep_forever>\n/,
+      :*,
+      /^\s*-:2:in 'Object#frame_for_deadlock_test_1'/,
+      :*,
+    ]
+
+    assert_in_out_err([], <<-INPUT, [], expected_stderr, bug21127)
+      def frame_for_deadlock_test_1
+        yield
+      end
+
+      def frame_for_deadlock_test_2
+        yield
+      end
+
+      q = Thread::Queue.new
+      t = Thread.new { frame_for_deadlock_test_1 { q.pop } }
+
+      frame_for_deadlock_test_2 { t.join }
+    INPUT
+  end
+
+  def test_unlock_locked_mutex_with_collected_fiber
+    bug21342 = '[ruby-core:122121] [Bug #21342]'
+    assert_ruby_status([], "#{<<~"begin;"}\n#{<<~'end;'}", bug21342)
+    begin;
+      5.times do
+        m = Mutex.new
+        Thread.new do
+          m.synchronize do
+          end
+        end.join
+        Fiber.new do
+          GC.start
+          m.lock
+        end.resume
+      end
+    end;
+  end
+
+  def test_unlock_locked_mutex_with_collected_fiber2
+    assert_ruby_status([], "#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      MUTEXES = []
+      5.times do
+        m = Mutex.new
+        Fiber.new do
+          GC.start
+          m.lock
+        end.resume
+        MUTEXES << m
+      end
+      10.times do
+        MUTEXES.clear
+        GC.start
+      end
+    end;
+  end
+
+  def test_mutexes_locked_in_fiber_dont_have_aba_issue_with_new_fibers
+    assert_ruby_status([], "#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      mutexes = 1000.times.map do
+        Mutex.new
+      end
+
+      mutexes.map do |m|
+        Fiber.new do
+          m.lock
+        end.resume
+      end
+
+      GC.start
+
+      1000.times.map do
+        Fiber.new do
+          raise "FAILED!" if mutexes.any?(&:owned?)
+        end.resume
+      end
+    end;
+  end
+
+  # [Bug #21836]
+  def test_mn_threads_sub_millisecond_sleep
+    assert_separately([{'RUBY_MN_THREADS' => '1'}], "#{<<~"begin;"}\n#{<<~'end;'}", timeout: 30)
+    begin;
+      t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      1000.times { sleep 0.0001 }
+      t1 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      elapsed = t1 - t0
+      assert_operator elapsed, :>=, 0.1, "sub-millisecond sleeps should not return immediately"
+    end;
+  end
+
+  def test_mn_threads_killed_io_waiter_does_not_spin
+    assert_separately([{'RUBY_MN_THREADS' => '1'}], "#{<<~"begin;"}\n#{<<~'end;'}", timeout: 30)
+    begin;
+      r, w = IO.pipe
+      th = Thread.new { r.read(1) }
+      sleep 0.1 # let th park in the M:N poller
+      th.kill
+      th.join
+      w.close # r hangs up while the poller still holds a registration for it
+
+      t0 = Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID)
+      sleep 0.3
+      cpu = Process.clock_gettime(Process::CLOCK_PROCESS_CPUTIME_ID) - t0
+      # A spinning timer thread never reaches its timeout branch, which under
+      # RUBY_MN_THREADS=2 is the only thing that can serve the exiting Ractor.
+      assert_operator cpu, :<, 0.15, "timer thread spins on an fd nobody waits on"
+      r.close
+    end;
+  end
+
+  # RUBY_MN_THREADS=2 puts the main thread, which receives the traps, on the M:N io wait.
+  def test_mn_threads_io_wait_under_signals
+    omit "needs fork and SIGUSR1" unless Process.respond_to?(:fork) && Signal.list.key?("USR1")
+    assert_separately([{'RUBY_MN_THREADS' => '2'}], "#{<<~"begin;"}\n#{<<~'end;'}", timeout: 60)
+    begin;
+      r, w = IO.pipe
+      in_trap = nil
+      trap(:USR1) do
+        if in_trap == :measure
+          # Signals keep coming while TRAP is masked; their wakeups must not end the wait.
+          t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          ret = r.wait_readable(0.2)
+          in_trap = [ret, Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0]
+        end
+      end
+      ppid = Process.pid
+      # Unthrottled, the traps arrive faster than the main thread can run them.
+      pid = fork { (loop { Process.kill(:USR1, ppid); sleep 0.0001 }) rescue exit!(0) }
+      begin
+        # A trap pending when the wait starts must not be reported as readiness.
+        ready = 0
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 1
+        while Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+          ready += 1 if r.wait_readable(0.0001)
+        end
+        assert_equal 0, ready, "wait_readable reported a pipe nobody wrote to as readable"
+
+        in_trap = :measure
+        sleep 0.01 while in_trap == :measure
+        ret, elapsed = in_trap
+        assert_nil ret
+        assert_operator elapsed, :>=, 0.15, "wait_readable in a trap handler returned before its timeout"
+      ensure
+        Process.kill(:KILL, pid)
+        Process.wait(pid)
+        w.close # held open until here so that r never reaches EOF
+      end
+    end;
+  end
+
+  # [Bug #21926]
+  def test_thread_join_during_finalizers
+    assert_separately([], "#{<<~"begin;"}\n#{<<~'end;'}", timeout: 60)
+    begin;
+      require 'open3'
+
+      class ProcessWrapper
+        def initialize
+          @stdin, @stdout, @stderr, @wait_thread = Open3.popen3("cat") # hangs until we close our stdin side
+          ObjectSpace.define_finalizer(self, self.class.make_finalizer(@stdin, @stdout, @stderr, @wait_thread))
+        end
+
+        def self.make_finalizer(stdin, stdout, stderr, wait_thread)
+          proc do
+            stdin.close rescue nil
+            stdout.close rescue nil
+            stderr.close rescue nil
+            # On some GC implementations (e.g. mmtk), finalizers run as postponed
+            # jobs which can execute on any thread, including the wait_thread itself.
+            # Guard against joining the current thread.
+            wait_thread.value unless Thread.current == wait_thread
+          end
+        end
+      end
+
+      20.times { ProcessWrapper.new }
+      GC.stress = true
+      1000.times { Object.new }
+    end;
   end
 end

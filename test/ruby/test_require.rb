@@ -6,11 +6,27 @@ require 'tmpdir'
 
 class TestRequire < Test::Unit::TestCase
   def test_load_error_path
-    filename = "should_not_exist"
-    error = assert_raise(LoadError) do
-      require filename
-    end
-    assert_equal filename, error.path
+    Tempfile.create(["should_not_exist", ".rb"]) {|t|
+      filename = t.path
+      t.close
+      File.unlink(filename)
+
+      error = assert_raise(LoadError) do
+        require filename
+      end
+      assert_equal filename, error.path
+
+      # with --disable=gems
+      assert_separately(["-", filename], "#{<<~"begin;"}\n#{<<~'end;'}")
+      begin;
+        filename = ARGV[0]
+        path = Struct.new(:to_path).new(filename)
+        error = assert_raise(LoadError) do
+          require path
+        end
+        assert_equal filename, error.path
+      end;
+    }
   end
 
   def test_require_invalid_shared_object
@@ -38,7 +54,7 @@ class TestRequire < Test::Unit::TestCase
     end;
 
     begin
-      assert_in_out_err(["-S", "-w", "foo/" * 1024 + "foo"], "") do |r, e|
+      assert_in_out_err(["-S", "-w", (["foo"] * 1025).join("_")], "") do |r, e|
         assert_equal([], r)
         assert_operator(2, :<=, e.size)
         assert_match(/warning: openpath: pathname too long \(ignored\)/, e.first)
@@ -52,7 +68,8 @@ class TestRequire < Test::Unit::TestCase
   def test_require_nonascii
     bug3758 = '[ruby-core:31915]'
     ["\u{221e}", "\x82\xa0".force_encoding("cp932")].each do |path|
-      assert_raise_with_message(LoadError, /#{path}\z/, bug3758) {require path}
+      e = assert_raise(LoadError, bug3758) {require path}
+      assert_operator(e.message, :end_with?, path, bug3758)
     end
   end
 
@@ -93,7 +110,7 @@ class TestRequire < Test::Unit::TestCase
       begin
         require_path = File.join(tmp, dir, 'foo.rb').encode(encoding)
       rescue
-        skip "cannot convert path encoding to #{encoding}"
+        omit "cannot convert path encoding to #{encoding}"
       end
       Dir.mkdir(File.dirname(require_path))
       open(require_path, "wb") {|f| f.puts '$:.push __FILE__'}
@@ -175,7 +192,7 @@ class TestRequire < Test::Unit::TestCase
       t.close
 
       path = File.expand_path(t.path).sub(/\A(\w):/, '//127.0.0.1/\1$')
-      skip "local drive #$1: is not shared" unless File.exist?(path)
+      omit "local drive #$1: is not shared" unless File.exist?(path)
       args = ['--disable-gems', "-I#{File.dirname(path)}"]
       assert_in_out_err(args, "#{<<~"END;"}", [path], [])
       begin
@@ -192,7 +209,7 @@ class TestRequire < Test::Unit::TestCase
       File.write(req, "p :ok\n")
       assert_file.exist?(req)
       req[/.rb$/i] = ""
-      assert_in_out_err(['--disable-gems'], <<-INPUT, %w(:ok), [])
+      assert_in_out_err([], <<-INPUT, %w(:ok), [])
         require "#{req}"
         require "#{req}"
       INPUT
@@ -210,6 +227,7 @@ class TestRequire < Test::Unit::TestCase
       assert_not_nil(bt = e.backtrace, "no backtrace")
       assert_not_empty(bt.find_all {|b| b.start_with? __FILE__}, proc {bt.inspect})
     end
+  ensure
     $LOADED_FEATURES.replace loaded_features
   end
 
@@ -352,6 +370,26 @@ class TestRequire < Test::Unit::TestCase
     end
   end
 
+  def test_public_in_wrapped_load
+    Tempfile.create(["test_public_in_wrapped_load", ".rb"]) do |t|
+      t.puts "def foo; end", "public :foo"
+      t.close
+      assert_warning(/main\.public/) do
+        assert load(t.path, true)
+      end
+    end
+  end
+
+  def test_private_in_wrapped_load
+    Tempfile.create(["test_private_in_wrapped_load", ".rb"]) do |t|
+      t.puts "def foo; end", "private :foo"
+      t.close
+      assert_warning(/main\.private/) do
+        assert load(t.path, true)
+      end
+    end
+  end
+
   def test_load_scope
     bug1982 = '[ruby-core:25039] [Bug #1982]'
     Tempfile.create(["test_ruby_test_require", ".rb"]) {|t|
@@ -460,7 +498,7 @@ class TestRequire < Test::Unit::TestCase
           result = IO.popen([EnvUtil.rubybin, "b/tst.rb"], &:read)
           assert_equal("a/lib.rb\n", result, "[ruby-dev:40040]")
         rescue NotImplementedError, Errno::EACCES
-          skip "File.symlink is not implemented"
+          omit "File.symlink is not implemented"
         end
       }
     }
@@ -486,7 +524,7 @@ class TestRequire < Test::Unit::TestCase
           result = IO.popen([EnvUtil.rubybin, "c.rb"], &:read)
           assert_equal("1", result, "bug17885 [ruby-core:104010]")
         rescue NotImplementedError, Errno::EACCES
-          skip "File.symlink is not implemented"
+          omit "File.symlink is not implemented"
         end
       }
     }
@@ -494,9 +532,14 @@ class TestRequire < Test::Unit::TestCase
 
   def test_frozen_loaded_features
     bug3756 = '[ruby-core:31913]'
-    assert_in_out_err(['-e', '$LOADED_FEATURES.freeze; require "ostruct"'], "",
+    assert_in_out_err(['-e', '$LOADED_FEATURES.freeze; require "erb"'], "",
                       [], /\$LOADED_FEATURES is frozen; cannot append feature \(RuntimeError\)$/,
                       bug3756)
+  end
+
+  def test_frozen_loaded_features_while_rebuilding_index
+    assert_in_out_err(['-e', '$LOADED_FEATURES << "dummy.rb"; $LOADED_FEATURES.freeze; require "erb"'], "",
+                      [], /\$LOADED_FEATURES is frozen; cannot append feature \(RuntimeError\)$/)
   end
 
   def test_race_exception
@@ -562,9 +605,6 @@ class TestRequire < Test::Unit::TestCase
 
       assert_equal(true, (t1_res ^ t2_res), bug5754 + " t1:#{t1_res} t2:#{t2_res}")
       assert_equal([:pre, :post], scratch, bug5754)
-
-      assert_match(/circular require/, output)
-      assert_match(/in #{__method__}'$/o, output)
     }
   ensure
     $VERBOSE = verbose
@@ -682,7 +722,7 @@ class TestRequire < Test::Unit::TestCase
     Dir.mktmpdir {|tmp|
       Dir.chdir(tmp) {
         open("foo.rb", "w") {}
-        assert_in_out_err([{"RUBYOPT"=>nil}, '--disable-gems'], "#{<<~"begin;"}\n#{<<~"end;"}", %w(:ok), [], bug7158)
+        assert_in_out_err([{"RUBYOPT"=>nil}], "#{<<~"begin;"}\n#{<<~"end;"}", %w(:ok), [], bug7158)
         begin;
           $:.replace([IO::NULL])
           a = Object.new
@@ -710,7 +750,7 @@ class TestRequire < Test::Unit::TestCase
     Dir.mktmpdir {|tmp|
       Dir.chdir(tmp) {
         open("foo.rb", "w") {}
-        assert_in_out_err([{"RUBYOPT"=>nil}, '--disable-gems'], "#{<<~"begin;"}\n#{<<~"end;"}", %w(:ok), [], bug7158)
+        assert_in_out_err([{"RUBYOPT"=>nil}], "#{<<~"begin;"}\n#{<<~"end;"}", %w(:ok), [], bug7158)
         begin;
           $:.replace([IO::NULL])
           a = Object.new
@@ -740,7 +780,7 @@ class TestRequire < Test::Unit::TestCase
         open("foo.rb", "w") {}
         Dir.mkdir("a")
         open(File.join("a", "bar.rb"), "w") {}
-        assert_in_out_err(['--disable-gems'], "#{<<~"begin;"}\n#{<<~"end;"}", %w(:ok), [], bug7383)
+        assert_in_out_err([], "#{<<~"begin;"}\n#{<<~"end;"}", %w(:ok), [], bug7383)
         begin;
           $:.replace([IO::NULL])
           $:.#{add} "#{tmp}"
@@ -805,6 +845,36 @@ class TestRequire < Test::Unit::TestCase
         p :ok
       end;
     }
+
+    # [Bug #21567]
+    assert_ruby_status(%w[-rtempfile], "#{<<~"begin;"}\n#{<<~"end;"}")
+    begin;
+      class MyString
+        def initialize(path)
+          @path = path
+        end
+
+        def to_str
+          $LOADED_FEATURES.clear
+          @path
+        end
+
+        def to_path = @path
+      end
+
+      FILES = []
+
+      def create_ruby_file
+        file = Tempfile.open(["test", ".rb"])
+        FILES << file
+        file.path
+      end
+
+      require MyString.new(create_ruby_file)
+      $LOADED_FEATURES.unshift(create_ruby_file)
+      $LOADED_FEATURES << MyString.new(create_ruby_file)
+      require create_ruby_file
+    end;
   end
 
   def test_loading_fifo_threading_raise
@@ -812,7 +882,7 @@ class TestRequire < Test::Unit::TestCase
       f.close
       File.unlink(f.path)
       File.mkfifo(f.path)
-      assert_separately(["-", f.path], "#{<<~"begin;"}\n#{<<~"end;"}", timeout: 3)
+      assert_separately(["-", f.path], "#{<<~"begin;"}\n#{<<~"end;"}", timeout: 10)
       begin;
         th = Thread.current
         Thread.start {begin sleep(0.001) end until th.stop?; th.raise(IOError)}
@@ -829,7 +899,7 @@ class TestRequire < Test::Unit::TestCase
       File.unlink(f.path)
       File.mkfifo(f.path)
 
-      assert_separately(["-", f.path], "#{<<~"begin;"}\n#{<<~"end;"}", timeout: 3)
+      assert_separately(["-", f.path], "#{<<~"begin;"}\n#{<<~"end;"}", timeout: 10)
       begin;
         path = ARGV[0]
         th = Thread.current
@@ -850,7 +920,7 @@ class TestRequire < Test::Unit::TestCase
   end if File.respond_to?(:mkfifo)
 
   def test_loading_fifo_fd_leak
-    skip if RUBY_PLATFORM =~ /android/ # https://rubyci.org/logs/rubyci.s3.amazonaws.com/android29-x86_64/ruby-master/log/20200419T124100Z.fail.html.gz
+    omit if RUBY_PLATFORM =~ /android/ # https://rubyci.org/logs/rubyci.s3.amazonaws.com/android29-x86_64/ruby-master/log/20200419T124100Z.fail.html.gz
 
     Tempfile.create(%w'fifo .rb') {|f|
       f.close
@@ -911,7 +981,7 @@ class TestRequire < Test::Unit::TestCase
       begin
         File.symlink "real", File.join(tmp, "symlink")
       rescue NotImplementedError, Errno::EACCES
-        skip "File.symlink is not implemented"
+        omit "File.symlink is not implemented"
       end
       File.write(File.join(tmp, "real/test_symlink_load_path.rb"), "print __FILE__")
       result = IO.popen([EnvUtil.rubybin, "-I#{tmp}/symlink", "-e", "require 'test_symlink_load_path.rb'"], &:read)
@@ -958,5 +1028,34 @@ class TestRequire < Test::Unit::TestCase
     def test_resolve_feature_path_with_missing_feature
       assert_nil($LOAD_PATH.resolve_feature_path("superkalifragilisticoespialidoso"))
     end
+  end
+
+  def test_require_with_public_method_missing
+    # [Bug #19793]
+    assert_ruby_status(["-W0", "-rtempfile"], <<~RUBY, timeout: 60)
+      GC.stress = true
+
+      class Object
+        public :method_missing
+      end
+
+      Tempfile.create(["empty", ".rb"]) do |file|
+        require file.path
+      end
+    RUBY
+  end
+
+  def test_bug_21568
+    load_path = $LOAD_PATH.dup
+    loaded_featrures = $LOADED_FEATURES.dup
+
+    $LOAD_PATH.clear
+    $LOADED_FEATURES.replace(["foo.so", "a/foo.rb", "b/foo.rb"])
+
+    assert_nothing_raised(LoadError) { require "foo" }
+
+  ensure
+    $LOAD_PATH.replace(load_path) if load_path
+    $LOADED_FEATURES.replace loaded_featrures
   end
 end

@@ -1,21 +1,24 @@
 # frozen_string_literal: true
-require_relative '../command'
+
+require_relative "../command"
 
 class Gem::Commands::EnvironmentCommand < Gem::Command
   def initialize
-    super 'environment', 'Display information about the RubyGems environment'
+    super "environment", "Display information about the RubyGems environment"
   end
 
   def arguments # :nodoc:
     args = <<-EOF
-          gemdir          display the path where gems are installed
-          gempath         display path used to search for gems
+          home            display the path where gems are installed. Aliases: gemhome, gemdir, GEM_HOME
+          path            display path used to search for gems. Aliases: gempath, GEM_PATH
+          user_gemhome    display the path where gems are installed when `--user-install` is given. Aliases: user_gemdir
           version         display the gem format version
           remotesources   display the remote gem servers
           platform        display the supported gem platforms
+          credentials     display the path where credentials are stored
           <omitted>       display everything
     EOF
-    return args.gsub(/^\s+/, '')
+    args.gsub(/^\s+/, "")
   end
 
   def description # :nodoc:
@@ -35,6 +38,7 @@ keys:
   :verbose: Verbosity of the gem command. false, true, and :really are the
             levels
   :update_sources: Enable/disable automatic updating of repository metadata
+  :concurrent_downloads: The number of gem downloads to perform concurrently
   :backtrace: Print backtrace when RubyGems encounters an error
   :gempath: The paths in which to look for gems
   :disable_default_gem_server: Force specification of gem server host on push
@@ -80,10 +84,14 @@ lib/rubygems/defaults/operating_system.rb
         Gem.dir
       when /^gempath/, /^path/, /^GEM_PATH/ then
         Gem.path.join(File::PATH_SEPARATOR)
+      when /^user_gemdir/, /^user_gemhome/ then
+        Gem.user_dir
       when /^remotesources/ then
         Gem.sources.to_a.join("\n")
       when /^platform/ then
         Gem.platforms.join(File::PATH_SEPARATOR)
+      when /^credentials/, /^creds/ then
+        Gem.configuration.credentials_path
       when nil then
         show_environment
       else
@@ -104,13 +112,13 @@ lib/rubygems/defaults/operating_system.rb
 
     out << "  - RUBYGEMS VERSION: #{Gem::VERSION}\n"
 
-    out << "  - RUBY VERSION: #{RUBY_VERSION} (#{RUBY_RELEASE_DATE}"
-    out << " patchlevel #{RUBY_PATCHLEVEL}" if defined? RUBY_PATCHLEVEL
-    out << ") [#{RUBY_PLATFORM}]\n"
+    out << "  - RUBY VERSION: #{RUBY_VERSION} (#{RUBY_RELEASE_DATE} patchlevel #{RUBY_PATCHLEVEL}) [#{RUBY_PLATFORM}]\n"
 
     out << "  - INSTALLATION DIRECTORY: #{Gem.dir}\n"
 
     out << "  - USER INSTALLATION DIRECTORY: #{Gem.user_dir}\n"
+
+    out << "  - CREDENTIALS FILE: #{Gem.configuration.credentials_path}\n"
 
     out << "  - RUBYGEMS PREFIX: #{Gem.prefix}\n" unless Gem.prefix.nil?
 
@@ -138,7 +146,7 @@ lib/rubygems/defaults/operating_system.rb
 
     out << "  - GEM CONFIGURATION:\n"
     Gem.configuration.each do |name, value|
-      value = value.gsub(/./, '*') if name == 'gemcutter_key'
+      value = value.gsub(/./, "*") if name == "gemcutter_key"
       out << "     - #{name.inspect} => #{value.inspect}\n"
     end
 
@@ -149,7 +157,7 @@ lib/rubygems/defaults/operating_system.rb
 
     out << "  - SHELL PATH:\n"
 
-    shell_path = ENV['PATH'].split(File::PATH_SEPARATOR)
+    shell_path = ENV["PATH"].split(File::PATH_SEPARATOR)
     add_path out, shell_path
 
     out
@@ -169,6 +177,6 @@ lib/rubygems/defaults/operating_system.rb
       end
     end
 
-    return nil
+    nil
   end
 end

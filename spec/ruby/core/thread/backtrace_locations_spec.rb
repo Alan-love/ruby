@@ -3,20 +3,20 @@ require_relative '../../spec_helper'
 describe "Thread#backtrace_locations" do
   it "returns an Array" do
     locations = Thread.current.backtrace_locations
-    locations.should be_an_instance_of(Array)
-    locations.should_not be_empty
+    locations.should.instance_of?(Array)
+    locations.should_not.empty?
   end
 
   it "sets each element to a Thread::Backtrace::Location" do
     locations = Thread.current.backtrace_locations
-    locations.each { |loc| loc.should be_an_instance_of(Thread::Backtrace::Location) }
+    locations.each { |loc| loc.should.instance_of?(Thread::Backtrace::Location) }
   end
 
   it "can be called on any Thread" do
     locations = Thread.new { Thread.current.backtrace_locations }.value
-    locations.should be_an_instance_of(Array)
-    locations.should_not be_empty
-    locations.each { |loc| loc.should be_an_instance_of(Thread::Backtrace::Location) }
+    locations.should.instance_of?(Array)
+    locations.should_not.empty?
+    locations.each { |loc| loc.should.instance_of?(Thread::Backtrace::Location) }
   end
 
   it "can be called with a number of locations to omit" do
@@ -30,6 +30,18 @@ describe "Thread#backtrace_locations" do
     locations1 = Thread.current.backtrace_locations
     locations2 = Thread.current.backtrace_locations(2, 3)
     locations2.map(&:to_s).should == locations1[2..4].map(&:to_s)
+  end
+
+  it "raises for negative start" do
+    -> { Thread.current.backtrace_locations(-1) }.should.raise(ArgumentError, "negative level (-1)")
+  end
+
+  it "raises for negative length" do
+    -> { Thread.current.backtrace_locations(0, -1) }.should.raise(ArgumentError, "negative size (-1)")
+  end
+
+  it "can be called with `nil` length" do
+    Thread.current.backtrace_locations(0, nil).map(&:to_s).should == Thread.current.backtrace_locations(0).map(&:to_s)
   end
 
   it "can be called with a range" do
@@ -49,12 +61,10 @@ describe "Thread#backtrace_locations" do
     locations2.map(&:to_s).should == locations1[2..-1].map(&:to_s)
   end
 
-  ruby_version_is "2.7" do
-    it "can be called with an beginless range" do
-      locations1 = Thread.current.backtrace_locations(0)
-      locations2 = Thread.current.backtrace_locations(eval("(..5)"))
-      locations2.map(&:to_s)[eval("(2..)")].should == locations1[eval("(..5)")].map(&:to_s)[eval("(2..)")]
-    end
+  it "can be called with an beginless range" do
+    locations1 = Thread.current.backtrace_locations(0)
+    locations2 = Thread.current.backtrace_locations((..5))
+    locations2.map(&:to_s)[eval("(2..)")].should == locations1[(..5)].map(&:to_s)[eval("(2..)")]
   end
 
   it "returns nil if omitting more locations than available" do
@@ -72,10 +82,15 @@ describe "Thread#backtrace_locations" do
   end
 
   it "the first location reports the call to #backtrace_locations" do
-    Thread.current.backtrace_locations(0..0)[0].to_s.should == "#{__FILE__ }:#{__LINE__ }:in `backtrace_locations'"
+    Thread.current.backtrace_locations(0..0)[0].to_s.should =~ /\A#{__FILE__ }:#{__LINE__ }:in [`'](?:Thread#)?backtrace_locations'\z/
   end
 
   it "[1..-1] is the same as #caller_locations(0..-1) for Thread.current" do
     Thread.current.backtrace_locations(1..-1).map(&:to_s).should == caller_locations(0..-1).map(&:to_s)
+  end
+
+  it "coerces the arguments to integers" do
+    Thread.current.backtrace_locations(1.1, 1.1).map(&:to_s).should == Thread.current.backtrace_locations(1, 1).map(&:to_s)
+    Thread.current.backtrace_locations(1.1..1.1).map(&:to_s).should == Thread.current.backtrace_locations(1..1).map(&:to_s)
   end
 end
